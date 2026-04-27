@@ -1,0 +1,12 @@
+
+mcu: stm32
+radios:
+  radio0:
+    spi: spi1
+    cs: PA4
+  radio1:
+    spi: spi1
+    cs: PA15
+display:
+  type: ssd1306
+  bus: i2c1
