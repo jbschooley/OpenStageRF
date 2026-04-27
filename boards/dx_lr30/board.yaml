@@ -1,0 +1,18 @@
+name: dx_lr30
+description: DX-LR30 dev board — STM32F103C8T6 + SX1262 (detachable radio module)
+mcu: stm32f103c8t6
+port: stm32_hal
+
+radios:
+  radio0:
+    type: sx126x
+    chip: sx1262
+    spi: spi1
+    # Exact pins TBD — needs schematic verification on the actual board
+    cs: TBD
+    busy: TBD
+    dio1: TBD
+    reset: TBD
+
+# DX-LR30 has no built-in display or buttons usable for the MIDI app.
+# UI hardware (I2C OLED + GPIO buttons) is added externally via headers.
