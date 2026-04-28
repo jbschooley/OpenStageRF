@@ -1,0 +1,42 @@
+name: nrf5340_dual_sx1262
+description: v2 custom board — nRF5340 (dual M33) + 2× SX1262 on shared SPI for true diversity
+mcu: nrf5340
+port: embassy_nrf
+
+# nRF5340 is dual-core: application core (M33 + CryptoCell CC312) handles
+# the radio link, MIDI, crypto, and UI; network core (M33) runs BLE for
+# config/pairing.
+cores:
+  app:
+    cpu: cortex_m33
+    crypto: cryptocell_cc312    # AES-CCM, AES-256, SHA-256, TRNG
+  net:
+    cpu: cortex_m33
+    role: ble                   # softdevice or open Rust BLE stack
+
+radios:
+  # Both radios share one SPI bus; CS is the multiplexer, IRQ/BUSY/RESET
+  # are per-radio. See README "Decision #4 (Diversity)".
+  radio0:
+    type: sx126x
+    chip: sx1262
+    spi: spi0
+    cs: TBD
+    busy: TBD
+    dio1: TBD
+    reset: TBD
+  radio1:
+    type: sx126x
+    chip: sx1262
+    spi: spi0          # shared bus
+    cs: TBD
+    busy: TBD
+    dio1: TBD
+    reset: TBD
+
+display:
+  type: ssd1306
+  bus: i2c0
+
+# Pre-certified Nordic modules (Raytac MDBT53, Fanstel BT5340, etc.) provide
+# the cleanest FCC modular-approval path for productized hardware.

@@ -1,0 +1,59 @@
+name: nrf5340_dual_si4463
+description: v3 audio expansion board — nRF5340 (dual M33) + 2× Si4463 + audio front-end. Targets Tier 2 wireless audio (mics, instruments, IEMs) with true 2-radio diversity at full audio quality.
+mcu: nrf5340
+port: embassy_nrf
+
+# Same dual-core nRF5340 as v2: app core handles radio link, codec, audio I/O,
+# crypto, and UI; net core runs BLE softdevice for config/pairing only.
+cores:
+  app:
+    cpu: cortex_m33
+    crypto: cryptocell_cc312    # AES-CCM, AES-256, SHA-256, TRNG
+  net:
+    cpu: cortex_m33
+    role: ble                   # softdevice for config/pairing only — not for audio
+
+# Two Si4463 radios on shared SPI, identical wiring pattern to v2's dual-SX1262.
+# 1 Mbps GFSK / 4-GFSK; default audio modulation is 4-GFSK for ~2x spectral
+# efficiency vs 2-GFSK (closer to pro mid-tier density).
+radios:
+  radio0:
+    type: si446x
+    chip: si4463
+    spi: spi0
+    cs: TBD
+    irq: TBD               # nIRQ output
+    sdn: TBD               # shutdown / reset
+  radio1:
+    type: si446x
+    chip: si4463
+    spi: spi0              # shared bus
+    cs: TBD
+    irq: TBD
+    sdn: TBD
+
+# Audio front-end: I²S codec IC + analog input/output stages.
+audio:
+  codec:
+    type: tlv320aic3204    # representative; alternatives: tlv320aic3254, similar
+    bus: i2s0
+    control_bus: i2c0
+  inputs:
+    mic:
+      type: balanced_xlr
+      preamp: enabled
+      phantom_power: 48v   # selectable per channel
+    instrument:
+      type: trs_balanced
+      impedance: high_z    # for direct guitar/bass input
+  outputs:
+    headphone:
+      type: stereo_trs
+      amp: instrumentation_grade
+      max_level: line_plus
+
+# Dedicated audio power rail with low-noise LDOs separated from digital supply.
+power:
+  audio_rail: ldo_low_noise
+  digital_rail: smps
+  isolation: true

@@ -1,0 +1,32 @@
+name: nrf5340_v3_audio_mic
+description: v3 audio board — wireless mic / instrument transmitter. Uncompressed PCM 16-bit / 48 kHz mono with true 2-radio diversity at the receiver. Exceeds what most pro mid-tier wireless mics deliver (which all compress).
+app: audio_node
+role: tx
+board: nrf5340_dual_si4463
+port: embassy_nrf
+
+features:
+  display: ssd1306_i2c
+  input: gpio_buttons
+  diversity: dual_spi          # at the paired RX side; this profile is the TX
+  audio_in: mic_or_instrument  # selectable: balanced XLR + 48V phantom, or TRS instrument
+  audio_out: none
+  encryption: aes_128_ccm
+  ble_config: enabled
+  key_provider: ble_config
+
+radio:
+  driver: si446x
+  count: 2                     # second radio used for true diversity at RX-paired side
+  band: us_915
+  frequency_hz: 915000000
+  bitrate: 768000              # matches PCM 16-bit / 48 kHz mono
+  modulation: 4gfsk
+  channel_bw_hz: 500000
+
+audio:
+  codec: pcm_48k_16bit_mono    # raw PCM, no compression
+  sample_rate: 48000
+  bit_depth: 16
+  channels: 1
+  jitter_buffer_frames: 2

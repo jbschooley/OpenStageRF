@@ -1,7 +1,7 @@
 name: dx_lr30
 description: DX-LR30 dev board — STM32F103C8T6 + SX1262 (detachable radio module)
 mcu: stm32f103c8t6
-port: stm32_hal
+port: embassy_stm32
 
 radios:
   radio0:

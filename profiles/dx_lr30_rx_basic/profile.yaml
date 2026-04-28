@@ -3,7 +3,7 @@ description: First-edition receiver — DX-LR30, single SX1262, US 915 ISM, GFSK
 app: midi_node
 role: rx
 board: dx_lr30
-port: stm32_hal
+port: embassy_stm32
 
 features:
   display: ssd1306_i2c     # optional add-on for tuning UI

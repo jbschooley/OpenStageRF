@@ -3,7 +3,7 @@ description: First-edition transmitter — DX-LR30, single SX1262, US 915 ISM, G
 app: midi_node
 role: tx
 board: dx_lr30
-port: stm32_hal
+port: embassy_stm32
 
 features:
   display: none
