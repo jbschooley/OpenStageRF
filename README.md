@@ -10,14 +10,14 @@ Open-source firmware platform for low-latency wireless MIDI over sub-GHz radio. 
 - **Scope:** one-way MIDI link, single radio per node, no diversity, no BLE
 - **UI (RX side, optional):** external I²C OLED + GPIO buttons
 - **MIDI front end:** external DIN opto-isolator (e.g. Adafruit MIDI FeatherWing for prototype)
-- **Build system:** STM32 HAL + CMake
+- **Language / framework:** Rust + [embassy](https://embassy.dev) (async, no_std, multi-vendor via `embedded-hal`)
 
 The firmware is structured to grow into more boards, radios, and feature profiles, but the initial focus is making one rock-solid configuration before broadening.
 
 ## Prototype Stages
 
 ### Stage 1 — basic link
-1× DX-LR30 TX, 1× DX-LR30 RX. One-way packetized MIDI over GFSK at ~915 MHz, no diversity, no encryption. Goal: prove latency, range, and packet reliability end-to-end with real instruments. (See *First Edition Target* above.)
+1× DX-LR30 TX, 1× DX-LR30 RX. One-way packetized MIDI over GFSK at ~915 MHz, no diversity, no encryption. Goal: prove latency, range, and packet reliability end-to-end with real instruments. Built on Rust + embassy via `embassy-stm32`. (See *First Edition Target* above.)
 
 ### Stage 2 — diversity (UART slave first)
 Add a second DX-LR30 to the receive end as a **UART slave**: it runs nearly the same firmware as the master, receives RF independently, and forwards `RxReport` frames (seq, RSSI, payload) to the master over UART. Master runs the dedupe/arbitration logic.
@@ -28,17 +28,35 @@ Why UART-slave before dual-SPI on one MCU:
 - the slave can sit physically apart for real spatial diversity
 - the dual-SPI implementation gets done once, on the v2 custom board
 
-Dual-SPI (both SX1262s on one MCU's SPI bus) is also a supported profile (`stm_oled_rx_dual_spi`) and becomes the default on the v2 custom board.
+Dual-SPI (both SX1262s on one MCU's SPI bus) is also a supported profile and becomes the default on the v2 custom board.
+
+### Stage 2.5 — second platform (Heltec T114 / nRF52840)
+Port the firmware to **Heltec T114** (nRF52840 + SX1262) via `embassy-nrf`. This is where the multi-vendor portability boundary gets validated: the same `core/`, `drivers/`, `protocols/` crates compile against a different HAL with only board and port code changing. Anything that doesn't compile cleanly is a portability bug to fix in core, not in the port.
+
+T114 also unlocks experimentation with hardware AES-CCM (native to the nRF CCM peripheral) and lets BLE config/pairing development start in parallel with the radio link, since `embassy-nrf` + `nrf-softdevice` is a mature Rust BLE path.
 
 ### Stage 3 — encryption + authentication
-Add AEAD with a sequence-number nonce. Default cipher: ChaCha20-Poly1305 (works on every chip; F103 has no crypto hardware). On targets with AES acceleration (STM32WBA, CC1352R, nRF52/53), AES-128-CCM is selectable and faster. The on-air header carries a 1-byte cipher ID so receivers can verify regardless. Replay protection comes from the AEAD nonce; tamper detection from the auth tag. See *Encryption* and *Key distribution* below.
+Add AEAD with a sequence-number nonce. Default cipher: ChaCha20-Poly1305 (works on every chip; F103 has no crypto hardware). On targets with AES acceleration (nRF52/53 CCM peripheral, others), AES-128-CCM is selectable and faster. Replay protection comes from the AEAD nonce; tamper detection from the auth tag. RustCrypto crates (`chacha20poly1305`, `ccm`) are well-audited and `no_std` compatible. See *Encryption* and *Key distribution* below.
 
-### Stage 4 — custom board
-Spin a custom **STM32WBA + 2× SX1262** board: native BLE for config/pairing, both radios on shared SPI for true diversity, smaller form factor for keytar-mount. Stage 4 also decides the band question: stay on 902–928 if it holds up live, or add a 470–510 MHz SKU/profile (SX1268) for users in noisier ISM environments.
+### Stage 4 — v2 custom MIDI board (nRF5340 + 2× SX1262)
+Spin a custom **nRF5340 + 2× SX1262** board, MIDI-only scope: dual-core M33 (app + net), CryptoCell CC312 hardware crypto (AES-CCM, AES-256, SHA-256), native BLE 5.3 (used for config/pairing only), both radios on shared SPI for true diversity, smaller form factor for keytar-mount. DIN MIDI in/out + opto-isolator front-end. Pre-certified Nordic modules (Raytac MDBT53, Fanstel BT5340) provide the cleanest FCC modular-approval path.
+
+Stage 4 also decides the band question: stay on 902–928 if it holds up live, or add a 470–510 MHz SKU/profile (SX1268) for users in noisier ISM environments.
 
 ### Beyond v2
 
 - channel scan, frequency diversity, mobile configurator app
+
+### Potential future platforms
+
+These were considered earlier and may return as community ports, but are not on the active roadmap:
+
+- **STM32WBA5x** — capable hardware, but BLE-in-Rust support is currently rough (no mature stack equivalent to `nrf-softdevice`). Consider revisiting if TrouBLE or vendor Rust BLE matures.
+- **TI CC1352R / CC1354R10** — strong hardware. No embassy HAL today. Either a community-built embassy HAL or a parallel Zephyr+C implementation could enable it.
+
+#### What "porting to C" means
+
+If a contributor wants to support TI silicon (or anything else without an embassy HAL) via Zephyr+C, that's not a mechanical port of the Rust code — it's a **parallel C implementation that shares the on-air protocol spec and crypto test vectors but no source code**. Concretely, the C side would re-implement `core/link/`, `protocols/`, `crypto/`, and the radio driver from scratch in C against Zephyr's APIs. Devices running the Rust implementation and the Zephyr+C implementation interoperate over the air (same packet format, same AEAD, same key model); they do not share code. Analogous to BlueZ vs BlueDroid for Bluetooth — same protocol, separate codebases. Maintenance burden is real: every protocol change happens twice. Worth doing only if a contributor wants to own the C variant.
 
 ## Architecture
 
@@ -48,9 +66,9 @@ Layered so one app can build for many boards and radios:
 app
   → profile           (which board + role + features + radio config)
     → core            (link, diversity arbitration, scheduler, config)
-      → drivers       (radio, display, MIDI, input — vendor-neutral interfaces)
-        → port        (STM32 HAL, TI SimpleLink later)
-          → board     (pin map only)
+      → drivers       (radio, display, MIDI, input — embedded-hal trait bounds)
+        → port        (embassy_stm32, embassy_nrf — platform-shared helpers)
+          → board     (pin map + chip-specific HAL setup)
 ```
 
 - `apps/` — high-level firmware roles (e.g. `midi_node` for TX or RX)
@@ -105,14 +123,15 @@ On-air packets carry a 1-byte cipher ID, sequence-number nonce, and an auth tag.
 - `chacha20_poly1305` — universal software AEAD, 256-bit key
 - `aes_128_ccm` — universal hardware AEAD on all wireless MCUs (BLE-aligned)
 
-Defaults by chip:
+Defaults by chip (active platforms; future platforms in italics):
 
-| Chip                   | AES-CCM hardware        | Default cipher                |
-| ---------------------- | ----------------------- | ----------------------------- |
-| STM32F103 (DX-LR30)    | none                    | ChaCha20-Poly1305 (software)  |
-| STM32WBA5x             | yes (CRYP peripheral)   | AES-128-CCM (hardware)        |
-| CC1352R                | yes (AES accelerator)   | AES-128-CCM (hardware)        |
-| nRF52840 / nRF5340     | yes (CCM peripheral, native to BLE Link Layer) | AES-128-CCM (hardware) |
+| Chip                       | AES-CCM hardware                                | Default cipher                |
+| -------------------------- | ----------------------------------------------- | ----------------------------- |
+| STM32F103 (DX-LR30, v1)    | none                                            | ChaCha20-Poly1305 (software)  |
+| nRF52840 (T114, Stage 2.5) | yes (CCM peripheral, native to BLE Link Layer)  | AES-128-CCM (hardware)        |
+| nRF5340 (v2 custom board)  | yes (CCM peripheral) + CryptoCell CC312         | AES-128-CCM (hardware)        |
+| *STM32WBA5x* (future)      | *yes (CRYP peripheral)*                         | *AES-128-CCM (hardware)*      |
+| *CC1352R* (future)         | *yes (AES accelerator)*                         | *AES-128-CCM (hardware)*      |
 
 **Why CCM over GCM:** AES-CCM has hardware acceleration on every wireless MCU we target (GCM does not — nRF's CCM peripheral is the gap, and that's the chip family we most want hardware support on). CCM is also the same AES mode used by BLE Link Layer encryption, which aligns nicely with v2 BLE pairing. GCM's parallelization advantage doesn't matter at MIDI packet sizes.
 
@@ -170,43 +189,64 @@ OLED is I²C, buttons are GPIO. Radio gets unblocked SPI and deterministic IRQ s
 ### 9. Open source firmware, hardware comes later
 Firmware ships as source. Hardware sold (if any) starts as non-RF dev boards and lets users add their own pre-certified radio modules. Productized RF hardware is deferred until demand is proven and FCC/modular-approval cost is justified.
 
-### 10. STM32 HAL + CMake first; Zephyr later
-Faster low-level control for proving SX1262 latency. A Zephyr port is plausible later for broader board support, but it is not the entry path.
+### 10. Rust + embassy as the primary platform
+The firmware is written in Rust on top of [embassy](https://embassy.dev) — async, `no_std`, multi-vendor via `embedded-hal`. embassy has first-class support for STM32 (every series including F103 and WBA) and Nordic (nRF52, nRF53), which covers v1 through v2 with the same codebase. The `embedded-hal` trait abstractions replace what would otherwise be a hand-rolled `port_api.h`-style HAL.
+
+**Why embassy over Zephyr+C:**
+
+- **Lower latency** — no kernel scheduler, no driver locking, no IPC. The executor is a single-threaded cooperative state machine. RF IRQ → `await` resume → packet service is essentially the same code path as a hand-written ISR-plus-flag pattern, with no overhead.
+- **async/await fits RF protocols structurally** — "wait for DIO1, then read FIFO" is one linear async function, not a callback or thread-blocked-on-semaphore.
+- **Memory safety** at compile time — no buffer overflows or use-after-free in packet decode or the key store, which matters for code that runs the radio path live on stage.
+- **Multi-vendor without DTS/Kconfig overhead** — `embedded-hal` traits give vendor-agnostic SPI/GPIO/UART without the framework ceremony.
+
+**Portability boundary rule.** Vendor HAL crates (`embassy-stm32`, `embassy-nrf`, etc.) are only allowed in `boards/<board>/` and `ports/<port>/`. Everywhere else (`core/`, `drivers/<X>/`, `protocols/`, `apps/`) depends only on `embedded-hal` traits and project-internal crates. If a driver ever has to import `embassy-stm32` directly, that's a portability bug.
+
+**Build system.** Cargo workspace with one crate per module (driver, protocol, board, app). Profiles live as YAML files; an `xtask` helper translates `profile.yaml` into the right `cargo build --features ... --target ... -p <board_app>` invocation.
+
+**Other ports stay welcome as community contributions.** A Zephyr+C port (TI CC13xx support, alternative for users who prefer Zephyr's middleware) and a bare-metal STM32 HAL port (minimum-overhead reference) are both reasonable additions if someone wants to maintain them. They aren't on the maintainer's roadmap.
 
 ## Directory Structure
 
 ```
 wireless-performer-fw/
-├── apps/
+├── Cargo.toml                              # workspace root
+├── apps/                                   # bin crates (executables)
 │   └── midi_node/                          # TX/RX firmware role; behavior selected by profile
-├── boards/                                 # hardware pin maps and capabilities
-│   ├── dx_lr30/                            # v1 — STM32F103 + SX1262
-│   ├── stm32_custom_oled_dual_radio/       # v2 — STM32WBA + 2× SX1262
-│   └── ti_lpstk_cc1352r/                   # future — TI integrated MCU+radio
-├── ports/                                  # platform glue
-│   ├── stm32_hal/                          # primary
-│   └── ti_simplelink/                      # reserved
+├── boards/                                 # board crates: pin maps + chip-specific HAL setup
+│   ├── dx_lr30/                            # v1 — STM32F103 + SX1262 (embassy-stm32)
+│   ├── t114/                               # Stage 2.5 — Heltec T114, nRF52840 + SX1262 (embassy-nrf)
+│   ├── nrf5340_dual_sx1262/                # v2 custom MIDI — nRF5340 + 2× SX1262 (embassy-nrf)
+│   └── _future/                            # deferred targets, not on active roadmap
+│       ├── stm32_custom_oled_dual_radio/   # was v2 plan — STM32WBA + 2× SX1262
+│       └── ti_lpstk_cc1352r/               # TI CC1352R, awaiting embassy HAL
+├── ports/                                  # platform-shared code (not chip-specific)
+│   ├── embassy_stm32/                      # STM32 family helpers (flash partitions, etc.)
+│   └── embassy_nrf/                        # nRF family helpers (softdevice glue, etc.)
 ├── profiles/                               # build configs: board + role + features + radio
 │   ├── dx_lr30_tx_basic/                   # v1 transmitter
 │   ├── dx_lr30_rx_basic/                   # v1 receiver
-│   └── stm_oled_rx_dual_spi/               # v2 dual-radio diversity receiver
-├── drivers/                                # vendor-neutral hardware interfaces
+│   ├── t114_rx_diversity/                  # Stage 2.5 receiver on nRF52840
+│   ├── nrf5340_v2_midi/                    # v2 board, MIDI with diversity
+├── drivers/                                # vendor-neutral library crates
 │   ├── radio/
-│   │   ├── sx126x/                         # SX1262/SX1268
-│   │   └── cc13xx/                         # future
+│   │   ├── sx126x/                         # SX1262/SX1268 — v1/v2, depends on embedded-hal traits only
+│   │   ├── cc1200/                         # future — TI standalone SPI radio, MSK + 4-FSK, embassy-friendly
+│   │   └── cc13xx/                         # future — TI integrated MCU+radio, requires Zephyr+C or embassy HAL port
 │   ├── display/
 │   │   └── ssd1306/                        # I²C OLED
 │   ├── input/
 │   │   └── buttons/                        # GPIO buttons / joystick
-│   └── midi/
-│       └── din_uart/                       # opto-isolated DIN MIDI
-├── core/                                   # portable, hardware-agnostic
+│   ├── midi/
+│   │   └── din_uart/                       # opto-isolated DIN MIDI
+├── core/                                   # portable, hardware-agnostic library crates
 │   ├── link/                               # packetization, seq numbers, CRC, dedupe, watchdog
 │   ├── diversity/                          # arbitration (UART-slave or dual-SPI)
 │   ├── scheduler/                          # event/packet timing
 │   └── config/                             # persisted settings, key store, active profile
 ├── protocols/                              # frozen on-air formats
 │   └── midi_packet_v1/
+├── crypto/                                 # AEAD wrappers (chacha20poly1305, ccm) over RustCrypto
+├── xtask/                                  # build helper: profile.yaml → cargo invocation
 ├── tools/                                  # host-side
 │   ├── configurator/                       # desktop/CLI key + channel config
 │   ├── packet_analyzer/                    # off-air capture/decode
@@ -220,7 +260,7 @@ wireless-performer-fw/
 └── README.md
 ```
 
-Each `boards/<name>/board.yaml` documents that board's MCU, pin map, and radio wiring. Each `profiles/<name>/profile.yaml` documents the role, features, and radio config for that build target.
+Each `boards/<name>/board.yaml` documents that board's MCU, pin map, and radio wiring. Each `profiles/<name>/profile.yaml` documents the role, features, and radio config for that build target. The `xtask` helper reads the profile YAML and invokes Cargo with the right features, target triple, and board crate.
 
 ## License
 
