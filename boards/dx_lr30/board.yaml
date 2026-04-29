@@ -1,18 +1,26 @@
 name: dx_lr30
-description: DX-LR30 dev board — STM32F103C8T6 + SX1262 (detachable radio module)
+description: DX-LR30-900M22SP dev board — STM32F103C8T6 + DX-LR30-900M22S (SX1262)
 mcu: stm32f103c8t6
 port: embassy_stm32
+
+# High-level board metadata used by the xtask build system.
+# Pin assignments live in src/pins.rs — edit there, not here.
+
+clocks:
+  hse_crystal: none       # X1 footprint absent; board runs on HSI
+  default_config: hsi_64mhz
 
 radios:
   radio0:
     type: sx126x
     chip: sx1262
     spi: spi1
-    # Exact pins TBD — needs schematic verification on the actual board
-    cs: TBD
-    busy: TBD
-    dio1: TBD
-    reset: TBD
 
-# DX-LR30 has no built-in display or buttons usable for the MIDI app.
-# UI hardware (I2C OLED + GPIO buttons) is added externally via headers.
+midi:
+  uart: usart3             # USART1=CH340C debug, USART2=radio pins — see pins.rs
+
+leds:
+  status: PC13
+
+ui:
+  oled_i2c: i2c1

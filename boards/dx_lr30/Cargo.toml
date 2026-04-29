@@ -6,6 +6,9 @@ license = "AGPL-3.0-or-later"
 
 [features]
 defmt = ["dep:defmt", "embassy-stm32/defmt"]
+# Use HSI (internal 8 MHz oscillator) instead of HSE+PLL.
+# Safe for initial bring-up when crystal presence is unconfirmed.
+hsi = []
 
 [dependencies]
 defmt        = { workspace = true, optional = true }

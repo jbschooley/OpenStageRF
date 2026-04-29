@@ -52,15 +52,14 @@ These were settled in conversation before code starts:
 
 **Goal:** all peripherals respond. Pinmap is no longer TBD.
 
-- [ ] Obtain DX-LR30 schematic; identify SX1262 SPI bus pins, CS, BUSY, DIO1, RESET
-- [ ] Update `boards/dx_lr30/board.yaml` with real pin assignments (replacing the TBD lines)
+- [ ] Obtain DX-LR30 schematic; verify pin assignments in `boards/dx_lr30/src/pins.rs` and `board.yaml` (all currently placeholder — marked with "verify" comments)
 - [ ] Wire ST-Link SWD: SWDIO, SWCLK, GND, optionally NRST
 - [ ] Wire Adafruit MIDI FeatherWing: 3V3 + GND, FeatherWing TX → DX-LR30 USART RX, FeatherWing RX ← DX-LR30 USART TX (5-pin DIN side handles isolation/level conversion)
-- [ ] (RX side only) wire I²C OLED + 5-way joystick to free GPIOs:
-  - I²C SCL/SDA → OLED
-  - 5 GPIOs → joystick up/down/left/right/center (with internal pull-ups, joystick pulls low when pressed)
-- [ ] `osrf-board-dx-lr30`: clock setup (HSE crystal config), peripheral init via embassy-stm32
-- [ ] Smoke test: toggle each radio control GPIO, verify with multimeter; read DIO1 level
+- [ ] (RX side only) wire I²C OLED + 5-way joystick to free GPIOs per `board.yaml`; resolve joystick pin conflicts (joy_down/joy_left currently clash with USART1)
+- [x] `osrf-board-dx-lr30`: HSE+PLL clock config (72 MHz via 8 MHz crystal), HSI fallback, peripheral init — `boards/dx_lr30/src/clocks.rs`
+- [x] Pin assignments centralised in `boards/dx_lr30/src/pins.rs` — one file to edit after schematic verification
+- [x] Smoke test binary `smoke_dx_lr30` — tests LED, SX1262 reset/BUSY/DIO1/CS, USART2 init; flash with `cargo xtask run dx_lr30_tx_basic --bin smoke_dx_lr30`
+- [ ] Run `smoke_dx_lr30` on hardware; fix any pin mismatches found
 
 **Exit criteria:** schematic-verified pinmap committed; all GPIOs respond.
 

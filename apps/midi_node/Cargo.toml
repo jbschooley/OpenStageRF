@@ -5,7 +5,8 @@ edition = "2021"
 license = "AGPL-3.0-or-later"
 
 [features]
-dx_lr30 = []
+dx_lr30     = []
+dx_lr30_hsi = ["dx_lr30", "osrf-board-dx-lr30/hsi"]
 
 [dependencies]
 cortex-m    = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
@@ -21,6 +22,11 @@ embassy-time     = { version = "0.5", features = ["defmt", "defmt-timestamp-upti
 osrf-board-dx-lr30 = { path = "../../boards/dx_lr30", features = ["defmt"] }
 
 [[bin]]
-name             = "embassy_dx_lr30"
-path             = "src/bin/embassy_dx_lr30.rs"
+name              = "embassy_dx_lr30"
+path              = "src/bin/embassy_dx_lr30.rs"
+required-features = ["dx_lr30"]
+
+[[bin]]
+name              = "smoke_dx_lr30"
+path              = "src/bin/smoke_dx_lr30.rs"
 required-features = ["dx_lr30"]
