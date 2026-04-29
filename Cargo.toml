@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "apps/midi_node",
+    "boards/dx_lr30",
+    "core/link",
+    "crypto",
+    "drivers/radio/sx126x",
+    "ports/embassy_stm32",
+    "protocols/midi_packet_v1",
+    "xtask",
+]
+# xtask excluded from default-members: it's a host tool, not a cross-compiled crate.
+default-members = [
+    "apps/midi_node",
+    "boards/dx_lr30",
+    "core/link",
+    "crypto",
+    "drivers/radio/sx126x",
+    "ports/embassy_stm32",
+    "protocols/midi_packet_v1",
+]
+resolver = "2"
+
+[workspace.dependencies]
+defmt            = "1.0"
+embedded-hal     = "1.0"
+embedded-hal-async = "1.0"
+heapless         = { version = "0.8", default-features = false }

@@ -1,0 +1,12 @@
+[package]
+name    = "osrf-protocols-midi-v1"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[features]
+defmt = ["dep:defmt"]
+
+[dependencies]
+defmt    = { workspace = true, optional = true }
+heapless = { workspace = true }

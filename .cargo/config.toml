@@ -1,0 +1,12 @@
+[build]
+target = "thumbv7m-none-eabi"
+
+[alias]
+xtask = "run --target aarch64-apple-darwin -p osrf-xtask --"
+
+[target.thumbv7m-none-eabi]
+runner = "probe-rs run --chip STM32F103C8"
+rustflags = [
+    "-C", "link-arg=-Tlink.x",
+    "-C", "link-arg=-Tdefmt.x",
+]

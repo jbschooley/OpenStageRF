@@ -33,17 +33,18 @@ These were settled in conversation before code starts:
 
 **Goal:** every developer can flash the DX-LR30 and see RTT logs.
 
-- [ ] Install Rust stable + `thumbv7m-none-eabi` target (`rustup target add thumbv7m-none-eabi`)
-- [ ] Install `probe-rs` (`cargo install probe-rs --features cli`) and ST-Link drivers
-- [ ] Set up Cargo workspace skeleton:
+- [x] Install Rust stable + `thumbv7m-none-eabi` target (`rustup target add thumbv7m-none-eabi`)
+- [x] Install `probe-rs` (`cargo install probe-rs-tools --locked` → probe-rs 0.31.0 at `~/.cargo/bin`)
+- [x] Set up Cargo workspace skeleton:
   - root `Cargo.toml` with `[workspace]` and member list
   - `Cargo.lock` checked in (this is a binary project)
-  - `rust-toolchain.toml` pinning the stable toolchain version
+  - `rust-toolchain.toml` pinned to 1.95.0
   - `.cargo/config.toml` with default `[target.thumbv7m-none-eabi]` runner = `probe-rs run --chip STM32F103C8`
-- [ ] Initial crates: `osrf-link`, `osrf-protocols-midi-v1`, `osrf-crypto`, `osrf-radio-sx126x`, `osrf-board-dx-lr30`, `osrf-port-embassy-stm32`, `osrf-app-midi-node`, `osrf-xtask`
-- [ ] `osrf-xtask` reads `profiles/<name>/profile.yaml` and shells out to `cargo build --target thumbv7m-none-eabi -p osrf-app-midi-node --features <board>`
-- [ ] `Cargo.toml` license headers on every file via cargo-deny rule
-- [ ] First flash: blink LED on DX-LR30 + `defmt::info!("hello world")` over RTT, viewed via `probe-rs attach`
+  - `[alias] xtask = ...` so `cargo xtask build <profile>` works
+- [x] Initial crates: `osrf-link`, `osrf-protocols-midi-v1`, `osrf-crypto`, `osrf-radio-sx126x`, `osrf-board-dx-lr30`, `osrf-port-embassy-stm32`, `osrf-app-midi-node`, `osrf-xtask`
+- [x] `osrf-xtask` reads `profiles/<name>/profile.yaml` and shells out to `cargo build --target thumbv7m-none-eabi -p osrf-app-midi-node --features <board>`
+- [x] `SPDX-License-Identifier: AGPL-3.0-or-later` headers on every source file; `deny.toml` created for cargo-deny (install `cargo install cargo-deny` to enforce in CI)
+- [ ] First flash: blink LED on DX-LR30 + RTT log viewed via `probe-rs attach` — **requires hardware** (binary `target/thumbv7m-none-eabi/debug/embassy_dx_lr30` is built and ready)
 
 **Exit criteria:** `cargo run -p osrf-app-midi-node --target thumbv7m-none-eabi --features dx_lr30` flashes the board and shows logs.
 
