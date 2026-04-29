@@ -1,0 +1,26 @@
+[package]
+name    = "osrf-app-midi-node"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[features]
+dx_lr30 = []
+
+[dependencies]
+cortex-m    = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7"
+defmt       = "1.0"
+defmt-rtt   = "1.1"
+panic-probe = { version = "1.0", features = ["print-defmt"] }
+
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-stm32    = { version = "0.6", features = ["stm32f103c8", "time-driver-any", "defmt"] }
+embassy-time     = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
+
+osrf-board-dx-lr30 = { path = "../../boards/dx_lr30", features = ["defmt"] }
+
+[[bin]]
+name             = "embassy_dx_lr30"
+path             = "src/bin/embassy_dx_lr30.rs"
+required-features = ["dx_lr30"]

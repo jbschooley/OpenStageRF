@@ -1,0 +1,12 @@
+[package]
+name    = "osrf-port-embassy-stm32"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[features]
+defmt = ["dep:defmt", "embassy-stm32/defmt"]
+
+[dependencies]
+defmt        = { workspace = true, optional = true }
+embassy-stm32 = { version = "0.6", default-features = false }

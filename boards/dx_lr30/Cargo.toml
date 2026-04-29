@@ -1,0 +1,13 @@
+[package]
+name    = "osrf-board-dx-lr30"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[features]
+defmt = ["dep:defmt", "embassy-stm32/defmt"]
+
+[dependencies]
+defmt        = { workspace = true, optional = true }
+embassy-stm32 = { version = "0.6", features = ["stm32f103c8", "time-driver-any"] }
+cortex-m     = "0.7"

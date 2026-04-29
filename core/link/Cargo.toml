@@ -1,0 +1,13 @@
+[package]
+name    = "osrf-link"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[features]
+defmt = ["dep:defmt"]
+
+[dependencies]
+defmt        = { workspace = true, optional = true }
+embedded-hal = { workspace = true }
+heapless     = { workspace = true }
