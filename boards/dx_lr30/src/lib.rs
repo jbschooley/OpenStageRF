@@ -10,7 +10,7 @@
 //!
 //! Pin assignments verified against the LR30-SP PCBA schematic.
 
-use embassy_stm32::{bind_interrupts, dma, exti, interrupt, peripherals, usart};
+use embassy_stm32::{bind_interrupts, dma, exti, i2c, interrupt, peripherals, usart};
 
 pub mod clocks;
 
@@ -21,11 +21,19 @@ pub mod clocks;
 // STM32F103C8 USART3 nominally maps to DMA1_CH2/CH3, but those channels
 // are already taken by SPI1 above, and at 31250 baud (~3.1 KB/s) DMA is
 // pure ceremony — the per-byte interrupt is fine.
+// I2C1 EV/ER + DMA1_CH6/CH7 service the OLED on PB6/PB7.
+// On STM32F103 the I2C1 RX/TX DMA channels are CH7/CH6 respectively (RM0008
+// table 78); CH2/CH3 are taken by SPI1 above, so I²C and the radio do not
+// fight for DMA channels.
 bind_interrupts!(struct Irqs {
     EXTI15_10     => exti::InterruptHandler<interrupt::typelevel::EXTI15_10>;
     DMA1_CHANNEL2 => dma::InterruptHandler<peripherals::DMA1_CH2>;
     DMA1_CHANNEL3 => dma::InterruptHandler<peripherals::DMA1_CH3>;
+    DMA1_CHANNEL6 => dma::InterruptHandler<peripherals::DMA1_CH6>;
+    DMA1_CHANNEL7 => dma::InterruptHandler<peripherals::DMA1_CH7>;
     USART3        => usart::BufferedInterruptHandler<peripherals::USART3>;
+    I2C1_EV       => i2c::EventInterruptHandler<peripherals::I2C1>;
+    I2C1_ER       => i2c::ErrorInterruptHandler<peripherals::I2C1>;
 });
 
 // ── Built-in SX1262 radio on SPI1 ────────────────────────────────────────────
@@ -132,6 +140,19 @@ pub type Radio0 = osrf_radio_sx126x::Sx1262Radio<
     osrf_radio_sx126x::PinRfSwitch<embassy_stm32::gpio::Output<'static>, embassy_stm32::gpio::Output<'static>>,
 >;
 
+/// SSD1306 128×64 mono OLED on I²C1 (PB6=SCL, PB7=SDA), async via
+/// `embedded-hal-async`.  Buffered-graphics mode means `embedded_graphics::
+/// DrawTarget<Color = BinaryColor>` operations are sync (writing to an
+/// internal pixel buffer); the user must `display.flush().await` to push
+/// the buffer to the panel.  `init().await` must be called once before
+/// drawing — `resources()` returns an *un-initialised* display because
+/// it is itself sync.
+pub type Display = ssd1306::Ssd1306Async<
+    ssd1306::prelude::I2CInterface<embassy_stm32::i2c::I2c<'static, embassy_stm32::mode::Async, embassy_stm32::i2c::Master>>,
+    ssd1306::prelude::DisplaySize128x64,
+    ssd1306::mode::BufferedGraphicsModeAsync<ssd1306::prelude::DisplaySize128x64>,
+>;
+
 /// MIDI UART (USART3) configured at 31250 baud 8N1, interrupt-driven via
 /// `BufferedUart`.  Implements `embedded_io_async::Read` and `Write`
 /// directly so app crates can drive it through HAL-agnostic traits.
@@ -160,6 +181,16 @@ pub struct Resources {
 
     /// DIN MIDI UART on USART3 (PB10 TX, PB11 RX) at 31250 baud 8N1.
     pub midi_uart: MidiUart,
+
+    /// SSD1306 128×64 mono OLED on I²C1 (PB6=SCL, PB7=SDA), 400 kHz, async.
+    ///
+    /// Returned in *un-initialised* buffered-graphics mode: the caller
+    /// must `display.init().await` once before drawing, and call
+    /// `display.flush().await` after each batch of `embedded_graphics`
+    /// draw operations to push the in-memory buffer to the panel.  We
+    /// can't init here because `resources()` is sync — the SSD1306 init
+    /// sequence is async (it issues a sequence of I²C writes).
+    pub display: Display,
 }
 
 /// Initialise hardware and bundle the common peripherals into `Resources`.
@@ -242,5 +273,36 @@ pub fn resources() -> Resources {
     )
     .expect("USART3 BufferedUart init failed (baudrate divider out of range?)");
 
-    Resources { status_led, radio0, midi_uart }
+    // ── OLED display: I²C1 @ 400 kHz on PB6/PB7, async (DMA1_CH6/CH7) ──────
+    // I²C1's DMA channels (CH6/CH7) don't conflict with SPI1's (CH2/CH3) or
+    // USART3's (also CH2/CH3, but USART3 here uses BufferedUart instead).
+    //
+    // The SSD1306 lives at I²C address 0x3C by default; `I2CDisplayInterface
+    // ::new` bakes that in.  Buffered-graphics mode keeps a 128×64-bit
+    // (1024-byte) framebuffer in RAM; `flush().await` walks the buffer once
+    // to the panel.  At 400 kHz that's ≈ 22 ms per full flush; partial
+    // flushes via `flush_region` are an option later.
+    // F103 is gpio_v1 (no sda_pullup/scl_pullup config — boards are expected
+    // to provide external pull-ups on SDA/SCL, which both the LR30 add-on
+    // header and any common SSD1306 module do).
+    let mut i2c_cfg = embassy_stm32::i2c::Config::default();
+    i2c_cfg.frequency = embassy_stm32::time::Hertz(400_000);
+    let i2c = embassy_stm32::i2c::I2c::new(
+        p.I2C1,
+        p.PB6,        // SCL
+        p.PB7,        // SDA
+        p.DMA1_CH6,   // TX DMA (RM0008 table 78: I2C1_TX → CH6)
+        p.DMA1_CH7,   // RX DMA (I2C1_RX → CH7)
+        Irqs,
+        i2c_cfg,
+    );
+    let interface = ssd1306::I2CDisplayInterface::new(i2c);
+    let display = ssd1306::Ssd1306Async::new(
+        interface,
+        ssd1306::prelude::DisplaySize128x64,
+        ssd1306::prelude::DisplayRotation::Rotate0,
+    )
+    .into_buffered_graphics_mode();
+
+    Resources { status_led, radio0, midi_uart, display }
 }

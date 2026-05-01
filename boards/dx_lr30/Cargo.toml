@@ -29,6 +29,11 @@ embedded-hal-bus   = { workspace = true }
 embassy-time       = { version = "0.5" }
 osrf-radio-sx126x  = { workspace = true }
 
+# ── Display: SSD1306 128x64 mono OLED on I²C1, async via embedded-hal-async ──
+# ssd1306 0.10's I2CDisplayInterface uses 0x3C by default; the async path is
+# behind the `async` feature which pulls in embedded-hal-async 1.0.
+ssd1306            = { version = "0.10", default-features = false, features = ["async", "graphics"] }
+
 [lib]
 test    = false
 doctest = false

@@ -4,6 +4,7 @@ members = [
     "apps/midi_bench",
     "apps/midi_node",
     "apps/radio_bench",
+    "apps/ui_bench",
     "boards/dx_lr30",
     "boards/t114",
     "core/link",
@@ -19,6 +20,7 @@ members = [
     "profiles/dx_lr30_rx_basic",
     "profiles/dx_lr30_rx_diversity",
     "profiles/dx_lr30_tx_basic",
+    "profiles/dx_lr30_ui_demo",
     "profiles/t114_blink",
     "profiles/t114_midi_rx",
     "profiles/t114_midi_tx",
@@ -27,6 +29,7 @@ members = [
     "profiles/t114_rx_basic",
     "profiles/t114_rx_diversity",
     "profiles/t114_tx_basic",
+    "profiles/t114_ui_demo",
     "protocols/midi_packet_v1",
     "xtask",
 ]
@@ -37,6 +40,7 @@ default-members = [
     "apps/midi_bench",
     "apps/midi_node",
     "apps/radio_bench",
+    "apps/ui_bench",
     "boards/dx_lr30",
     "core/link",
     "crypto",
@@ -51,6 +55,7 @@ default-members = [
     "profiles/dx_lr30_rx_basic",
     "profiles/dx_lr30_rx_diversity",
     "profiles/dx_lr30_tx_basic",
+    "profiles/dx_lr30_ui_demo",
     "protocols/midi_packet_v1",
 ]
 resolver = "2"
@@ -59,6 +64,7 @@ resolver = "2"
 osrf-app-blink                    = { path = "apps/blink" }
 osrf-app-midi-bench               = { path = "apps/midi_bench" }
 osrf-app-radio-bench              = { path = "apps/radio_bench" }
+osrf-app-ui-bench                 = { path = "apps/ui_bench" }
 osrf-board-dx-lr30                = { path = "boards/dx_lr30" }
 osrf-board-t114                   = { path = "boards/t114" }
 osrf-midi-din                     = { path = "drivers/midi/din" }
@@ -71,6 +77,7 @@ osrf-profile-dx-lr30-radio-rx     = { path = "profiles/dx_lr30_radio_rx" }
 osrf-profile-dx-lr30-tx-basic     = { path = "profiles/dx_lr30_tx_basic" }
 osrf-profile-dx-lr30-rx-basic     = { path = "profiles/dx_lr30_rx_basic" }
 osrf-profile-dx-lr30-rx-diversity = { path = "profiles/dx_lr30_rx_diversity" }
+osrf-profile-dx-lr30-ui-demo      = { path = "profiles/dx_lr30_ui_demo" }
 osrf-profile-t114-blink           = { path = "profiles/t114_blink" }
 osrf-profile-t114-midi-tx         = { path = "profiles/t114_midi_tx" }
 osrf-profile-t114-midi-rx         = { path = "profiles/t114_midi_rx" }
@@ -79,6 +86,7 @@ osrf-profile-t114-radio-rx        = { path = "profiles/t114_radio_rx" }
 osrf-profile-t114-tx-basic        = { path = "profiles/t114_tx_basic" }
 osrf-profile-t114-rx-basic        = { path = "profiles/t114_rx_basic" }
 osrf-profile-t114-rx-diversity    = { path = "profiles/t114_rx_diversity" }
+osrf-profile-t114-ui-demo         = { path = "profiles/t114_ui_demo" }
 defmt                             = "1.0"
 embedded-hal                      = "1.0"
 embedded-hal-async                = "1.0"
