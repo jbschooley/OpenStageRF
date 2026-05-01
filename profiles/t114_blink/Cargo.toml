@@ -8,17 +8,28 @@ description = "Milestone 0 blink — T114 deployment.  Wires the T114 board's Re
 [package.metadata.osrf]
 board = "t114"
 
+[features]
+default = []
+# Route bin-level logging over USB-CDC instead of (in addition to) RTT.
+# Lets users with a UF2-flashed T114 watch logs in a generic serial
+# terminal without a debug probe.  See osrf-board-t114's `usb-log`
+# feature docs for the tradeoff (app-internal `defmt::*` calls are
+# invisible — only this bin's `log::*` calls are pumped over USB).
+usb-log = ["osrf-board-t114/usb-log", "dep:log"]
+
 [dependencies]
 osrf-board-t114 = { workspace = true, features = ["defmt"] }
 osrf-app-blink  = { workspace = true }
 
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-time     = { version = "0.5" }
 
 cortex-m    = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7"
 defmt       = "1.0"
 defmt-rtt   = "1.1"
 panic-probe = { version = "1.0", features = ["print-defmt"] }
+log         = { version = "0.4", optional = true }
 
 [[bin]]
 name  = "blink"
