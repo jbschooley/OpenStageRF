@@ -39,6 +39,12 @@ embassy-time       = { version = "0.5" }
 embassy-executor   = { version = "0.10", optional = true, features = ["platform-cortex-m", "executor-thread"] }
 osrf-radio-sx126x  = { workspace = true }
 
+# ── Display: ST7789 240×135 colour TFT on TWISPI1 (SPI mode) ────────────────
+# mipidsi 0.10 ships its own SpiInterface (mipidsi::interface::SpiInterface);
+# no separate display-interface-spi dep needed.  The Display struct
+# implements `embedded_graphics_core::DrawTarget<Color = Rgb565>` directly.
+mipidsi            = "0.10"
+
 # ── usb-log feature deps ─────────────────────────────────────────────────────
 # embassy-usb-driver is already pulled in transitively by embassy-nrf 0.10
 # (which depends on it at ^0.2).  embassy-usb 0.6 / embassy-usb-logger 0.6

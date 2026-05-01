@@ -1,14 +1,34 @@
 # OpenStageRF — UI Design
 
-On-device UI for the receiver-side OpenStageRF unit. Designed for an I²C OLED (default: 128×64 SSD1306-class) plus a 5-way joystick (up, down, left, right, center push) wired to GPIOs.
+On-device UI for the receiver-side OpenStageRF unit. Designed against `embedded-graphics`' `DrawTarget` trait so the same UI logic renders to either a monochrome I²C OLED or a colour SPI TFT, plus a 5-way joystick (up, down, left, right, center push) wired to GPIOs (or, where the board has fewer buttons, a smaller input set — see input variants below).
 
-This file specifies screen layouts, navigation flow, and implementation expectations. It is intentionally hardware-light and platform-agnostic — the same UI logic runs on any board with a comparable display + 5-way input.
+This file specifies screen layouts, navigation flow, and implementation expectations. It is intentionally hardware-light and platform-agnostic — the same UI code runs on any board with an `embedded-graphics` `DrawTarget` plus enough input surface to navigate the menu tree.
 
 ## Hardware assumptions
 
-- **Display:** 128×64 OLED, I²C, monochrome. SSD1306 or SH1106 controller (driver crate `osrf-driver-display-ssd1306`). Updates over a separate I²C bus from the radio's SPI bus (per README Decision #8) so display traffic never blocks radio handling.
+The UI targets two concrete display classes; designs should look correct on both.
+
+| Class | Default board | Bus | Resolution | Colour | Driver |
+|---|---|---|---|---|---|
+| Mono OLED | DX-LR30 (external add-on) | I²C @ 400 kHz | 128×64 | `BinaryColor` | upstream `ssd1306` crate, async via embedded-hal-async |
+| Colour TFT | T114 (built-in) | SPI @ 8 MHz | 240×135 | `Rgb565` | upstream `mipidsi` crate, ST7789 controller |
+
+**Why both:**
+- DX-LR30 has no built-in display; the canonical add-on in the bench-test ecosystem is a 128×64 SSD1306 I²C OLED. Cheap, ubiquitous, low-power, monochrome.
+- The Heltec T114 has a built-in 1.14" ST7789 TFT (RGB565, 240×135) wired to SPI1 (TWISPI1) plus DC/CS/RESET/backlight GPIOs. Using anything else on T114 would mean ignoring hardware that's already populated and powered through `VEXT_ENABLE` (P0_21).
+
+**Layout approach:** all UI code targets `D: DrawTarget` where `D::Color: From<embedded_graphics::pixelcolor::BinaryColor>`. The UI uses two abstract colours — foreground and background — represented as `BinaryColor::On` and `BinaryColor::Off`. On the mono OLED these map directly; on the colour TFT, `On → white, Off → black` via `From<BinaryColor> for Rgb565`. The colour TFT therefore renders the same screens but with much more headroom: the 16-column × 8-row mono layout below maps to the colour display with comfortable padding. Future colour-only embellishments (e.g. red `LinkLost` banner, green `Lk OK`) can be guarded behind a `D::Color: From<embedded_graphics::pixelcolor::Rgb565>` bound and become no-ops on mono.
+
+**Resolution and font:** the canonical mono layout is 16-col × 8-row at 8×8 pixels per glyph (128×64). On the colour TFT we render the same 16-col × 8-row grid scaled 2×, leaving border whitespace. This keeps the UI code identical and avoids per-board asset paths. A future "colour-rich" UI variant is possible but is not the v1 target — v1 prioritises identical behaviour across boards.
+
+- **Bus separation:** display traffic never shares the radio's SPI bus (per README Decision #8). On DX-LR30 the OLED is on I²C1 (PB6/PB7) — the radio is on SPI1. On T114 the TFT is on TWISPI1 (P1_08/P1_09) — the radio is on TWISPI0. Display redraws cannot block radio handling.
+
 - **Input:** 5-way joystick on 5 GPIOs, internal pull-up enabled, joystick pulls each pin to ground when actuated. Joystick directions: Up, Down, Left, Right, Center (push). Driver crate `osrf-driver-input-joystick5way` debounces (~20 ms) and emits events.
-- **No additional buttons assumed.** v1 UI must be fully navigable with the 5-way alone. Future hardware variants may add a power button or dedicated function buttons; UI design is forward-compatible but doesn't depend on them.
+  - DX-LR30: matches the design — pads on the expansion header take a 5-way joystick module. Pins per `boards/dx_lr30/src/lib.rs::joystick`.
+  - T114: the Heltec board itself only has a single user button (P1_10), but our deployment adds a 5-way joystick on header pins. Default pin assignment in `boards/t114/src/lib.rs::joystick` (P0_08/P0_00/P0_01/P1_11/P1_04 — GPIO header pins that don't collide with the dual-radio diversity pinout). Profiles where the joystick lives elsewhere on the header override that module.
+  - **Reduced-input fallback:** for any board where the full 5-way isn't wired (or for a barebones v1 deployment), the input driver can degrade to single-button mode using the always-present `button_user`: short-press = Center, long-press = back / Idle. This is enough for a one-deep menu hierarchy. Used when `Resources::joystick` is `None` or absent.
+
+- **No additional buttons assumed.** v1 UI must be fully navigable with the 5-way (or single-button fallback) alone. Future hardware variants may add a power button or dedicated function buttons; UI design is forward-compatible but doesn't depend on them.
 
 ## Joystick mapping (universal)
 
@@ -217,11 +237,11 @@ Three tasks, all on the same executor:
 |---|---|---|---|
 | `ui_input` | medium | 100 Hz polling | Read joystick GPIOs, debounce, emit `JoystickEvent`s into a channel |
 | `ui_state` | medium | event-driven | Consume `JoystickEvent`s + tick events, update `Screen`, push `RedrawRequest`s and config-change events to `settings_writer` |
-| `ui_render` | low | up to 30 Hz, gated by `RedrawRequest` | Draw current `Screen` to OLED via I²C |
+| `ui_render` | low | up to 30 Hz, gated by `RedrawRequest` | Draw current `Screen` to the board's `DrawTarget` (I²C or SPI; whichever the board exposes) |
 
 The radio task (link layer) runs on the same executor at higher priority. Embassy's cooperative scheduler ensures the radio task isn't blocked by UI work — each task awaits independently and yields between operations.
 
-**No I²C or display work in any radio path or IRQ.** Screen updates only happen in `ui_render`, which is the lowest-priority task.
+**No display-bus work in any radio path or IRQ.** Screen updates only happen in `ui_render`, which is the lowest-priority task. Whether the bus is I²C (DX-LR30) or SPI (T114) is invisible to the rest of the system — `ui_render` only touches the board's exposed `DrawTarget`.
 
 ## Error / status overlays
 
@@ -256,7 +276,20 @@ These are not required for v1 but the layout should not preclude them:
 
 ## Display/input library choices
 
-- `osrf-driver-display-ssd1306`: built on `embedded-graphics` for text rendering. Use a small bitmap font (FONT_8X8 or similar). Avoid heavy graphics primitives — overkill for this UI and consume CPU.
-- `osrf-driver-input-joystick5way`: pure GPIO-poll, no library needed. Internal pull-ups enabled in board init.
+**Display drivers (use upstream crates, no need to write our own):**
 
-Both crates depend only on `embedded-hal` traits — they're board-agnostic and will work on any platform that exposes I²C and GPIO via embedded-hal.
+- **Mono I²C OLED (DX-LR30 add-on, future v2 RX):** the upstream [`ssd1306`](https://crates.io/crates/ssd1306) crate. Implements `embedded-graphics`' `DrawTarget<Color = BinaryColor>` directly; supports SSD1306 and SH1106 controllers. Async via embedded-hal-async (its `BufferedGraphicsModeAsync`). 128×64 the default; the same crate handles 128×32 and 64×48 if a smaller display gets used.
+- **Colour SPI TFT (T114 built-in):** the upstream [`mipidsi`](https://crates.io/crates/mipidsi) crate. Supports ST7789 (T114), ILI9341, ST7735, GC9A01, etc. Implements `DrawTarget<Color = Rgb565>`. SPI bus via `display-interface-spi`.
+
+The board crate's `Resources` struct exposes whichever driver is appropriate for that board, with a concrete type. UI code is generic over `DrawTarget` so it doesn't care which.
+
+**Font:** small bitmap, 8×8 (e.g. `embedded_graphics::mono_font::ascii::FONT_6X10` or `FONT_8X13_BOLD`). Avoid heavy graphics primitives — overkill for this UI and they consume CPU on slow buses. The colour TFT has 16-bit pixels and ~390 KB per full frame; partial redraws (only changed regions) are essential.
+
+**Input:**
+
+- `osrf-driver-input-joystick5way`: pure GPIO-poll, no library needed. Internal pull-ups enabled in board init. Used on boards with a 5-way joystick wired to GPIO — DX-LR30 (expansion header), T114 (header pins, see `boards/t114/src/lib.rs::joystick`), and the future v2 custom board.
+- `osrf-driver-input-button1`: degraded subset for deployments that don't wire the full joystick (or for the bare Heltec T114 with only its built-in user button). Same `JoystickEvent` output enum, but only emits `Center` / `LongPress(Center)` events. The UI state machine handles the reduced navigation: long-press = "back / cancel" instead of dedicated Left.
+
+Both input crates depend only on `embedded-hal` GPIO traits — board-agnostic. A given board crate can expose both `joystick` and `button_user` modules; the profile picks which input driver to instantiate based on what's actually wired in that deployment.
+
+**Why not write our own display driver:** SSD1306 and ST7789 are extremely well-trodden in the Rust embedded ecosystem; their upstream drivers are mature, support `embedded-graphics` natively, and have async backends. Writing our own would just be NIH.
