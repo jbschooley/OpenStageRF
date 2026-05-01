@@ -754,6 +754,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "osrf-app-blink"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "defmt 1.0.1",
+ "defmt-rtt",
+ "embassy-executor",
+ "embassy-time",
+ "osrf-board-dx-lr30",
+ "panic-probe",
+]
+
+[[package]]
 name = "osrf-app-midi-node"
 version = "0.1.0"
 dependencies = [
@@ -765,6 +779,9 @@ dependencies = [
  "embassy-stm32",
  "embassy-time",
  "osrf-board-dx-lr30",
+ "osrf-profile-dx-lr30-rx-basic",
+ "osrf-profile-dx-lr30-rx-diversity",
+ "osrf-profile-dx-lr30-tx-basic",
  "panic-probe",
 ]
 
@@ -800,6 +817,27 @@ version = "0.1.0"
 dependencies = [
  "defmt 1.0.1",
  "embassy-stm32",
+]
+
+[[package]]
+name = "osrf-profile-dx-lr30-rx-basic"
+version = "0.1.0"
+dependencies = [
+ "osrf-board-dx-lr30",
+]
+
+[[package]]
+name = "osrf-profile-dx-lr30-rx-diversity"
+version = "0.1.0"
+dependencies = [
+ "osrf-board-dx-lr30",
+]
+
+[[package]]
+name = "osrf-profile-dx-lr30-tx-basic"
+version = "0.1.0"
+dependencies = [
+ "osrf-board-dx-lr30",
 ]
 
 [[package]]

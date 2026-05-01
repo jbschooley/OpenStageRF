@@ -1,0 +1,26 @@
+[package]
+name        = "osrf-board-t114"
+version     = "0.1.0"
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "Heltec Mesh Node T114 v2.0 — nRF52840 + SX1262 + ST7789 TFT"
+
+# Standalone — excluded from the main (STM32) workspace because embassy-nrf
+# can't share a Cargo.lock with embassy-stm32 (links = "embassy-time-queue"
+# clash).
+[workspace]
+
+# xtask reads this block to pick the rustc target.
+[package.metadata.osrf]
+target = "thumbv7em-none-eabihf"
+mcu    = "nrf52840"
+
+[features]
+defmt = ["dep:defmt", "embassy-nrf/defmt"]
+
+[dependencies]
+defmt       = { version = "1.0", optional = true }
+# nfc-pins-as-gpio: P0_09/P0_10 are NFC-dedicated by default.  T114 wires
+# them to the P1 header as a general-purpose UART, so we must opt in.
+embassy-nrf = { version = "0.6", features = ["nrf52840", "time-driver-rtc1", "gpiote", "nfc-pins-as-gpio"] }
+cortex-m    = "0.7"

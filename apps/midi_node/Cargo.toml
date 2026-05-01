@@ -4,11 +4,30 @@ version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 
+# STM32 platform variant.  When T114/nRF hardware arrives, add a sibling
+# `apps/midi_node_nrf/` crate — embassy-stm32 and embassy-nrf can't coexist
+# in one Cargo.toml because both link the same native `embassy-time-queue`
+# library.
+
 [features]
-dx_lr30     = []
+# ── Board base ────────────────────────────────────────────────────────────────
+dx_lr30     = ["dep:osrf-board-dx-lr30"]
 dx_lr30_hsi = ["dx_lr30", "osrf-board-dx-lr30/hsi"]
 
+# ── Profiles ──────────────────────────────────────────────────────────────────
+# Each profile feature pulls its profile crate + the board base.  Pass exactly
+# one to xtask.  Adding a profile: workspace dep + optional dep below + feature
+# entry + cfg-gated re-export in src/profile.rs.
+dx_lr30_tx_basic     = ["dx_lr30", "dep:osrf-profile-dx-lr30-tx-basic"]
+dx_lr30_rx_basic     = ["dx_lr30", "dep:osrf-profile-dx-lr30-rx-basic"]
+dx_lr30_rx_diversity = ["dx_lr30", "dep:osrf-profile-dx-lr30-rx-diversity"]
+
 [dependencies]
+osrf-board-dx-lr30                = { workspace = true, optional = true }
+osrf-profile-dx-lr30-tx-basic     = { workspace = true, optional = true }
+osrf-profile-dx-lr30-rx-basic     = { workspace = true, optional = true }
+osrf-profile-dx-lr30-rx-diversity = { workspace = true, optional = true }
+
 cortex-m    = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7"
 defmt       = "1.0"
@@ -16,15 +35,8 @@ defmt-rtt   = "1.1"
 panic-probe = { version = "1.0", features = ["print-defmt"] }
 
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
-embassy-stm32    = { version = "0.6", features = ["stm32f103c8", "time-driver-any", "defmt"] }
-embassy-time     = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
-
-osrf-board-dx-lr30 = { path = "../../boards/dx_lr30", features = ["defmt"] }
-
-[[bin]]
-name              = "embassy_dx_lr30"
-path              = "src/bin/embassy_dx_lr30.rs"
-required-features = ["dx_lr30"]
+embassy-stm32    = { version = "0.6",  features = ["stm32f103c8", "time-driver-any", "defmt"] }
+embassy-time     = { version = "0.5",  features = ["defmt", "defmt-timestamp-uptime"] }
 
 [[bin]]
 name              = "smoke_dx_lr30"

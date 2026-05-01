@@ -1,0 +1,16 @@
+[package]
+name        = "osrf-profile-t114-rx-diversity"
+version     = "0.1.0"
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "Dual-radio diversity receiver — T114 + a second SX1262 on SPI3 via GPIO header"
+
+# Standalone — see boards/t114/Cargo.toml for the workspace split rationale.
+[workspace]
+
+[package.metadata.osrf]
+board = "t114"
+app   = "midi_node"
+
+[dependencies]
+osrf-board-t114 = { path = "../../boards/t114" }

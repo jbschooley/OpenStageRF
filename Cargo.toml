@@ -1,28 +1,50 @@
 [workspace]
+# T114 (nRF) crates are intentionally excluded — embassy-nrf 0.6 and
+# embassy-stm32 0.6 both link the native `embassy-time-queue` library at
+# different versions, so they can't coexist in one workspace.  T114 will
+# get its own sibling workspace when hardware arrives.
 members = [
+    "apps/blink",
     "apps/midi_node",
     "boards/dx_lr30",
     "core/link",
     "crypto",
     "drivers/radio/sx126x",
     "ports/embassy_stm32",
+    "profiles/dx_lr30_rx_basic",
+    "profiles/dx_lr30_rx_diversity",
+    "profiles/dx_lr30_tx_basic",
     "protocols/midi_packet_v1",
     "xtask",
 ]
-# xtask excluded from default-members: it's a host tool, not a cross-compiled crate.
+exclude = [
+    "boards/t114",
+    "profiles/t114_rx_basic",
+    "profiles/t114_rx_diversity",
+    "profiles/t114_tx_basic",
+]
+# xtask is a host tool, not a cross-compiled crate.
 default-members = [
+    "apps/blink",
     "apps/midi_node",
     "boards/dx_lr30",
     "core/link",
     "crypto",
     "drivers/radio/sx126x",
     "ports/embassy_stm32",
+    "profiles/dx_lr30_rx_basic",
+    "profiles/dx_lr30_rx_diversity",
+    "profiles/dx_lr30_tx_basic",
     "protocols/midi_packet_v1",
 ]
 resolver = "2"
 
 [workspace.dependencies]
-defmt            = "1.0"
-embedded-hal     = "1.0"
-embedded-hal-async = "1.0"
-heapless         = { version = "0.8", default-features = false }
+osrf-board-dx-lr30                = { path = "boards/dx_lr30" }
+osrf-profile-dx-lr30-tx-basic     = { path = "profiles/dx_lr30_tx_basic" }
+osrf-profile-dx-lr30-rx-basic     = { path = "profiles/dx_lr30_rx_basic" }
+osrf-profile-dx-lr30-rx-diversity = { path = "profiles/dx_lr30_rx_diversity" }
+defmt                             = "1.0"
+embedded-hal                      = "1.0"
+embedded-hal-async                = "1.0"
+heapless                          = { version = "0.8", default-features = false }
