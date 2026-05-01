@@ -1,0 +1,35 @@
+name        = "dx_lr30_rx_diversity"
+description = "Dual-radio diversity receiver — DX-LR30 with a second SX1262 on SPI2 via expansion headers"
+app         = "midi_node"
+role        = "rx"
+board       = "dx_lr30"
+port        = "embassy_stm32"
+
+# radio0 is the built-in SX1262 module on SPI1 (pins in boards/dx_lr30/src/pins.rs).
+# radio1 is a second SX1262 wired to the SPI2 expansion header.
+[diversity]
+mode = "dual_spi_diff_bus"
+
+[diversity.radio1]
+spi  = "SPI2"
+sck  = "PB13"  # SPI2_SCK
+miso = "PB14"  # SPI2_MISO
+mosi = "PB15"  # SPI2_MOSI
+cs   = "PB12"  # SPI2_NSS — natural hardware NSS pin
+busy = "PB5"
+nrst = "PC14"  # OSC32_IN repurposed as GPIO (RTC not used)
+dio1 = "PA8"
+# txen/rxen omitted — diversity RX stays in receive-only mode
+
+[features]
+display  = "none"
+input    = "none"
+midi_out = "din_uart"
+
+[radio]
+driver       = "sx126x"
+count        = 2
+band         = "us_915"
+frequency_hz = 915000000
+bitrate      = 300000
+modulation   = "gfsk"

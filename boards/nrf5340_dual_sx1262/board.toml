@@ -1,0 +1,39 @@
+name        = "nrf5340_dual_sx1262"
+description = "v2 custom board — nRF5340 (dual M33) + 2× SX1262 on shared SPI for true diversity"
+mcu         = "nrf5340"
+port        = "embassy_nrf"
+target      = "thumbv7em-none-eabihf"
+
+# Both radios share SPI0; a second SPI bus would require external wiring not on this PCB.
+diversity_modes = ["single", "uart_slave", "dual_spi_same_bus"]
+
+[cores.app]
+cpu    = "cortex_m33"
+crypto = "cryptocell_cc312"  # AES-CCM, AES-256, SHA-256, TRNG
+
+[cores.net]
+cpu  = "cortex_m33"
+role = "ble"                 # softdevice or open Rust BLE stack
+
+# Both radios share one SPI bus; CS is the multiplexer, IRQ/BUSY/RESET are per-radio.
+[radios.radio0]
+type  = "sx126x"
+chip  = "sx1262"
+spi   = "SPI0"
+cs    = "TBD"
+busy  = "TBD"
+dio1  = "TBD"
+reset = "TBD"
+
+[radios.radio1]
+type  = "sx126x"
+chip  = "sx1262"
+spi   = "SPI0"   # shared bus
+cs    = "TBD"
+busy  = "TBD"
+dio1  = "TBD"
+reset = "TBD"
+
+[display]
+type = "ssd1306"
+bus  = "I2C0"
