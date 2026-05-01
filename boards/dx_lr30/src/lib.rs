@@ -10,16 +10,22 @@
 //!
 //! Pin assignments verified against the LR30-SP PCBA schematic.
 
-use embassy_stm32::{bind_interrupts, dma, exti, interrupt, peripherals};
+use embassy_stm32::{bind_interrupts, dma, exti, interrupt, peripherals, usart};
 
 pub mod clocks;
 
 // EXTI15_10 (services lines 10..=15 on STM32F1) drives DIO1 = PC15.
 // DMA1 channels 2 (RX) and 3 (TX) drive SPI1 transfers for the radio.
+//
+// USART3 binding feeds `BufferedUart` (interrupt-driven, no DMA): on the
+// STM32F103C8 USART3 nominally maps to DMA1_CH2/CH3, but those channels
+// are already taken by SPI1 above, and at 31250 baud (~3.1 KB/s) DMA is
+// pure ceremony — the per-byte interrupt is fine.
 bind_interrupts!(struct Irqs {
     EXTI15_10     => exti::InterruptHandler<interrupt::typelevel::EXTI15_10>;
     DMA1_CHANNEL2 => dma::InterruptHandler<peripherals::DMA1_CH2>;
     DMA1_CHANNEL3 => dma::InterruptHandler<peripherals::DMA1_CH3>;
+    USART3        => usart::BufferedInterruptHandler<peripherals::USART3>;
 });
 
 // ── Built-in SX1262 radio on SPI1 ────────────────────────────────────────────
@@ -126,6 +132,19 @@ pub type Radio0 = osrf_radio_sx126x::Sx1262Radio<
     osrf_radio_sx126x::PinRfSwitch<embassy_stm32::gpio::Output<'static>, embassy_stm32::gpio::Output<'static>>,
 >;
 
+/// MIDI UART (USART3) configured at 31250 baud 8N1, interrupt-driven via
+/// `BufferedUart`.  Implements `embedded_io_async::Read` and `Write`
+/// directly so app crates can drive it through HAL-agnostic traits.
+///
+/// Why `BufferedUart` and not the DMA-backed `Uart`?  USART3 on the
+/// STM32F103C8 is hardwired to DMA1_CH2 (RX) and DMA1_CH3 (TX) — the
+/// same channels SPI1 (the SX1262 radio bus) requires.  DMA channel
+/// allocation is fixed in silicon, so the only way to keep both the
+/// radio and a MIDI UART alive simultaneously is to drop one of them
+/// off DMA.  At MIDI's 31250 baud (~3.1 KB/s, byte-rate ~3 kHz),
+/// per-byte interrupt servicing is trivial; SPI1 at 8 MHz needs DMA.
+pub type MidiUart = embassy_stm32::usart::BufferedUart<'static>;
+
 /// Eagerly-initialised on-board peripherals.  Apps that just want "the LED"
 /// or "the MIDI UART" call `resources()` and read fields off the result.
 pub struct Resources {
@@ -138,6 +157,9 @@ pub struct Resources {
     /// NRESET has already been pulsed; caller can immediately
     /// `radio0.init().await` and proceed to configure modulation.
     pub radio0: Radio0,
+
+    /// DIN MIDI UART on USART3 (PB10 TX, PB11 RX) at 31250 baud 8N1.
+    pub midi_uart: MidiUart,
 }
 
 /// Initialise hardware and bundle the common peripherals into `Resources`.
@@ -194,5 +216,31 @@ pub fn resources() -> Resources {
         osrf_radio_sx126x::PinRfSwitch::new(txen, rxen),
     );
 
-    Resources { status_led, radio0 }
+    // ── MIDI UART: USART3 @ 31250 baud 8N1, interrupt-driven ──────────────
+    // Static ring-buffer storage for the BufferedUart.  Sizes picked to
+    // comfortably absorb one busy MIDI second (~3 KB/s) of input plus a
+    // similar TX burst, even if the executor is briefly stalled.
+    //
+    // The unsafe block is the standard pattern for handing a 'static
+    // mutable slice to embassy: the static storage exists for the
+    // lifetime of the program, and we promise to call `resources()` only
+    // once (it consumes the singleton `Peripherals` token).
+    static mut MIDI_TX_BUF: [u8; 64] = [0; 64];
+    static mut MIDI_RX_BUF: [u8; 256] = [0; 256];
+    let mut uart_cfg = embassy_stm32::usart::Config::default();
+    uart_cfg.baudrate = 31250;
+    let midi_uart = embassy_stm32::usart::BufferedUart::new(
+        p.USART3,
+        p.PB11, // RX
+        p.PB10, // TX
+        // SAFETY: static storage, single-call resources() consumes
+        // Peripherals, so this slice is uniquely owned.
+        unsafe { &mut *core::ptr::addr_of_mut!(MIDI_TX_BUF) },
+        unsafe { &mut *core::ptr::addr_of_mut!(MIDI_RX_BUF) },
+        Irqs,
+        uart_cfg,
+    )
+    .expect("USART3 BufferedUart init failed (baudrate divider out of range?)");
+
+    Resources { status_led, radio0, midi_uart }
 }

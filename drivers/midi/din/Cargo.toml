@@ -1,0 +1,22 @@
+[package]
+name        = "osrf-midi-din"
+version     = "0.1.0"
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "DIN MIDI byte parser — converts a 31250 baud byte stream into typed MidiEvent values"
+
+[features]
+defmt = ["dep:defmt"]
+
+[dependencies]
+defmt = { workspace = true, optional = true }
+
+[lib]
+# Host-side unit tests cover the state-machine edge cases (running status,
+# real-time interruption, malformed-status-during-SysEx, etc.).  This is the
+# only no_std crate in the workspace that opts into host tests; the IDE
+# warning hit (cfg(test) macros looking ungated) is worth catching parser
+# regressions on the host instead of chasing them on hardware.
+test    = true
+doctest = false
+bench   = false

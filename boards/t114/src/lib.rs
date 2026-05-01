@@ -14,14 +14,18 @@
 //!   - SPI3    (periph 3, dedicated) → radio1 (dual_spi_diff_bus)
 //! No two modules share the same nRF52840 peripheral instance.
 
-use embassy_nrf::{bind_interrupts, peripherals, spim};
+use embassy_nrf::{bind_interrupts, buffered_uarte, peripherals, spim};
 
 pub mod clocks;
 #[cfg(feature = "usb-log")]
 pub mod usb_log;
 
+// `BufferedUarte` (used for the MIDI UART so we can expose
+// `embedded_io_async::Read`) needs UARTE1's interrupt bound to its own
+// `buffered_uarte::InterruptHandler` — not the plain `uarte::*` one.
 bind_interrupts!(struct Irqs {
     TWISPI0 => spim::InterruptHandler<peripherals::TWISPI0>;
+    UARTE1  => buffered_uarte::InterruptHandler<peripherals::UARTE1>;
 });
 
 // ── Built-in SX1262 radio (TWISPI0 in SPI mode) ──────────────────────────────
@@ -140,6 +144,17 @@ pub type Radio0 = osrf_radio_sx126x::Sx1262Radio<
     osrf_radio_sx126x::Dio2RfSwitch,
 >;
 
+/// MIDI UART (UARTE1) configured at 31250 baud 8N1.  Implements
+/// `embedded_io_async::Read` and `embedded_io_async::Write` directly so
+/// app crates can drive it through HAL-agnostic traits.
+///
+/// We use `BufferedUarte` rather than the plain `Uarte`: only the
+/// buffered driver implements `embedded_io_async::Read` (the plain
+/// `Uarte` only implements `Write`), and at MIDI's 31250 baud the
+/// extra TIMER+PPI machinery the buffered version uses for idle
+/// detection is well within budget on the otherwise-quiet UARTE1.
+pub type MidiUart = embassy_nrf::buffered_uarte::BufferedUarte<'static>;
+
 /// Eagerly-initialised on-board peripherals.  Apps that just want "the LED"
 /// or "the user button" call `resources()` and read fields off the result.
 pub struct Resources {
@@ -152,6 +167,9 @@ pub struct Resources {
     /// caller can immediately `radio0.init().await` and proceed to configure
     /// modulation.
     pub radio0: Radio0,
+
+    /// DIN MIDI UART on UARTE1 (P0_09 RX, P0_10 TX) at 31250 baud 8N1.
+    pub midi_uart: MidiUart,
 }
 
 /// Initialise hardware with the default clock config and bundle the common
@@ -239,5 +257,32 @@ fn build_resources(
         osrf_radio_sx126x::Dio2RfSwitch,
     );
 
-    (Resources { status_led, radio0 }, usbd)
+    // ── MIDI UART: UARTE1 @ 31250 baud 8N1, P0_09 RX, P0_10 TX ──────────────
+    // The `nfc-pins-as-gpio` feature on `embassy-nrf` is what makes P0_09 /
+    // P0_10 usable as a UART (T114 wires them to the P1 header).
+    //
+    // BufferedUarte requires a TIMER, two PPI channels, and a PPI group for
+    // its DMA-with-idle-detect machinery.  TIMER1 + PPI_CH0/CH1 + PPI_GROUP0
+    // are otherwise unused on this board.
+    static mut MIDI_RX_BUF: [u8; 256] = [0; 256];
+    static mut MIDI_TX_BUF: [u8; 64] = [0; 64];
+    let mut uart_cfg = embassy_nrf::uarte::Config::default();
+    uart_cfg.baudrate = embassy_nrf::uarte::Baudrate::BAUD31250;
+    let midi_uart = embassy_nrf::buffered_uarte::BufferedUarte::new(
+        p.UARTE1,
+        p.TIMER1,
+        p.PPI_CH0,
+        p.PPI_CH1,
+        p.PPI_GROUP0,
+        p.P0_09, // RX
+        p.P0_10, // TX
+        Irqs,
+        uart_cfg,
+        // SAFETY: static storage, single-call build_resources() consumes
+        // Peripherals, so these slices are uniquely owned.
+        unsafe { &mut *core::ptr::addr_of_mut!(MIDI_RX_BUF) },
+        unsafe { &mut *core::ptr::addr_of_mut!(MIDI_TX_BUF) },
+    );
+
+    (Resources { status_led, radio0, midi_uart }, usbd)
 }

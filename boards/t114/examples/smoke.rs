@@ -14,15 +14,14 @@ use defmt::{info, warn};
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
-use embassy_nrf::uarte::{Config as UarteConfig, Uarte};
-use embassy_nrf::{bind_interrupts, peripherals, uarte};
 use embassy_time::Timer;
 use osrf_board_t114 as board;
 use panic_probe as _;
 
-bind_interrupts!(struct Irqs {
-    UARTE1 => uarte::InterruptHandler<peripherals::UARTE1>;
-});
+// UARTE1 IRQ binding lives in the board crate (it owns the MIDI UART
+// since Milestone 3).  Re-binding it here would cause a duplicate-
+// symbol link error; the UART-init smoke check is exercised end-to-end
+// by `board::resources()` instead — see the t114_midi_{rx,tx} profiles.
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -88,13 +87,10 @@ async fn main(_spawner: Spawner) {
     cs.set_high();
     info!("[RADIO] CS toggle done — probe P0_24 to verify");
 
-    // ── MIDI UART (UARTE1 at 31250 baud, P0_09 RX / P0_10 TX) ─────────────────
-    // Requires `nfc-pins-as-gpio` feature (P0_09/P0_10 are NFC-dedicated by default).
-    info!("[UART] initialising UARTE1 at 31250 baud");
-    let mut uart_cfg = UarteConfig::default();
-    uart_cfg.baudrate = embassy_nrf::uarte::Baudrate::BAUD31250;
-    let _uart = Uarte::new(p.UARTE1, p.P0_09, p.P0_10, Irqs, uart_cfg);
-    info!("[UART] PASS — UARTE1 initialised at 31250 baud");
+    // MIDI UART smoke check moved to the t114_midi_{rx,tx} profile bin
+    // builds (see PLAN.md Milestone 3).  Re-binding UARTE1 here would
+    // collide with the board crate's bind_interrupts! since the MIDI
+    // UART now lives inside board::Resources.
 
     info!("══════════════════════════════════════");
     info!("  Smoke test complete.  Check RTT log");

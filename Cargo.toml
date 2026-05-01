@@ -1,21 +1,27 @@
 [workspace]
 members = [
     "apps/blink",
+    "apps/midi_bench",
     "apps/midi_node",
     "apps/radio_bench",
     "boards/dx_lr30",
     "boards/t114",
     "core/link",
     "crypto",
+    "drivers/midi/din",
     "drivers/radio/sx126x",
     "ports/embassy_stm32",
     "profiles/dx_lr30_blink",
+    "profiles/dx_lr30_midi_rx",
+    "profiles/dx_lr30_midi_tx",
     "profiles/dx_lr30_radio_rx",
     "profiles/dx_lr30_radio_tx",
     "profiles/dx_lr30_rx_basic",
     "profiles/dx_lr30_rx_diversity",
     "profiles/dx_lr30_tx_basic",
     "profiles/t114_blink",
+    "profiles/t114_midi_rx",
+    "profiles/t114_midi_tx",
     "profiles/t114_radio_rx",
     "profiles/t114_radio_tx",
     "profiles/t114_rx_basic",
@@ -28,14 +34,18 @@ members = [
 # tool) — `.cargo/config.toml` sets the default target to thumbv7m-none-eabi.
 default-members = [
     "apps/blink",
+    "apps/midi_bench",
     "apps/midi_node",
     "apps/radio_bench",
     "boards/dx_lr30",
     "core/link",
     "crypto",
+    "drivers/midi/din",
     "drivers/radio/sx126x",
     "ports/embassy_stm32",
     "profiles/dx_lr30_blink",
+    "profiles/dx_lr30_midi_rx",
+    "profiles/dx_lr30_midi_tx",
     "profiles/dx_lr30_radio_rx",
     "profiles/dx_lr30_radio_tx",
     "profiles/dx_lr30_rx_basic",
@@ -47,17 +57,23 @@ resolver = "2"
 
 [workspace.dependencies]
 osrf-app-blink                    = { path = "apps/blink" }
+osrf-app-midi-bench               = { path = "apps/midi_bench" }
 osrf-app-radio-bench              = { path = "apps/radio_bench" }
 osrf-board-dx-lr30                = { path = "boards/dx_lr30" }
 osrf-board-t114                   = { path = "boards/t114" }
+osrf-midi-din                     = { path = "drivers/midi/din" }
 osrf-radio-sx126x                 = { path = "drivers/radio/sx126x" }
 osrf-profile-dx-lr30-blink        = { path = "profiles/dx_lr30_blink" }
+osrf-profile-dx-lr30-midi-tx      = { path = "profiles/dx_lr30_midi_tx" }
+osrf-profile-dx-lr30-midi-rx      = { path = "profiles/dx_lr30_midi_rx" }
 osrf-profile-dx-lr30-radio-tx     = { path = "profiles/dx_lr30_radio_tx" }
 osrf-profile-dx-lr30-radio-rx     = { path = "profiles/dx_lr30_radio_rx" }
 osrf-profile-dx-lr30-tx-basic     = { path = "profiles/dx_lr30_tx_basic" }
 osrf-profile-dx-lr30-rx-basic     = { path = "profiles/dx_lr30_rx_basic" }
 osrf-profile-dx-lr30-rx-diversity = { path = "profiles/dx_lr30_rx_diversity" }
 osrf-profile-t114-blink           = { path = "profiles/t114_blink" }
+osrf-profile-t114-midi-tx         = { path = "profiles/t114_midi_tx" }
+osrf-profile-t114-midi-rx         = { path = "profiles/t114_midi_rx" }
 osrf-profile-t114-radio-tx        = { path = "profiles/t114_radio_tx" }
 osrf-profile-t114-radio-rx        = { path = "profiles/t114_radio_rx" }
 osrf-profile-t114-tx-basic        = { path = "profiles/t114_tx_basic" }
