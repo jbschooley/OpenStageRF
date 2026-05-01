@@ -8,17 +8,25 @@ description = "Milestone 2 radio bench TX — T114 deployment of osrf-app-radio-
 [package.metadata.osrf]
 board = "t114"
 
+[features]
+default = []
+# Route bin-level logging over USB-CDC.  See profiles/t114_blink/Cargo.toml
+# for the full description of the tradeoff.
+usb-log = ["osrf-board-t114/usb-log", "dep:log"]
+
 [dependencies]
 osrf-board-t114      = { workspace = true, features = ["defmt"] }
 osrf-app-radio-bench = { workspace = true }
 
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-time     = { version = "0.5" }
 
 cortex-m    = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7"
 defmt       = "1.0"
 defmt-rtt   = "1.1"
 panic-probe = { version = "1.0", features = ["print-defmt"] }
+log         = { version = "0.4", optional = true }
 
 [[bin]]
 name  = "bench"

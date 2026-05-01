@@ -17,6 +17,8 @@
 use embassy_nrf::{bind_interrupts, peripherals, spim};
 
 pub mod clocks;
+#[cfg(feature = "usb-log")]
+pub mod usb_log;
 
 bind_interrupts!(struct Irqs {
     TWISPI0 => spim::InterruptHandler<peripherals::TWISPI0>;
@@ -111,7 +113,14 @@ pub mod vext_power {
 /// accurate Embassy time-driver timestamps; HFCLK stays on HFINT (64 MHz
 /// internal RC).  See `clocks.rs` for the rationale.
 pub fn init() -> embassy_nrf::Peripherals {
-    embassy_nrf::init(clocks::default_config())
+    init_with(clocks::default_config())
+}
+
+/// Like [`init()`] but with a caller-supplied clock config.  Use this when
+/// the default HFINT/LFXO mix isn't enough — most notably, USB-CDC needs
+/// HFXO (see [`clocks::usb_config()`]).
+pub fn init_with(config: embassy_nrf::config::Config) -> embassy_nrf::Peripherals {
+    embassy_nrf::init(config)
 }
 
 // ── Board-level resource API ─────────────────────────────────────────────────
@@ -145,12 +154,51 @@ pub struct Resources {
     pub radio0: Radio0,
 }
 
-/// Initialise hardware and bundle the common peripherals into `Resources`.
+/// Initialise hardware with the default clock config and bundle the common
+/// peripherals into `Resources`.  Equivalent to `resources_with(clocks::default_config())`.
 pub fn resources() -> Resources {
+    resources_with(clocks::default_config())
+}
+
+/// Like [`resources()`] but with a caller-supplied clock config.  Use this
+/// when the default HFINT/LFXO mix isn't enough — most notably, the
+/// `usb-log` feature requires HFXO (see [`clocks::usb_config()`]).
+///
+/// The unused-peripheral tokens needed for USB (`USBD`, `POWER` IRQ binding)
+/// remain inside `embassy_nrf::Peripherals` and are not exposed by this
+/// resource bundle; profiles that need them must call
+/// [`resources_and_usbd_with()`] instead.
+pub fn resources_with(config: embassy_nrf::config::Config) -> Resources {
+    let p = init_with(config);
+    let (r, _usbd) = build_resources(p);
+    r
+}
+
+/// Like [`resources_with()`] but also returns the still-unused USB
+/// peripheral token, so a profile can hand it to [`crate::usb_log::spawn`]
+/// alongside its `Resources`.  Available regardless of features so the
+/// API surface stays stable; the returned token is unused (and the USB
+/// peripheral stays idle) until the caller actually starts a USB driver.
+pub fn resources_and_usbd_with(
+    config: embassy_nrf::config::Config,
+) -> (Resources, embassy_nrf::Peri<'static, embassy_nrf::peripherals::USBD>) {
+    let p = init_with(config);
+    build_resources(p)
+}
+
+/// Internal: take an `embassy_nrf::Peripherals`, peel off USBD, build
+/// `Resources` from the rest.  Inlined into both public entry points so
+/// we never have to pass a partially-moved `Peripherals` across a
+/// function boundary.
+fn build_resources(
+    p: embassy_nrf::Peripherals,
+) -> (Resources, embassy_nrf::Peri<'static, embassy_nrf::peripherals::USBD>) {
     use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
     use embassy_nrf::spim::{Config as SpimConfig, Frequency, Spim, MODE_0};
 
-    let p = init();
+    // Move USBD out first — Rust accepts partial moves of a struct so long
+    // as we only access (not move) the rest of the fields below.
+    let usbd = p.USBD;
 
     // ── Status LED (P1_03, active-high) ─────────────────────────────────────
     let status_led = Output::new(p.P1_03, Level::Low, OutputDrive::Standard);
@@ -191,5 +239,5 @@ pub fn resources() -> Resources {
         osrf_radio_sx126x::Dio2RfSwitch,
     );
 
-    Resources { status_led, radio0 }
+    (Resources { status_led, radio0 }, usbd)
 }
