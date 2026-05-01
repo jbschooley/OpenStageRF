@@ -1,0 +1,22 @@
+name        = "t114"
+description = "Heltec T114 dev board — nRF52840 + SX1262 (Stage 2.5 second platform)"
+mcu         = "nrf52840"
+port        = "embassy_nrf"
+target      = "thumbv7em-none-eabihf"
+
+# "dual_spi_same_bus" NOT listed — T114 has only one SPI bus wired to the
+# built-in radio; a second module must be on a separate SPI peripheral.
+diversity_modes = ["single", "uart_slave", "dual_spi_diff_bus"]
+
+[radios.radio0]
+type  = "sx126x"
+chip  = "sx1262"
+spi   = "SPI0"
+# Exact pin assignments per Heltec T114 schematic — TBD, verify on board
+cs    = "TBD"
+busy  = "TBD"
+dio1  = "TBD"
+reset = "TBD"
+
+# T114 includes integrated battery management, USB-C, and a small OLED on some
+# variants. UI peripherals (display, buttons) connect via header pins.

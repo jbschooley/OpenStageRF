@@ -1,0 +1,15 @@
+mcu = "stm32"
+
+diversity_modes = ["single", "uart_slave", "dual_spi_same_bus"]
+
+[radios.radio0]
+spi = "SPI1"
+cs  = "PA4"
+
+[radios.radio1]
+spi = "SPI1"
+cs  = "PA15"
+
+[display]
+type = "ssd1306"
+bus  = "I2C1"

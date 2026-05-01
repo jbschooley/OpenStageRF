@@ -1,0 +1,30 @@
+name        = "dx_lr30"
+description = "DX-LR30-900M22SP dev board — STM32F103C8T6 + DX-LR30-900M22S (SX1262)"
+mcu         = "stm32f103c8t6"
+port        = "embassy_stm32"
+target      = "thumbv7m-none-eabi"
+
+# High-level board metadata used by the xtask build system.
+# Pin assignments live in src/pins.rs — edit there, not here.
+
+# "dual_spi_same_bus" shares SPI1 (two CS lines); "dual_spi_diff_bus" puts
+# radio1 on SPI2 (PB13/PB14/PB15) via the expansion headers.
+diversity_modes = ["single", "uart_slave", "dual_spi_same_bus", "dual_spi_diff_bus"]
+
+[clocks]
+hse_crystal    = "none"       # X1 footprint absent; board runs on HSI
+default_config = "hsi_64mhz"
+
+[radios.radio0]
+type = "sx126x"
+chip = "sx1262"
+spi  = "SPI1"
+
+[midi]
+uart = "USART3"   # USART1=CH340C debug, USART2=radio pins — see pins.rs
+
+[leds]
+status = "PC13"
+
+[ui]
+oled_i2c = "I2C1"
