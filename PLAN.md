@@ -67,21 +67,24 @@ These were settled in conversation before code starts:
 
 ### Milestone 2 — SX1262 driver (5–10 days)
 
-**Goal:** packets travel between two DX-LR30 boards over the air.
+**Goal:** packets travel between two SX1262-equipped boards (DX-LR30 ↔ DX-LR30, or DX-LR30 ↔ T114) over the air.
 
-- [ ] Survey existing SX126x crates: `lora-rs/lora-phy`, `sx126x` on crates.io, `lora-modulation`. Document which have GFSK support and embedded-hal-async traits.
-- [ ] Decision: integrate existing crate or write `osrf-radio-sx126x` from scratch.
-- [ ] Implement (or wrap) the minimum API:
-  - `init()` — chip wake, calibration, set standby mode
-  - `set_frequency(hz)`
-  - `set_modulation_gfsk(bitrate, deviation, bandwidth)`
-  - `set_packet_format(preamble_len, sync_word, payload_max_len, crc_on)`
-  - `set_tx_power(dbm)`
-  - `tx(payload: &[u8])` — async, returns when TX complete
-  - `rx_continuous()` — async, awaits DIO1 IRQ, returns received payload + RSSI + SNR + CRC OK flag
-- [ ] Bench test: TX board sends `[0xDE 0xAD 0xBE 0xEF]` once per second; RX board logs received bytes via RTT.
+- [x] Survey: `lora-phy` (LoRa-only on SX126x backend), `tweedegolf/sx126x` (no async, no GFSK, no DIO2 RF switch), `BroderickCarlin/sx1262` (full GFSK, async, DIO2 switch). See conversation log for full report.
+- [x] Decision: wrap `sx1262 = "0.3"` with our own `osrf-radio-sx126x` thin async layer
+- [x] `osrf-radio-sx126x` wrapper — compiles for both targets, with and without `defmt`:
+  - `Sx1262Radio<Spi, Dio1, Reset, Switch>` — generic over `embedded-hal-async` `SpiDevice` + `Wait`-able DIO1 + `OutputPin` reset + a `RfSwitchControl` impl
+  - `RfSwitchControl` trait with two impls: `Dio2RfSwitch` (T114, calls `SetDio2AsRfSwitchCtrl(true)` once during init) and `PinRfSwitch<Txen, Rxen>` (DX-LR30, toggles GPIOs around tx/rx)
+  - `init`, `set_frequency`, `set_modulation_gfsk`, `set_packet_format`, `set_tx_power`, `tx`, `rx_continuous` — all async
+  - `RxPacket { len, rssi_dbm, crc_ok }` — no SNR (SX1262 only reports SNR for LoRa; FSK uses RssiSync from `GetPacketStatus`)
+- [ ] **Board-side reset gate:** the wrapper does not own `DelayNs`, so the board's `Resources` builder must pulse NRESET low ≥100 µs and wait ≥10 ms before calling `radio.init().await`. Add this to each board crate's `resources()` constructor when the radio gets wired in.
+- [ ] Wire `radio0` field into `Resources` on both `boards/dx_lr30/` and `boards/t114/` — uses `PinRfSwitch` on DX-LR30, `Dio2RfSwitch` on T114
+- [ ] Bench test: TX board sends `[0xDE 0xAD 0xBE 0xEF]` once per second at 915 MHz / 300 kbps GFSK; RX board logs received bytes + RSSI via RTT.
 
 **Exit criteria:** RX reliably receives TX's test packet at 5 m line of sight, RSSI logged is reasonable (-50 to -70 dBm).
+
+**Known upstream caveats** (worth tracking, not blocking):
+- `sx1262 = "0.3.0"` lags master — `PacketParams` is a raw `[u8; 9]` here vs. typed enums on master. Wrapper hand-encodes the byte layout. If we hit issues, switch to a git dep at master.
+- Upstream `Status::from_bytes(...).unwrap()` panics on weird reserved bits in the chip's status response. Not a problem under nominal operation but worth knowing if we see mysterious crashes.
 
 ### Milestone 3 — DIN MIDI parser and I/O (3–5 days)
 

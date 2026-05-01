@@ -14,6 +14,12 @@
 //!   - SPI3    (periph 3, dedicated) → radio1 (dual_spi_diff_bus)
 //! No two modules share the same nRF52840 peripheral instance.
 
+use embassy_nrf::{bind_interrupts, peripherals, spim};
+
+bind_interrupts!(struct Irqs {
+    TWISPI0 => spim::InterruptHandler<peripherals::TWISPI0>;
+});
+
 // ── Built-in SX1262 radio (TWISPI0 in SPI mode) ──────────────────────────────
 // No TXEN/RXEN pins — the SX1262's DIO2 output drives a UPG2179 RF switch IC
 // directly.  Set DIO2_AS_RF_SWITCH in the SX126x driver config.
@@ -106,22 +112,78 @@ pub fn init() -> embassy_nrf::Peripherals {
 // The fields below are HAL-specific types but each implements an embedded-hal
 // trait, letting board-agnostic apps drive them through the trait surface.
 
+/// SX1262 wrapper as it lives on this board: SPIM0 (TWISPI0) + GPIOTE-driven
+/// DIO1 + GPIO NRESET + DIO2-driven RF switch (no MCU-side switch pins).
+pub type Radio0 = osrf_radio_sx126x::Sx1262Radio<
+    embedded_hal_bus::spi::ExclusiveDevice<
+        embassy_nrf::spim::Spim<'static>,
+        embassy_nrf::gpio::Output<'static>,
+        embassy_time::Delay,
+    >,
+    embassy_nrf::gpio::Input<'static>,
+    embassy_nrf::gpio::Output<'static>,
+    osrf_radio_sx126x::Dio2RfSwitch,
+>;
+
 /// Eagerly-initialised on-board peripherals.  Apps that just want "the LED"
 /// or "the user button" call `resources()` and read fields off the result.
 pub struct Resources {
     /// Green status LED (P1_03, active-high).  Implements
     /// `embedded_hal::digital::OutputPin`.
     pub status_led: embassy_nrf::gpio::Output<'static>,
+
+    /// Built-in SX1262 radio on TWISPI0 (SPI mode).  RF switch is driven by
+    /// the chip's DIO2 line autonomously.  NRESET has already been pulsed;
+    /// caller can immediately `radio0.init().await` and proceed to configure
+    /// modulation.
+    pub radio0: Radio0,
 }
 
 /// Initialise hardware and bundle the common peripherals into `Resources`.
 pub fn resources() -> Resources {
+    use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
+    use embassy_nrf::spim::{Config as SpimConfig, Frequency, Spim, MODE_0};
+
     let p = init();
-    Resources {
-        status_led: embassy_nrf::gpio::Output::new(
-            p.P1_03,
-            embassy_nrf::gpio::Level::Low, // active-high — start LED off
-            embassy_nrf::gpio::OutputDrive::Standard,
-        ),
-    }
+
+    // ── Status LED (P1_03, active-high) ─────────────────────────────────────
+    let status_led = Output::new(p.P1_03, Level::Low, OutputDrive::Standard);
+
+    // ── SX1262 SPI bus: SPIM0 @ 8 MHz, MODE_0 ───────────────────────────────
+    let mut spi_cfg = SpimConfig::default();
+    spi_cfg.frequency = Frequency::M8;
+    spi_cfg.mode = MODE_0;
+    let spi = Spim::new(
+        p.TWISPI0,
+        Irqs,
+        p.P0_19, // SCK
+        p.P0_23, // MISO
+        p.P0_22, // MOSI
+        spi_cfg,
+    );
+    let cs = Output::new(p.P0_24, Level::High, OutputDrive::Standard);
+    let spi_dev = embedded_hal_bus::spi::ExclusiveDevice::new(spi, cs, embassy_time::Delay)
+        .expect("CS pin set_high cannot fail (Infallible)");
+
+    // ── DIO1 = P0_20 (interrupt-capable Input via GPIOTE) ───────────────────
+    let dio1 = Input::new(p.P0_20, Pull::Down);
+
+    // ── NRESET = P0_25 ──────────────────────────────────────────────────────
+    let mut reset = Output::new(p.P0_25, Level::High, OutputDrive::Standard);
+
+    // ── Hardware reset pulse: low ≥100 µs, then ≥10 ms post-reset wait ──────
+    // SYSCLK on nRF52840 is 64 MHz.  Be generous: ~200 µs and ~15 ms.
+    reset.set_low();
+    cortex_m::asm::delay(64 * 200);
+    reset.set_high();
+    cortex_m::asm::delay(64_000 * 15);
+
+    let radio0 = osrf_radio_sx126x::Sx1262Radio::new(
+        spi_dev,
+        dio1,
+        reset,
+        osrf_radio_sx126x::Dio2RfSwitch,
+    );
+
+    Resources { status_led, radio0 }
 }
