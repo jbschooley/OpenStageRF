@@ -1,0 +1,13 @@
+[package]
+name        = "osrf-profile-dx-lr30-tx-basic"
+version     = "0.1.0"
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "First-edition transmitter — DX-LR30, single SX1262, US 915 ISM, GFSK MIDI"
+
+[package.metadata.osrf]
+board = "dx_lr30"
+app   = "midi_node"
+
+[dependencies]
+osrf-board-dx-lr30 = { workspace = true }

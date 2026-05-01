@@ -1,0 +1,13 @@
+[package]
+name        = "osrf-profile-dx-lr30-rx-diversity"
+version     = "0.1.0"
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "Dual-radio diversity receiver — DX-LR30 with a second SX1262 on SPI2"
+
+[package.metadata.osrf]
+board = "dx_lr30"
+app   = "midi_node"
+
+[dependencies]
+osrf-board-dx-lr30 = { workspace = true }

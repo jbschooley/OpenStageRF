@@ -1,16 +1,22 @@
 [package]
-name    = "osrf-board-dx-lr30"
-version = "0.1.0"
-edition = "2021"
-license = "AGPL-3.0-or-later"
+name        = "osrf-board-dx-lr30"
+version     = "0.1.0"
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "DX-LR30-900M22SP dev board — STM32F103C8T6 + DX-LR30-900M22S (SX1262)"
+
+# xtask reads this block to pick the rustc target.
+[package.metadata.osrf]
+target = "thumbv7m-none-eabi"
+mcu    = "stm32f103c8t6"
 
 [features]
 defmt = ["dep:defmt", "embassy-stm32/defmt"]
-# Use HSI (internal 8 MHz oscillator) instead of HSE+PLL.
+# Use HSI (internal 8 MHz oscillator) instead of HSI+PLL.
 # Safe for initial bring-up when crystal presence is unconfirmed.
 hsi = []
 
 [dependencies]
-defmt        = { workspace = true, optional = true }
+defmt         = { workspace = true, optional = true }
 embassy-stm32 = { version = "0.6", features = ["stm32f103c8", "time-driver-any"] }
-cortex-m     = "0.7"
+cortex-m      = "0.7"

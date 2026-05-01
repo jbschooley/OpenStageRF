@@ -1,0 +1,31 @@
+[package]
+name        = "osrf-app-blink"
+version     = "0.1.0"
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "Milestone 0 — blink the status LED.  STM32 platform variant; the nRF variant in apps/blink_nrf shares the bin source via `[[bin]] path`."
+
+[features]
+dx_lr30 = []
+
+# `t114` is intentionally not a feature here — it lives in apps/blink_nrf.
+# Tell rustc check-cfg about it so the cfg-gated `use` in blink.rs doesn't warn.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("t114"))'] }
+
+[dependencies]
+osrf-board-dx-lr30 = { workspace = true, features = ["defmt"] }
+
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-time     = { version = "0.5",  features = ["defmt", "defmt-timestamp-uptime"] }
+
+cortex-m    = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7"
+defmt       = "1.0"
+defmt-rtt   = "1.1"
+panic-probe = { version = "1.0", features = ["print-defmt"] }
+
+[[bin]]
+name              = "dx_lr30"
+path              = "src/blink.rs"
+required-features = ["dx_lr30"]
