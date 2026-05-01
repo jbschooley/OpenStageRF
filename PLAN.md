@@ -90,13 +90,17 @@ These were settled in conversation before code starts:
 
 **Goal:** MIDI events flow in and out of the MCU correctly.
 
-- [ ] `osrf-driver-midi-din`: UART @ 31250 baud 8N1, async byte stream
-- [ ] MIDI byte parser state machine:
+- [x] `osrf-midi-din` parser crate (`drivers/midi/din/`) — `MidiParser` consumes a 31250 baud byte stream and emits typed `MidiEvent` values.  17 host-side unit tests cover the state-machine edge cases (running status, real-time interruption, SysEx with embedded real-time, malformed-status-during-SysEx, undefined system bytes).
+- [x] MIDI byte parser state machine:
   - status bytes (0x80–0xFF) vs data bytes (0x00–0x7F)
   - running status (data bytes following a status byte reuse the previous status)
   - real-time messages (0xF8–0xFF) can interrupt other messages without affecting parser state
-  - SysEx (0xF0…0xF7), variable length, terminated by 0xF7 or by the next status byte
-- [ ] Output: MIDI events (`MidiEvent::NoteOn{ch, note, vel}`, etc.) and `MidiEvent::SysExFragment{is_first, is_last, bytes}`
+  - SysEx (0xF0…0xF7), streamed via `ParseResult::SysExByte(u8)` between `MidiEvent::SysExStart` and `SysExEnd` (consumer accumulates if it cares)
+- [x] Output shape: `MidiEvent::{NoteOff, NoteOn, PolyAftertouch, ControlChange, ProgramChange, ChannelAftertouch, PitchBend, TimeCodeQuarterFrame, SongPosition, SongSelect, TuneRequest, TimingClock, Start, Continue, Stop, ActiveSensing, SystemReset, SysExStart, SysExEnd}`.  SysEx body is **streamed**, not buffered into a `SysExFragment` — that decision keeps the parser allocation-free and pushes the buffer-size policy to the consumer.
+- [x] Board-agnostic bench app `osrf-app-midi-bench` (`apps/midi_bench/`) generic over `embedded_io_async::{Read, Write}`: `run_rx` parses + logs every event, `run_tx` arpeggiates C major using running status with interleaved real-time clock.
+- [x] DX-LR30 board crate exposes `Resources::midi_uart` as `BufferedUart<'static>` over USART3 PB10/PB11.  **DMA conflict resolution**: USART3's hardwired DMA channels (DMA1_CH2/CH3) collide with SPI1's allocation for the SX1262, so the MIDI UART runs interrupt-driven via `BufferedUart` — at 31250 baud the per-byte interrupt is trivial.
+- [x] T114 board crate exposes `Resources::midi_uart` as `BufferedUarte<'static>` over UARTE1 P0_09/P0_10 (consumes TIMER1 + PPI_CH0/CH1 + PPI_GROUP0 for the buffered driver's idle-detect machinery).  Plain `Uarte` only implements `embedded_io_async::Write`, not `Read`, so `BufferedUarte` is the right choice anyway.
+- [x] Profile binaries: `dx_lr30_midi_{rx,tx}`, `t114_midi_{rx,tx}` (the latter pair gated with optional `usb-log` feature mirroring the radio bench profiles).
 - [ ] Bench test on TX side: connect keyboard MIDI OUT to FeatherWing → DX-LR30; play notes; log parsed events via RTT.
 - [ ] Bench test on RX side: synthesize a stream of `MidiEvent::NoteOn`/`NoteOff` in firmware, push out FeatherWing UART, verify on a synth.
 

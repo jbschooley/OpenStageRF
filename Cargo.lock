@@ -932,6 +932,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "osrf-app-midi-bench"
+version = "0.1.0"
+dependencies = [
+ "defmt 1.0.1",
+ "embassy-time",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "embedded-io-async 0.7.0",
+ "osrf-midi-din",
+]
+
+[[package]]
 name = "osrf-app-midi-node"
 version = "0.1.0"
 dependencies = [
@@ -1017,6 +1029,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "osrf-midi-din"
+version = "0.1.0"
+dependencies = [
+ "defmt 1.0.1",
+]
+
+[[package]]
 name = "osrf-port-embassy-stm32"
 version = "0.1.0"
 dependencies = [
@@ -1034,6 +1053,34 @@ dependencies = [
  "defmt-rtt",
  "embassy-executor",
  "osrf-app-blink",
+ "osrf-board-dx-lr30",
+ "panic-probe",
+]
+
+[[package]]
+name = "osrf-profile-dx-lr30-midi-rx"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "defmt 1.0.1",
+ "defmt-rtt",
+ "embassy-executor",
+ "osrf-app-midi-bench",
+ "osrf-board-dx-lr30",
+ "panic-probe",
+]
+
+[[package]]
+name = "osrf-profile-dx-lr30-midi-tx"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "defmt 1.0.1",
+ "defmt-rtt",
+ "embassy-executor",
+ "osrf-app-midi-bench",
  "osrf-board-dx-lr30",
  "panic-probe",
 ]
@@ -1099,6 +1146,38 @@ dependencies = [
  "embassy-time",
  "log",
  "osrf-app-blink",
+ "osrf-board-t114",
+ "panic-probe",
+]
+
+[[package]]
+name = "osrf-profile-t114-midi-rx"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "defmt 1.0.1",
+ "defmt-rtt",
+ "embassy-executor",
+ "embassy-time",
+ "log",
+ "osrf-app-midi-bench",
+ "osrf-board-t114",
+ "panic-probe",
+]
+
+[[package]]
+name = "osrf-profile-t114-midi-tx"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "defmt 1.0.1",
+ "defmt-rtt",
+ "embassy-executor",
+ "embassy-time",
+ "log",
+ "osrf-app-midi-bench",
  "osrf-board-t114",
  "panic-probe",
 ]
