@@ -54,3 +54,17 @@ embedded-hal                      = "1.0"
 embedded-hal-async                = "1.0"
 embedded-hal-bus                  = "0.3"
 heapless                          = { version = "0.9", default-features = false }
+
+# Embedded targets are tight on flash (STM32F103C8 has 64 KB).  Optimize for
+# size even in dev so debug builds fit; LTO in release shaves more.
+[profile.dev]
+opt-level        = "s"
+debug            = true
+overflow-checks  = true
+
+[profile.release]
+opt-level        = "s"
+lto              = "fat"
+codegen-units    = 1
+debug            = true
+overflow-checks  = true

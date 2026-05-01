@@ -25,3 +25,19 @@ cortex-m      = "0.7"
 test    = false
 doctest = false
 bench   = false
+
+# ── dev-dependencies — only used by examples/ (smoke test, etc.) ─────────────
+[dev-dependencies]
+cortex-m         = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt      = "0.7"
+defmt            = "1.0"
+defmt-rtt        = "1.1"
+panic-probe      = { version = "1.0", features = ["print-defmt"] }
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-time     = { version = "0.5",  features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-stm32    = { version = "0.6",  features = ["stm32f103c8", "time-driver-any", "defmt"] }
+
+[[example]]
+name  = "smoke"
+test  = false
+bench = false

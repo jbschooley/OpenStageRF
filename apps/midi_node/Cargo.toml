@@ -42,10 +42,3 @@ embassy-time     = { version = "0.5",  features = ["defmt", "defmt-timestamp-upt
 test    = false
 doctest = false
 bench   = false
-
-[[bin]]
-name              = "smoke_dx_lr30"
-path              = "src/bin/smoke_dx_lr30.rs"
-required-features = ["dx_lr30"]
-test              = false
-bench             = false

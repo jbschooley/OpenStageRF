@@ -869,8 +869,13 @@ name = "osrf-board-dx-lr30"
 version = "0.1.0"
 dependencies = [
  "cortex-m",
+ "cortex-m-rt",
  "defmt 1.0.1",
+ "defmt-rtt",
+ "embassy-executor",
  "embassy-stm32",
+ "embassy-time",
+ "panic-probe",
 ]
 
 [[package]]
@@ -878,11 +883,16 @@ name = "osrf-board-t114"
 version = "0.1.0"
 dependencies = [
  "cortex-m",
+ "cortex-m-rt",
  "defmt 1.0.1",
+ "defmt-rtt",
+ "embassy-executor",
  "embassy-nrf",
+ "embassy-time",
  "embedded-hal 1.0.0",
  "embedded-hal-async",
  "embedded-hal-bus",
+ "panic-probe",
 ]
 
 [[package]]

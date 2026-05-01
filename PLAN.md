@@ -48,20 +48,22 @@ These were settled in conversation before code starts:
 
 **Exit criteria:** `cargo run -p osrf-app-midi-node --target thumbv7m-none-eabi --features dx_lr30` flashes the board and shows logs.
 
-### Milestone 1 — DX-LR30 schematic verification + hardware bring-up (3–5 days)
+### Milestone 1 — schematic verification + hardware bring-up (3–5 days)
 
 **Goal:** all peripherals respond. Pinmap is no longer TBD.
 
-- [ ] Obtain DX-LR30 schematic; verify pin assignments in `boards/dx_lr30/src/pins.rs` and `board.yaml` (all currently placeholder — marked with "verify" comments)
+- [x] DX-LR30 schematic verified; pin assignments live in `boards/dx_lr30/src/lib.rs` (module-per-peripheral)
+- [x] T114 schematic verified (Heltec Mesh Node T114 v2.0); pin assignments in `boards/t114/src/lib.rs`
+- [x] `osrf-board-dx-lr30`: HSI+PLL clock config (64 MHz, no external crystal); `boards/dx_lr30/src/clocks.rs`
+- [x] Smoke test `examples/smoke.rs` for both boards — LED, SX1262 reset/BUSY/DIO1/CS, MIDI UART init.
+      Run: `cargo run --example smoke -p osrf-board-dx-lr30 --target thumbv7m-none-eabi`
+      Run: `cargo run --example smoke -p osrf-board-t114    --target thumbv7em-none-eabihf`
 - [ ] Wire ST-Link SWD: SWDIO, SWCLK, GND, optionally NRST
-- [ ] Wire Adafruit MIDI FeatherWing: 3V3 + GND, FeatherWing TX → DX-LR30 USART RX, FeatherWing RX ← DX-LR30 USART TX (5-pin DIN side handles isolation/level conversion)
-- [ ] (RX side only) wire I²C OLED + 5-way joystick to free GPIOs per `board.yaml`; resolve joystick pin conflicts (joy_down/joy_left currently clash with USART1)
-- [x] `osrf-board-dx-lr30`: HSE+PLL clock config (72 MHz via 8 MHz crystal), HSI fallback, peripheral init — `boards/dx_lr30/src/clocks.rs`
-- [x] Pin assignments centralised in `boards/dx_lr30/src/pins.rs` — one file to edit after schematic verification
-- [x] Smoke test binary `smoke_dx_lr30` — tests LED, SX1262 reset/BUSY/DIO1/CS, USART2 init; flash with `cargo xtask run dx_lr30_tx_basic --bin smoke_dx_lr30`
-- [ ] Run `smoke_dx_lr30` on hardware; fix any pin mismatches found
+- [ ] Wire Adafruit MIDI FeatherWing on the chosen board's MIDI UART pins
+- [ ] (RX side only) wire I²C OLED (DX-LR30) or onboard ST7789 (T114) + buttons
+- [ ] Run `smoke` example on each board; fix any pin mismatches found
 
-**Exit criteria:** schematic-verified pinmap committed; all GPIOs respond.
+**Exit criteria:** schematic-verified pinmap committed; all GPIOs respond on real hardware.
 
 ### Milestone 2 — SX1262 driver (5–10 days)
 
