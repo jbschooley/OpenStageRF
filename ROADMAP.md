@@ -7,6 +7,10 @@ The active project state, architecture, and design decisions are in [README.md](
 ### Stage 1 — basic link (current focus, v1)
 See [First Edition Target](README.md#first-edition-target) in the README. 1× DX-LR30 TX, 1× DX-LR30 RX, one-way packetized MIDI over GFSK at ~915 MHz, no diversity, no encryption. Built on Rust + embassy via `embassy-stm32`.
 
+**Driver:** `drivers/radio/sx126x` wraps the upstream `sx1262` crate (BroderickCarlin) with a thin async layer + `RfSwitchControl` trait. Two impls cover the boards we care about: `Dio2RfSwitch` (T114, internal RF switch via SX1262 DIO2) and `PinRfSwitch` (DX-LR30, external TXEN/RXEN GPIOs). See PLAN.md Milestone 2 for the API.
+
+**SX1262 GFSK rate limit (300 kbps):** the SX1262 silicon caps GFSK at 300 kbps per datasheet. This is fine for MIDI (a few kbps of sustained traffic, lots of headroom for retries/diversity) and is the firm reason audio profiles in Stage 5 below run on Si4463 instead — see *Stage 5* and *Tier 2 — Pro wireless audio* for the chip-swap rationale.
+
 ### Stage 2 — diversity (UART slave first)
 Add a second DX-LR30 to the receive end as a **UART slave**: it runs nearly the same firmware as the master, receives RF independently, and forwards `RxReport` frames (seq, RSSI, payload) to the master over UART. Master runs the dedupe/arbitration logic.
 

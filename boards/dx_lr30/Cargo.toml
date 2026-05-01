@@ -11,15 +11,23 @@ target = "thumbv7m-none-eabi"
 mcu    = "stm32f103c8t6"
 
 [features]
-defmt = ["dep:defmt", "embassy-stm32/defmt"]
+defmt = ["dep:defmt", "embassy-stm32/defmt", "osrf-radio-sx126x/defmt"]
 # Use HSI (internal 8 MHz oscillator) instead of HSI+PLL.
 # Safe for initial bring-up when crystal presence is unconfirmed.
 hsi = []
 
 [dependencies]
-defmt         = { workspace = true, optional = true }
-embassy-stm32 = { version = "0.6", features = ["stm32f103c8", "time-driver-any"] }
-cortex-m      = "0.7"
+defmt              = { workspace = true, optional = true }
+embassy-stm32      = { version = "0.6", features = ["stm32f103c8", "time-driver-any", "exti"] }
+cortex-m           = "0.7"
+
+# embedded-hal trait surface — exposed by the board API so apps can drive
+# peripherals through HAL-agnostic interfaces.
+embedded-hal       = { workspace = true }
+embedded-hal-async = { workspace = true }
+embedded-hal-bus   = { workspace = true }
+embassy-time       = { version = "0.5" }
+osrf-radio-sx126x  = { workspace = true }
 
 [lib]
 test    = false

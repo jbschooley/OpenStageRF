@@ -549,6 +549,7 @@ checksum = "513e0b3a8fb7d3013a8ae17a834283f170deaf7d0eeab0a7c1a36ad4dd356d22"
 dependencies = [
  "critical-section",
  "embedded-hal 1.0.0",
+ "embedded-hal-async",
 ]
 
 [[package]]
@@ -865,6 +866,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "osrf-app-radio-bench"
+version = "0.1.0"
+dependencies = [
+ "defmt 1.0.1",
+ "embassy-time",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "osrf-radio-sx126x",
+]
+
+[[package]]
 name = "osrf-board-dx-lr30"
 version = "0.1.0"
 dependencies = [
@@ -875,6 +887,10 @@ dependencies = [
  "embassy-executor",
  "embassy-stm32",
  "embassy-time",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "embedded-hal-bus",
+ "osrf-radio-sx126x",
  "panic-probe",
 ]
 
@@ -892,6 +908,7 @@ dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-async",
  "embedded-hal-bus",
+ "osrf-radio-sx126x",
  "panic-probe",
 ]
 
@@ -935,6 +952,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "osrf-profile-dx-lr30-radio-rx"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "defmt 1.0.1",
+ "defmt-rtt",
+ "embassy-executor",
+ "osrf-app-radio-bench",
+ "osrf-board-dx-lr30",
+ "panic-probe",
+]
+
+[[package]]
+name = "osrf-profile-dx-lr30-radio-tx"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "defmt 1.0.1",
+ "defmt-rtt",
+ "embassy-executor",
+ "osrf-app-radio-bench",
+ "osrf-board-dx-lr30",
+ "panic-probe",
+]
+
+[[package]]
 name = "osrf-profile-dx-lr30-rx-basic"
 version = "0.1.0"
 dependencies = [
@@ -965,6 +1010,34 @@ dependencies = [
  "defmt-rtt",
  "embassy-executor",
  "osrf-app-blink",
+ "osrf-board-t114",
+ "panic-probe",
+]
+
+[[package]]
+name = "osrf-profile-t114-radio-rx"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "defmt 1.0.1",
+ "defmt-rtt",
+ "embassy-executor",
+ "osrf-app-radio-bench",
+ "osrf-board-t114",
+ "panic-probe",
+]
+
+[[package]]
+name = "osrf-profile-t114-radio-tx"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "defmt 1.0.1",
+ "defmt-rtt",
+ "embassy-executor",
+ "osrf-app-radio-bench",
  "osrf-board-t114",
  "panic-probe",
 ]
@@ -1006,6 +1079,7 @@ dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-async",
  "heapless",
+ "sx1262",
 ]
 
 [[package]]
@@ -1112,6 +1186,28 @@ name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
+
+[[package]]
+name = "regiface"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68cb3999c0f452b340f94d960205a0c499b89ddb6d8c8247a95c788fc7378e4e"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "regiface-macros",
+]
+
+[[package]]
+name = "regiface-macros"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e24cb5b14e574b1f2ab517062181b2ff287c93a56366a87c5f41b99e88aaaa04"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
 
 [[package]]
 name = "rustc_version"
@@ -1252,6 +1348,19 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "sx1262"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4d6ea9084fe378284c31acaf401ce97e652e18674af93b17b460a50d4afce46"
+dependencies = [
+ "bitflags 2.11.1",
+ "defmt 1.0.1",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "regiface",
+]
 
 [[package]]
 name = "syn"
