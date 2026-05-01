@@ -1,0 +1,27 @@
+[package]
+name        = "osrf-profile-dx-lr30-blink"
+version     = "0.1.0"
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "Milestone 0 blink — DX-LR30 deployment.  Wires the DX-LR30 board's Resources into the board-agnostic blink loop."
+
+[package.metadata.osrf]
+board = "dx_lr30"
+
+[dependencies]
+osrf-board-dx-lr30 = { workspace = true, features = ["defmt"] }
+osrf-app-blink     = { workspace = true }
+
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+
+cortex-m    = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7"
+defmt       = "1.0"
+defmt-rtt   = "1.1"
+panic-probe = { version = "1.0", features = ["print-defmt"] }
+
+[[bin]]
+name  = "blink"
+path  = "src/main.rs"
+test  = false
+bench = false

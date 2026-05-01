@@ -5,12 +5,14 @@ edition     = "2021"
 license     = "AGPL-3.0-or-later"
 description = "T114 receiver — single SX1262 + ST7789 TFT + user button, US 915 ISM, GFSK MIDI"
 
-# Standalone — see boards/t114/Cargo.toml for the workspace split rationale.
-[workspace]
-
 [package.metadata.osrf]
 board = "t114"
 app   = "midi_node"
 
 [dependencies]
-osrf-board-t114 = { path = "../../boards/t114" }
+osrf-board-t114 = { workspace = true }
+
+[lib]
+test    = false
+doctest = false
+bench   = false
