@@ -16,6 +16,8 @@
 
 use embassy_nrf::{bind_interrupts, peripherals, spim};
 
+pub mod clocks;
+
 bind_interrupts!(struct Irqs {
     TWISPI0 => spim::InterruptHandler<peripherals::TWISPI0>;
 });
@@ -104,8 +106,12 @@ pub mod vext_power {
 
 /// Raw Embassy peripheral tokens.  Use this for fine-grained hardware access
 /// in apps that need more than `Resources` provides.
+///
+/// LFCLK is configured to use the board's 32.768 kHz crystal (LFXO) for
+/// accurate Embassy time-driver timestamps; HFCLK stays on HFINT (64 MHz
+/// internal RC).  See `clocks.rs` for the rationale.
 pub fn init() -> embassy_nrf::Peripherals {
-    embassy_nrf::init(Default::default())
+    embassy_nrf::init(clocks::default_config())
 }
 
 // ── Board-level resource API ─────────────────────────────────────────────────
