@@ -20,3 +20,8 @@ hsi = []
 defmt         = { workspace = true, optional = true }
 embassy-stm32 = { version = "0.6", features = ["stm32f103c8", "time-driver-any"] }
 cortex-m      = "0.7"
+
+[lib]
+test    = false
+doctest = false
+bench   = false

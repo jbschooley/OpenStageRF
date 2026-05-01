@@ -86,7 +86,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let app = profile_meta.app.unwrap_or_else(|| "midi_node".into());
+    // Two profile styles are supported:
+    //   - Binary-style:  profile crate IS the deployment binary (has src/main.rs).
+    //                    Metadata omits `app`.  Build directly.
+    //   - Library-style: profile crate is a config library; an app crate hosts
+    //                    the binary and gates this profile via a Cargo feature.
+    //                    Metadata sets `app = "..."`.
+    let app_field = profile_meta.app;
 
     // ── Board metadata ───────────────────────────────────────────────────────
     let board_cargo = workspace.join("boards").join(&board).join("Cargo.toml");
@@ -118,21 +124,26 @@ fn main() -> ExitCode {
         }
     };
 
-    let package  = format!("osrf-app-{}", app.replace('_', "-"));
-    let features = profile_name.as_str(); // profile name IS the cargo feature
-
     let mut cmd = Command::new("cargo");
     cmd.current_dir(&workspace)
         .arg(cargo_cmd)
         .arg("--target")
-        .arg(&target)
-        .arg("-p")
-        .arg(&package)
-        .arg("--features")
-        .arg(features);
+        .arg(&target);
 
-    if cargo_cmd == "run" {
-        cmd.arg("--bin").arg(format!("embassy_{board}"));
+    match app_field {
+        // Binary-style: build the profile crate itself.
+        None => {
+            let package = format!("osrf-profile-{}", profile_name.replace('_', "-"));
+            cmd.arg("-p").arg(&package);
+        }
+        // Library-style: build the named app crate with this profile as a feature.
+        Some(app) => {
+            let package = format!("osrf-app-{}", app.replace('_', "-"));
+            cmd.arg("-p").arg(&package).arg("--features").arg(profile_name);
+            if cargo_cmd == "run" {
+                cmd.arg("--bin").arg(format!("embassy_{board}"));
+            }
+        }
     }
 
     println!("+ {cmd:?}");

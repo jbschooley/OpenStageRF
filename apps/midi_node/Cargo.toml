@@ -38,7 +38,14 @@ embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executo
 embassy-stm32    = { version = "0.6",  features = ["stm32f103c8", "time-driver-any", "defmt"] }
 embassy-time     = { version = "0.5",  features = ["defmt", "defmt-timestamp-uptime"] }
 
+[lib]
+test    = false
+doctest = false
+bench   = false
+
 [[bin]]
 name              = "smoke_dx_lr30"
 path              = "src/bin/smoke_dx_lr30.rs"
 required-features = ["dx_lr30"]
+test              = false
+bench             = false
