@@ -1,8 +1,9 @@
 [package]
-name    = "osrf-protocols-midi-v1"
-version = "0.1.0"
-edition = "2021"
-license = "AGPL-3.0-or-later"
+name        = "osrf-protocols-midi-v1"
+version     = "0.1.0"
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "OpenStageRF on-air transport envelope v1 — wire format encode/decode (no crypto yet, key_fp = 0x000000 only)"
 
 [features]
 defmt = ["dep:defmt"]
@@ -11,7 +12,10 @@ defmt = ["dep:defmt"]
 defmt    = { workspace = true, optional = true }
 heapless = { workspace = true }
 
+# Host-side tests intentionally enabled — wire-format correctness benefits
+# enormously from unit tests.  `#![cfg_attr(not(test), no_std)]` in lib.rs
+# keeps the embedded build no_std.
 [lib]
-test    = false
+test    = true
 doctest = false
 bench   = false

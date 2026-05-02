@@ -29,9 +29,9 @@ Total fixed overhead: 11 bytes (header + event_type) + 0/8/16 bytes (tag).
 
 Transport envelope version. v1 is `0x01`. Receivers MUST drop packets with unknown versions. Bumped only on backward-incompatible wire-format changes.
 
-### `key_fp` (2 bytes)
+### `key_fp` (3 bytes)
 
-A 2-byte fingerprint that identifies which key was used to encrypt the packet. The fingerprint is derived from the key material itself, making it **device-independent**: two devices that hold the same key bytes will compute the same fingerprint regardless of what local key slot they assigned it to. This eliminates the pairing ceremony of synchronizing local key IDs across devices.
+A 3-byte fingerprint that identifies which key was used to encrypt the packet. The fingerprint is derived from the key material itself, making it **device-independent**: two devices that hold the same key bytes will compute the same fingerprint regardless of what local key slot they assigned it to. This eliminates the pairing ceremony of synchronizing local key IDs across devices.
 
 `key_fp = SHA-256(cipher_id || key_bytes)[0..3]` (big-endian, first three bytes of the SHA-256 digest)
 

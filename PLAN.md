@@ -110,7 +110,13 @@ These were settled in conversation before code starts:
 
 **Goal:** end-to-end MIDI over the wireless link, no encryption yet.
 
-- [ ] `osrf-protocols-midi-v1`: implement encode/decode per [SPEC.md](protocols/midi_packet_v1/SPEC.md). Start with `key_id = 0x00` (no encryption) only.
+- [x] `osrf-protocols-midi-v1`: wire-format encode/decode per [SPEC.md](protocols/midi_packet_v1/SPEC.md), `key_fp = 0x000000` (no-crypto) path only.
+  - Public API: `Header { ver, key_fp, seq, event_type }` (with `make_seq(boot_counter, session_seq)` packer + `boot_counter()`/`session_seq()` accessors), `FragState`, `Body<'a>` (Heartbeat / MidiMessage / SysExFragment / Unknown for forward-compat), `Packet<'a>`, `EncodeError`, `DecodeError`.
+  - Free functions: `wire_len(body)`, `encode(out, header, body) -> usize`, `decode(buf) -> Packet`.
+  - Encode/decode are tag-agnostic — they only frame the wire format.  AEAD-using callers (future): `encode` writes header + plaintext, caller hands `out[..HEADER_LEN]` (AAD) and `out[HEADER_LEN..n]` (plaintext) to a cipher, then appends the tag past `out[..n]`.
+  - `#![cfg_attr(not(test), no_std)]` + `[lib] test = true` — host tests intentionally enabled here despite the project-wide `test = false` convention, because wire-format correctness is the kind of thing that benefits enormously from unit tests.
+  - **23 host-side tests pass**, covering: round-trips for all body variants (Heartbeat / 1-,2-,3-byte MIDI / all four FragState values / Unknown event types), explicit byte-level wire-layout assertion (canary against accidental wire breaks), seq packing/unpacking, header AAD layout, all error paths (truncation, wrong version, reserved 0x00 event_type, invalid MIDI length on encode + decode, buffer too small, seq overflow, invalid fragstate, empty SysEx body on encode + decode), spec size table sanity (`HEADER_LEN`, NoteOn = 14 bytes in `none` mode).
+  - Compiles clean for both embedded targets (`thumbv7m-none-eabi`, `thumbv7em-none-eabihf`).
 - [ ] `osrf-link`:
   - `LinkSender`: takes `MidiEvent`, encodes to packet, hands to radio. Generates seq numbers via `(boot_counter, session_seq)`.
   - `LinkReceiver`: receives raw packet from radio, validates radio-level CRC, decodes, runs replay window check (64-packet sliding window with bitmap), emits dedup'd `MidiEvent` to consumer.
