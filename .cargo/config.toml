@@ -1,6 +1,12 @@
 [build]
 target = "thumbv7m-none-eabi"
 
+# defmt filters log macros at compile time via this env var.  If unset, the
+# `info!`/`warn!` calls in our smoke tests and apps compile to no-ops, so
+# RTT shows nothing at runtime.  Crank to "trace" if you need everything.
+[env]
+DEFMT_LOG = "info"
+
 [alias]
 xtask = "run --target aarch64-apple-darwin -p osrf-xtask --"
 
@@ -12,7 +18,11 @@ rustflags = [
 ]
 
 [target.thumbv7em-none-eabihf]
-runner = "probe-rs run --chip nRF52840_xxAA"
+# `--rtt-scan-memory` makes probe-rs locate the RTT control block by scanning
+# RAM for SEGGER's magic string instead of relying on the ELF symbol — needed
+# on probe-rs 0.31 with our defmt-rtt setup; without it the program runs but
+# RTT output never reaches the terminal.
+runner = "probe-rs run --chip nRF52840_xxAA --rtt-scan-memory"
 rustflags = [
     "-C", "link-arg=-Tlink.x",
     "-C", "link-arg=-Tdefmt.x",
