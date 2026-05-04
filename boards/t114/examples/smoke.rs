@@ -23,6 +23,13 @@ use panic_probe as _;
 // symbol link error; the UART-init smoke check is exercised end-to-end
 // by `board::resources()` instead — see the t114_midi_{rx,tx} profiles.
 
+// VTOR + bootloader peripheral teardown — required for any T114 binary
+// loaded via UF2.  See `osrf_board_t114::bootloader_handoff()` docs.
+#[cortex_m_rt::pre_init]
+unsafe fn pre_init() {
+    board::bootloader_handoff();
+}
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = board::init();
@@ -97,11 +104,20 @@ async fn main(_spawner: Spawner) {
     info!("  and verify signal levels with meter.");
     info!("══════════════════════════════════════");
 
-    // Fast-blink LED to signal end-of-test.
+    // Fast-blink LED + periodic heartbeat so RTT viewers that attach late
+    // (probe-rs needs ~hundreds of ms to discover the control block) still
+    // see fresh data and don't display an empty "defmt" channel.  Without
+    // the heartbeat all info!()s above run during boot, then RTT goes
+    // silent and the host has nothing to render.
+    let mut tick: u32 = 0;
     loop {
         led.set_high();
         Timer::after_millis(100).await;
         led.set_low();
         Timer::after_millis(100).await;
+        tick = tick.wrapping_add(1);
+        if tick % 10 == 0 {
+            info!("smoke heartbeat tick={}", tick);
+        }
     }
 }

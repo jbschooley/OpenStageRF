@@ -1,0 +1,25 @@
+# cargo-embed config — fallback RTT viewer when `probe-rs run` doesn't stream
+# logs.  Run with:
+#   cargo embed --release --example smoke -p osrf-board-t114 \
+#               --target thumbv7em-none-eabihf
+
+[default.general]
+chip = "nRF52840_xxAA"
+
+[default.flashing]
+enabled = true
+
+[default.reset]
+enabled = true
+
+[default.rtt]
+enabled = true
+# Scan all of RAM for the RTT control block — same flag as `probe-rs run
+# --rtt-scan-memory`.  Required because our memory.x puts RAM origin at
+# 0x20000008 (skipping the bottom 8 bytes for MBR/SD compat) and the SEGGER
+# control block ends up at 0x20000010, which probe-rs's default symbol-based
+# discovery sometimes misses.
+up_mode = "NoBlockSkip"
+
+[default.gdb]
+enabled = false
