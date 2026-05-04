@@ -4,9 +4,16 @@
 
 //! UI bench demo — T114.
 //!
-//! The board crate already initialises the ST7789 (power gate, reset
-//! pulse, ST7789 command sequence run via `mipidsi::Builder::init`),
-//! so this bin just hands the display to the bench loop.
+//! ⚠ CURRENTLY DOES NOT BUILD ⚠
+//!
+//! `osrf_board_t114::Resources::display` was removed because
+//! `mipidsi::Builder::init()` hangs on this hardware (root cause unknown;
+//! SX1262 SPI, raw TWISPI1 SPI write, and `embassy_time::Delay::delay_ms`
+//! all verified working in isolation via the stepwise diagnostic in
+//! `t114_blink`).  Reviving this profile requires either fixing the
+//! mipidsi hand-off or replacing the ST7789 init with a hand-rolled
+//! command sequence.  See git history of `boards/t114/src/lib.rs` for
+//! the original init code.
 
 use defmt_rtt as _;
 use embassy_executor::Spawner;

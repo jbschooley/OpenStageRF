@@ -27,12 +27,20 @@
 
 use embassy_nrf::config::{Config, HfclkSource, LfclkSource};
 
-/// Default T114 clock config: LFXO from the on-board 32.768 kHz crystal,
+/// Default T114 clock config: LFRC (internal 32 kHz RC) for LFCLK,
 /// HFINT (64 MHz internal RC) for SYSCLK.
+///
+/// **LFCLK source choice:** previously this was set to `ExternalXtal` to use
+/// the on-board 32.768 kHz crystal (~±20 ppm).  In practice the LFXO on at
+/// least some T114 v2.0 units fails to start cleanly, leaving the time
+/// driver running on a misconfigured fallback and producing visibly
+/// irregular timer intervals.  Switched to `InternalRC` (~±250 ppm
+/// calibrated) for reliable startup.  Re-evaluate per unit if better
+/// timing accuracy is ever needed (e.g. for BLE).
 pub fn default_config() -> Config {
     let mut c = Config::default();
-    c.hfclk_source = HfclkSource::Internal;     // explicit for clarity (also default)
-    c.lfclk_source = LfclkSource::ExternalXtal; // Heltec's 32.768 kHz X2
+    c.hfclk_source = HfclkSource::Internal;    // explicit for clarity (also default)
+    c.lfclk_source = LfclkSource::InternalRC;  // see note above
     c
 }
 

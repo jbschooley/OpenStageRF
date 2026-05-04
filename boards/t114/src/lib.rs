@@ -16,6 +16,13 @@
 
 use embassy_nrf::{bind_interrupts, buffered_uarte, peripherals, spim};
 
+// Re-export so profile binaries can drive HAL-level peripherals without
+// depending on these crates directly.
+pub use embassy_nrf;
+pub use embedded_hal;
+pub use embedded_hal_bus;
+pub use mipidsi;
+
 pub mod clocks;
 #[cfg(feature = "usb-log")]
 pub mod usb_log;
@@ -23,7 +30,7 @@ pub mod usb_log;
 // `BufferedUarte` (used for the MIDI UART so we can expose
 // `embedded_io_async::Read`) needs UARTE1's interrupt bound to its own
 // `buffered_uarte::InterruptHandler` — not the plain `uarte::*` one.
-bind_interrupts!(struct Irqs {
+bind_interrupts!(pub struct Irqs {
     TWISPI0 => spim::InterruptHandler<peripherals::TWISPI0>;
     TWISPI1 => spim::InterruptHandler<peripherals::TWISPI1>;
     UARTE1  => buffered_uarte::InterruptHandler<peripherals::UARTE1>;
@@ -134,6 +141,103 @@ pub mod vext_power {
     pub type Pin = peripherals::P0_21;
 }
 
+/// Address of the user-application slot in flash, matching `memory.x`'s
+/// `FLASH ORIGIN`.  Used by [`relocate_vtor()`] and kept here so a single
+/// edit changes both the linker layout and the runtime VTOR write.
+pub const FLASH_ORIGIN: u32 = 0x0000_1000;
+
+/// Relocate `SCB->VTOR` to the start of our flash slot, and stop the
+/// peripherals the Heltec bootloader leaves running on its way out.
+///
+/// **Must be called from `#[cortex_m_rt::pre_init]`** in every binary that
+/// targets this board, before any interrupt is allowed to fire and before
+/// `embassy_nrf::init()` runs.
+///
+/// What this fixes (one bug per item, all observed empirically on the
+/// `ht-n5262 0.9.0` bootloader hand-off):
+/// 1. **VTOR**: bootloader leaves it pointing at its own vector table at
+///    0xF4000 (no SoftDevice on this unit, so the SD-aware
+///    `sd_softdevice_vector_table_base_set` path doesn't run).
+///    cortex-m-rt's reset shim does not relocate VTOR for us.
+/// 2. **GPIOTE / PPI / TIMERs**: bootloader uses these to drive its LED
+///    blink during DFU.  It does not tear them down before jumping to the
+///    app, and embassy-nrf's `init()` does not preemptively reset them, so
+///    leftover GPIOTE channels keep yanking the LED pin even after the app
+///    configures it as a regular GPIO output.
+/// 3. **RTC1**: embassy's `time-driver-rtc1` assumes RTC1 starts in reset
+///    state.  When the bootloader has left RTC1 running, `Timer::after`
+///    awaits never fire and the executor hangs at the first `.await`.
+/// 4. **NVIC**: bootloader leaves USBD (and possibly others) enabled in
+///    NVIC.  Once embassy unmasks PRIMASK to dispatch the executor, those
+///    stray interrupts fire through cortex-m-rt's `DefaultHandler`, which
+///    is an infinite loop — symptom is the executor freezing at its first
+///    `.await` (e.g. `Timer::after_millis`).
+///
+/// # Safety
+/// Only call from within a `#[pre_init]` function.  The peripheral pokes
+/// blow away any in-flight DMA / timer state, which is fine at boot but
+/// catastrophic if invoked mid-program.
+#[inline(always)]
+pub unsafe fn bootloader_handoff() {
+    // 1. Disable + clear-pending every NVIC source the bootloader may have
+    //    armed.  ICER/ICPR are 8 × u32 at 0xE000_E180 / 0xE000_E280; writing
+    //    1s to a bit clears it.  We deliberately do NOT touch PRIMASK —
+    //    cortex-m-rt and embassy don't restore it, and a stray PRIMASK = 1
+    //    here would deadlock the executor.  With every NVIC source
+    //    disabled, no interrupt can fire regardless of PRIMASK state.
+    let icer: *mut u32 = 0xE000_E180 as *mut u32;
+    let icpr: *mut u32 = 0xE000_E280 as *mut u32;
+    for i in 0..8 {
+        core::ptr::write_volatile(icer.add(i), 0xFFFF_FFFF);
+        core::ptr::write_volatile(icpr.add(i), 0xFFFF_FFFF);
+    }
+
+    // 2. VTOR.
+    (*cortex_m::peripheral::SCB::PTR).vtor.write(FLASH_ORIGIN);
+
+    // 3. Fully reset all RTCs.  Just stopping isn't enough — embassy's
+    //    time driver init does not preemptively clear INTENSET / EVTENSET,
+    //    so leftover bits from the bootloader can either fire stray
+    //    events into a not-yet-bound handler or mask the COMPARE the
+    //    driver actually wants.  Symptom: first `.await` never resolves.
+    //    Order: stop → disable all interrupts → disable all events → clear counter.
+    for &base in &[0x4000_B000u32, 0x4001_1000, 0x4002_4000] {
+        core::ptr::write_volatile((base + 0x004) as *mut u32, 1); // TASKS_STOP
+        core::ptr::write_volatile((base + 0x308) as *mut u32, 0xFFFF_FFFF); // INTENCLR
+        core::ptr::write_volatile((base + 0x348) as *mut u32, 0xFFFF_FFFF); // EVTENCLR
+        core::ptr::write_volatile((base + 0x008) as *mut u32, 1); // TASKS_CLEAR
+    }
+
+    // 4. Reset LFCLK to a known-stopped state.  The bootloader leaves
+    //    LFCLK running on whatever source it chose (often LFRC for the
+    //    DFU timeout timer).  embassy-nrf's `init()` will reconfigure and
+    //    restart it; clearing it here avoids any "already running on the
+    //    wrong source" ambiguity.  CLOCK base 0x4000_0000.
+    core::ptr::write_volatile(0x4000_000C as *mut u32, 1); // TASKS_LFCLKSTOP
+    core::ptr::write_volatile(0x4000_0308 as *mut u32, 0xFFFF_FFFF); // INTENCLR (clock events)
+
+    // 5. Stop all TIMERs (TASKS_STOP at +0x004, TASKS_SHUTDOWN at +0x00C).
+    for &base in &[
+        0x4000_8000u32, // TIMER0
+        0x4000_9000,    // TIMER1
+        0x4000_A000,    // TIMER2
+        0x4001_A000,    // TIMER3
+        0x4001_B000,    // TIMER4
+    ] {
+        core::ptr::write_volatile((base + 0x004) as *mut u32, 1);
+        core::ptr::write_volatile((base + 0x00C) as *mut u32, 1);
+    }
+
+    // 6. Clear all 8 GPIOTE channel configs (CONFIG[0..7] at 0x4000_6510).
+    let gpiote_config: *mut u32 = 0x4000_6510 as *mut u32;
+    for i in 0..8 {
+        core::ptr::write_volatile(gpiote_config.add(i), 0);
+    }
+
+    // 7. Disable all PPI channels (CHENCLR at 0x4001_F508).
+    core::ptr::write_volatile(0x4001_F508 as *mut u32, 0xFFFF_FFFF);
+}
+
 /// Raw Embassy peripheral tokens.  Use this for fine-grained hardware access
 /// in apps that need more than `Resources` provides.
 ///
@@ -220,12 +324,21 @@ pub struct Resources {
     /// DIN MIDI UART on UARTE1 (P0_09 RX, P0_10 TX) at 31250 baud 8N1.
     pub midi_uart: MidiUart,
 
-    /// Built-in ST7789 TFT (240×135) on TWISPI1.  Already initialised:
-    /// caller can immediately draw with `embedded_graphics`.  Backlight
-    /// (P0_15) is currently held LOW; toggle it from the bin (the pin
-    /// is consumed into the panel power chain so we don't expose it
-    /// here in v1 — TODO once the UI design picks a backlight policy).
-    pub display: Display,
+    // The ST7789 TFT (`Display` type) is intentionally NOT initialised by
+    // `resources()`.  `mipidsi::Builder::init()` hangs on this hardware
+    // for reasons not yet root-caused — every other path through
+    // build_resources (SX1262 SPI, UARTE1, raw SPI write, 120 ms
+    // `embassy_time::Delay::delay_ms`) verified working in isolation.
+    // Display init is deferred to a future `init_display()` helper that
+    // the UI smoke-test profile will exercise once we debug the mipidsi
+    // hand-off.  See the t114_blink stepwise diagnostic history.
+
+    /// Single WS2812 RGB LED on P0_14, parked Low.  WS2812 inputs are
+    /// edge-sensitive — a floating P0_14 picks up noise and the LED
+    /// shows random colors / flicker.  Holding the data line Low keeps
+    /// it dark.  Replaced with a real driver if/when the NeoPixel is
+    /// actually used.
+    pub neopixel_parked: embassy_nrf::gpio::Output<'static>,
 }
 
 /// Initialise hardware with the default clock config and bundle the common
@@ -340,88 +453,30 @@ fn build_resources(
         unsafe { &mut *core::ptr::addr_of_mut!(MIDI_TX_BUF) },
     );
 
-    // ── Display: ST7789 240×135 TFT on TWISPI1 ──────────────────────────────
-    // Power sequence (per Heltec T114 v2.0 schematic):
-    //   1. VTFT_CTRL (P0_03) HIGH → gates the 3.3 V rail to the panel.
-    //   2. Wait ≥10 ms for rail to stabilise.
-    //   3. RESET pulse (handled by mipidsi::Builder::init via the reset_pin).
-    //   4. Backlight (P0_15) — left LOW for now (off); the UI layer turns
-    //      it on once the first frame has been drawn so the user never
-    //      sees garbage during init.
-    //
-    // We use blocking `cortex_m::asm::delay` for the pre-init waits because
-    // build_resources() is sync.  At 64 MHz, 64_000 cycles ≈ 1 ms.
-    let pwr_ctrl = Output::new(p.P0_03, Level::High, OutputDrive::Standard);
-    cortex_m::asm::delay(64_000 * 15);                      // ~15 ms
+    // ── Display: deferred ───────────────────────────────────────────────────
+    // ST7789 init via mipidsi::Builder::init hangs on this hardware (cause
+    // not yet root-caused; SPI write and embassy_time delays both verified
+    // working in isolation).  The display, backlight, and pwr_ctrl pins
+    // (P0_02, P0_03, P0_11, P0_12, P0_15, P1_08, P1_09, P1_11) along with
+    // TWISPI1 stay unowned in `embassy_nrf::Peripherals` and will be
+    // claimed by a future `init_display()` helper once the hand-off is
+    // debugged in the smoke-test profile.
 
-    // Backlight off for now — bin can drive P0_15 itself once the UI
-    // layer is ready.  We hold a reference to keep the pin pinned to
-    // a known state.
-    let _backlight = Output::new(p.P0_15, Level::Low, OutputDrive::Standard);
-    let _ = pwr_ctrl;  // hold high; dropping resets the pin to Hi-Z.
-    // Leak both pins so they stay asserted for the lifetime of the program.
-    // (Output<'static> is Drop-safe; without `forget` Rust would drop them
-    // after build_resources returns and tristate the pin.)
-    core::mem::forget(_backlight);
-    core::mem::forget(pwr_ctrl);
+    // ── NeoPixel (P0_14) parked Low ─────────────────────────────────────────
+    // The single WS2812 RGB LED on the T114 is edge-sensitive.  Leaving the
+    // pin floating causes the LED to interpret line noise as color data —
+    // visible as fast flicker / random colors / "stuck halfway on".  Holding
+    // the data line Low keeps the LED dark.  Replace this with a real
+    // NeoPixel driver when/if it's ever used.
+    let neopixel_parked = Output::new(p.P0_14, Level::Low, OutputDrive::Standard);
 
-    // SPIM1 @ 8 MHz, MODE_3 (CPOL=1/CPHA=1).  ST7789 datasheet permits
-    // either MODE_0 or MODE_3; MODE_3 is the convention in the
-    // mipidsi/embedded-graphics ecosystem.
-    let mut tft_spi_cfg = SpimConfig::default();
-    tft_spi_cfg.frequency = Frequency::M8;
-    tft_spi_cfg.mode = embassy_nrf::spim::MODE_3;
-    let tft_spi = Spim::new(
-        p.TWISPI1,
-        Irqs,
-        p.P1_08, // SCK
-        // The ST7789 is write-only from the MCU's perspective — there's no
-        // MISO line to read back.  We pin one of the unused TFT-side pads
-        // (P0_11 will become CS below; we still need *some* pin for MISO).
-        // Pick P1_11 — unrouted on T114 v2.0 — to avoid clobbering anything.
-        p.P1_11,
-        p.P1_09, // MOSI
-        tft_spi_cfg,
-    );
-    let tft_cs = Output::new(p.P0_11, Level::High, OutputDrive::Standard);
-    let tft_spi_dev = embedded_hal_bus::spi::ExclusiveDevice::new(
-        tft_spi,
-        tft_cs,
-        embassy_time::Delay,
+    (
+        Resources {
+            status_led,
+            radio0,
+            midi_uart,
+            neopixel_parked,
+        },
+        usbd,
     )
-    .expect("CS pin set_high cannot fail (Infallible)");
-
-    let tft_dc = Output::new(p.P0_12, Level::Low, OutputDrive::Standard);
-    let tft_reset = Output::new(p.P0_02, Level::High, OutputDrive::Standard);
-
-    // mipidsi's SpiInterface buffer: collects pixel data before flushing
-    // it down the SPI bus.  512 bytes ≈ one ST7789 row at 16 bpp; bigger
-    // is slightly faster but RAM-hungry.  T114 has 256 KB RAM, so 512 is
-    // a comfortable starting point — bump if profiling shows we're
-    // bottlenecked on per-batch overhead.
-    static mut TFT_BUF: [u8; 512] = [0; 512];
-    // SAFETY: build_resources consumes the singleton Peripherals, so this
-    // is the only producer of a &'static mut to TFT_BUF.
-    let tft_buf: &'static mut [u8] =
-        unsafe { &mut *core::ptr::addr_of_mut!(TFT_BUF) };
-
-    let di = mipidsi::interface::SpiInterface::new(tft_spi_dev, tft_dc, tft_buf);
-    let mut delay = embassy_time::Delay;
-    let display = mipidsi::Builder::new(mipidsi::models::ST7789, di)
-        .reset_pin(tft_reset)
-        .display_size(240, 135)
-        // The 1.14" ST7789 panel is wired such that the 240×135 active area
-        // sits offset (52, 40) inside the controller's 240×320 frame buffer
-        // when in landscape orientation.  This matches the Heltec T114 v2.0
-        // schematic + Meshtastic firmware variant.h.
-        .display_offset(40, 53)
-        .orientation(
-            mipidsi::options::Orientation::new()
-                .rotate(mipidsi::options::Rotation::Deg90),
-        )
-        .invert_colors(mipidsi::options::ColorInversion::Inverted)
-        .init(&mut delay)
-        .expect("ST7789 init failed (config rejected by mipidsi Builder)");
-
-    (Resources { status_led, radio0, midi_uart, display }, usbd)
 }

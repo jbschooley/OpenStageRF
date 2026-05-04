@@ -54,3 +54,8 @@ embassy-stm32    = { version = "0.6",  features = ["stm32f103c8", "time-driver-a
 name  = "smoke"
 test  = false
 bench = false
+
+[[example]]
+name  = "bare_blink"
+test  = false
+bench = false

@@ -24,6 +24,14 @@ use osrf_board_t114 as board;
 use defmt_rtt as _;
 use panic_probe as _;
 
+// Runs at the very top of the cortex-m-rt reset handler, before .data
+// copy / .bss zero / `main()`.  See `osrf_board_t114::bootloader_handoff()`
+// for what it fixes — VTOR + leftover bootloader peripheral state.
+#[cortex_m_rt::pre_init]
+unsafe fn pre_init() {
+    board::bootloader_handoff();
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     // ── Hardware init ──────────────────────────────────────────────────────
@@ -55,7 +63,7 @@ async fn main(spawner: Spawner) {
     // Spawn a heartbeat that emits via `log::*` so USB users see *something*
     // even though the app-internal `defmt::info!("tick {}")` is invisible.
     #[cfg(feature = "usb-log")]
-    spawner.spawn(usb_heartbeat().unwrap());
+    spawner.spawn(usb_heartbeat()).unwrap();
 
     osrf_app_blink::run(&mut r.status_led).await
 }
