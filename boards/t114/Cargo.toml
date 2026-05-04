@@ -73,3 +73,8 @@ embassy-nrf      = { version = "0.10", features = ["nrf52840", "time-driver-rtc1
 name  = "smoke"
 test  = false
 bench = false
+
+[[example]]
+name  = "bare_blink"
+test  = false
+bench = false

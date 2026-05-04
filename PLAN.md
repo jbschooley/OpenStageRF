@@ -44,7 +44,20 @@ These were settled in conversation before code starts:
 - [x] Initial crates: `osrf-link`, `osrf-protocols-midi-v1`, `osrf-crypto`, `osrf-radio-sx126x`, `osrf-board-dx-lr30`, `osrf-port-embassy-stm32`, `osrf-app-midi-node`, `osrf-xtask`
 - [x] `osrf-xtask` reads `profiles/<name>/profile.yaml` and shells out to `cargo build --target thumbv7m-none-eabi -p osrf-app-midi-node --features <board>`
 - [x] `SPDX-License-Identifier: AGPL-3.0-or-later` headers on every source file; `deny.toml` created for cargo-deny (install `cargo install cargo-deny` to enforce in CI)
-- [ ] First flash: blink LED on DX-LR30 + RTT log viewed via `probe-rs attach` — **requires hardware** (binary `target/thumbv7m-none-eabi/debug/embassy_dx_lr30` is built and ready)
+- [x] First flash on **DX-LR30**: blink running, GPIO toggle confirmed end-to-end.
+      SWD pins (PA13/PA14) are not broken out on the LR30-SP carrier, so flashing
+      uses the on-board CH340C USB-C → STM32 ROM UART bootloader via `stm32flash`
+      (BOOT0/NRST driven by RTS#/DTR# through the auto-reset transistor pair).
+      Working command: `stm32flash -w bin -v -g 0x08000000 -i '-rts,dtr,-dtr:rts,-dtr' /dev/tty.usbserial-…`.
+      Bring-up gotcha: the on-board status LED (LED2 on PC13 through R2 = 4.7 KΩ)
+      draws only ~64 µA — invisibly dim and apparently dead on the bring-up unit.
+      `profiles/dx_lr30_blink` now drives PB0 (H3 pin 8) for an external LED +
+      bypasses `board::resources()` (which inits SPI/USART/I²C and could hang
+      with no peripherals connected); both choices documented in the profile's
+      main.rs and reverted once peripherals are validated.
+      RTT logs deferred until SWD wiring is added (would require tack-soldering
+      to PA13/PA14 on the QFP48).
+- [ ] First flash on **T114** (in flight in a parallel agent).
 
 **Exit criteria:** `cargo run -p osrf-app-midi-node --target thumbv7m-none-eabi --features dx_lr30` flashes the board and shows logs.
 

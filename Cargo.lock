@@ -1162,6 +1162,7 @@ dependencies = [
  "defmt 1.0.1",
  "defmt-rtt",
  "embassy-executor",
+ "embassy-stm32",
  "osrf-app-blink",
  "osrf-board-dx-lr30",
  "panic-probe",
