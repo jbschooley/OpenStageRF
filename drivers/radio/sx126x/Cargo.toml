@@ -5,14 +5,14 @@ edition = "2021"
 license = "AGPL-3.0-or-later"
 
 [features]
-defmt = ["dep:defmt", "sx1262/defmt"]
+defmt = ["dep:defmt"]
 
 [dependencies]
 defmt              = { workspace = true, optional = true }
+embassy-time       = { version = "0.5" }
 embedded-hal       = { workspace = true }
 embedded-hal-async = { workspace = true }
 heapless           = { workspace = true }
-sx1262             = { version = "0.3", default-features = false }
 
 [lib]
 test    = false

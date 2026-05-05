@@ -267,7 +267,8 @@ pub type Radio0 = osrf_radio_sx126x::Sx1262Radio<
         embassy_nrf::gpio::Output<'static>,
         embassy_time::Delay,
     >,
-    embassy_nrf::gpio::Input<'static>,
+    embassy_nrf::gpio::Input<'static>, // BUSY (P0_17)
+    embassy_nrf::gpio::Input<'static>, // DIO1 (P0_20)
     embassy_nrf::gpio::Output<'static>,
     osrf_radio_sx126x::Dio2RfSwitch,
 >;
@@ -406,21 +407,24 @@ fn build_resources(
     let spi_dev = embedded_hal_bus::spi::ExclusiveDevice::new(spi, cs, embassy_time::Delay)
         .expect("CS pin set_high cannot fail (Infallible)");
 
+    // ── BUSY = P0_17 (high while chip is processing a command) ─────────────
+    // Used by `Sx1262Radio::wait_busy()` to hold off SPI commands until the
+    // chip is idle.  Without this, back-to-back commands after `Calibrate` /
+    // `CalibrateImage` are silently dropped → SetTx returns cmd_status=5.
+    let busy = Input::new(p.P0_17, Pull::None);
+
     // ── DIO1 = P0_20 (interrupt-capable Input via GPIOTE) ───────────────────
     let dio1 = Input::new(p.P0_20, Pull::Down);
 
     // ── NRESET = P0_25 ──────────────────────────────────────────────────────
-    let mut reset = Output::new(p.P0_25, Level::High, OutputDrive::Standard);
+    let reset = Output::new(p.P0_25, Level::High, OutputDrive::Standard);
 
-    // ── Hardware reset pulse: low ≥100 µs, then ≥10 ms post-reset wait ──────
-    // SYSCLK on nRF52840 is 64 MHz.  Be generous: ~200 µs and ~15 ms.
-    reset.set_low();
-    cortex_m::asm::delay(64 * 200);
-    reset.set_high();
-    cortex_m::asm::delay(64_000 * 15);
+    // Hardware reset pulse is now done inside `Sx1262Radio::init()` (which
+    // also waits for BUSY low afterward), so we no longer pulse here.
 
     let radio0 = osrf_radio_sx126x::Sx1262Radio::new(
         spi_dev,
+        busy,
         dio1,
         reset,
         osrf_radio_sx126x::Dio2RfSwitch,

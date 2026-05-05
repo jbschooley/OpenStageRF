@@ -1,185 +1,103 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #![no_std]
 
-//! GFSK-only async wrapper around the upstream `sx1262` crate (v0.3).
+//! Hand-rolled SX1262 driver — raw SPI commands per Semtech datasheet
+//! DS_SX1261-2_V2.1, Table 12-1.  Replaces the previous `sx1262 = "0.3"`
+//! dependency, which had two crippling issues for our chip variant:
+//!   1. `Status::from_bytes(...).unwrap()` panicked on `cmd_status` values
+//!      0 (Reserved) and 1 (RFU), both of which the chip returns in normal
+//!      operation.
+//!   2. No exposure of raw register access, so we couldn't apply the
+//!      mandatory TxClampConfig workaround (datasheet §15.2).
 //!
-//! HAL-agnostic: takes generic `embedded-hal-async` SPI and `Wait`-able DIO1,
-//! plus an `embedded-hal` `OutputPin` for RESET. LoRa is intentionally not
-//! exposed.
+//! The driver is generic over `embedded_hal_async::spi::SpiDevice` (so
+//! either ExclusiveDevice + ChipSelect or any other CS strategy works),
+//! `Wait` for both BUSY and DIO1 (we wait for BUSY low between commands
+//! per datasheet §8.3.1, and DIO1 high for IRQ delivery), an `OutputPin`
+//! for NRESET, and a per-board `RfSwitchControl` impl.
 //!
-//! Two RF-switch styles are supported via [`RfSwitchControl`]:
+//! Commands implemented (covers GFSK TX/RX bench-test path):
+//!   SetStandby, SetDio3AsTcxoCtrl, SetPacketType, SetDioIrqParams,
+//!   CalibrateImage, SetRfFrequency, SetModulationParams (GFSK only),
+//!   WriteRegister (sync word, TxClampConfig), SetPacketParams (GFSK),
+//!   SetPaConfig, SetTxParams, SetDio2AsRfSwitchCtrl, SetBufferBaseAddress,
+//!   WriteBuffer, ClearIrqStatus, SetTx, SetRx, GetStatus, GetIrqStatus,
+//!   GetRxBufferStatus, GetPacketStatus, ReadBuffer, SetTxContinuousWave.
 //!
-//! - [`Dio2RfSwitch`]: SX1262 DIO2 directly drives an external RF-switch IC
-//!   (e.g. UPG2179 on Heltec T114). `init` calls `SetDio2AsRfSwitchCtrl` once;
-//!   the chip handles tx/rx switching autonomously.
-//! - [`PinRfSwitch`]: two MCU GPIOs (TXEN/RXEN) drive the switch (e.g.
-//!   DX-LR30). The wrapper toggles them around `set_tx`/`set_rx`. DIO2 stays
-//!   free for IRQ mapping.
+//! Not implemented (yet): LoRa modulation, AddressFiltering,
+//! Whitening config (we always write whitening=0), CAD, Sleep, Fs.
 
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::{digital::Wait, spi::SpiDevice};
-
-// Re-export the upstream GFSK enums callers need to plumb through. Other GFSK
-// fields (header type, CRC type, address filtering) are typed locally below
-// because the v0.3 upstream `PacketParams` is a raw byte array.
-pub use sx1262::commands::{GfskBandwidth, GfskPulseShape, RampTime};
-
-use sx1262::{
-    commands::{
-        BufferBaseAddressConfig, Calibrate, CalibrateImage, CalibrationConfig, ClearIrqStatus,
-        DeviceSelect, DioIrqConfig, GetIrqStatus, GetPacketStatus, GetRxBufferStatus,
-        GfskModParams, ImageCalibConfig, IrqMask, ModulationParams, PaConfig, PacketParams,
-        PacketType, RfFrequencyConfig, RfSwitchConfig, RxMode, SetBufferBaseAddress,
-        SetDio2AsRfSwitchCtrl, SetDioIrqParams, SetModulationParams, SetPaConfig, SetPacketParams,
-        SetPacketType, SetRfFrequency, SetRx, SetStandby, SetTx, SetTxParams, StandbyConfig,
-        Timeout, TxParams,
-    },
-    registers::SyncWord,
-    Device,
-};
-
-// ---------------------------------------------------------------------------
-// Local GFSK config enums (upstream v0.3 only takes a raw [u8; 9])
-// ---------------------------------------------------------------------------
-
-/// GFSK preamble-detector length, in bits. Datasheet field name: `PreambleDetectorLength`.
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum PreambleDetectorLength {
-    Off = 0x00,
-    Bits8 = 0x04,
-    Bits16 = 0x05,
-    Bits24 = 0x06,
-    Bits32 = 0x07,
-}
-
-/// GFSK address-filtering mode.
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum AddressFiltering {
-    Disable = 0x00,
-    Node = 0x01,
-    NodeAndBroadcast = 0x02,
-}
-
-/// GFSK packet header type. We only ever use `Variable`.
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum GfskPacketHeaderType {
-    Fixed = 0x00,
-    Variable = 0x01,
-}
-
-/// GFSK CRC selection.
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum CrcType {
-    Off = 0x01,
-    Crc1Byte = 0x00,
-    Crc2Byte = 0x02,
-    Crc1ByteInv = 0x04,
-    Crc2ByteInv = 0x06,
-}
 
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
-/// Errors surfaced by the wrapper.
-///
-/// `SwitchE` is the RF-switch's error type. `ResetE` is the RESET pin's error
-/// type. The upstream v0.3 driver erases SPI errors into its own `Error` type,
-/// so SPI failures all show up as [`Error::Bus`].
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum Error<SwitchE, ResetE> {
-    /// SPI/register/command failure originating from the upstream driver.
-    /// Typically a stuck BUSY line or a deserialization mismatch.
+pub enum Error<SwitchErr, ResetErr> {
+    /// SPI transfer failed.
+    Spi,
+    /// NRESET pin write failed.
+    Reset(ResetErr),
+    /// RF-switch op failed.
+    Switch(SwitchErr),
+    /// Generic bus / pin wait failure.
     Bus,
-    /// RF-switch control layer failed (only the `PinRfSwitch` variant can
-    /// produce this).
-    Switch(SwitchE),
-    /// RESET pin failed to toggle.
-    Reset(ResetE),
-    /// IRQ fired but neither TX_DONE nor RX_DONE was set.
-    UnexpectedIrq(u16),
-    /// CRC check failed on a received packet.
-    CrcMismatch,
-    /// Caller-supplied RX buffer is smaller than the received payload.
-    BufferTooSmall,
-    /// Caller passed a payload that doesn't fit (configured `payload_max_len`
-    /// or hardware 256-byte buffer).
+    /// Caller passed too-long payload.
     PayloadTooLarge,
-    /// Unsupported sync-word length (must be 0..=8 bytes).
+    /// Caller-supplied buffer too small for received packet.
+    BufferTooSmall,
+    /// Sync word > 8 bytes.
     InvalidSyncWord,
+    /// CRC of received packet didn't match.
+    CrcMismatch,
+    /// Got an IRQ we weren't expecting.
+    UnexpectedIrq(u16),
+    /// Timed out waiting for an event.
+    Timeout,
 }
 
-impl<SwitchE, ResetE> From<sx1262::Error> for Error<SwitchE, ResetE> {
-    fn from(_: sx1262::Error) -> Self {
-        Error::Bus
-    }
-}
-
-/// One received GFSK packet.
-///
-/// `snr_db` is included for symmetry with LoRa-flavoured radios. SX1262's
-/// `GetPacketStatus` does not expose SNR for GFSK (datasheet table 11-66 only
-/// gives `RxStatus`/`RssiSync`/`RssiAvg`), so it is always 0 here. `rssi_dbm`
-/// comes from `RssiSync`, latched at sync-word detection.
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct RxPacket {
-    pub len: usize,
-    pub rssi_dbm: i16,
-    pub snr_db: i8,
-    pub crc_ok: bool,
-}
+pub type RadioError<Reset, Switch> = Error<
+    <Switch as RfSwitchControl>::Error,
+    <Reset as embedded_hal::digital::ErrorType>::Error,
+>;
 
 // ---------------------------------------------------------------------------
-// RF switch trait + impls
+// RF switch abstraction (board-specific)
 // ---------------------------------------------------------------------------
 
-/// Pluggable RF-switch driver.
-///
-/// `init` takes the live `sx1262::Device` so the DIO2 variant can issue
-/// `SetDio2AsRfSwitchCtrl` against it. The pin variant just leaves both pins
-/// low.
-///
-/// Single-executor embedded use does not need `Send` bounds on the returned
-/// futures, so we tolerate the `async_fn_in_trait` lint here.
-#[allow(async_fn_in_trait)]
+/// Per-board RF switch control.  T114 wires DIO2 to a UPG2179 RF switch and
+/// the SX1262 drives it autonomously after `SetDio2AsRfSwitchCtrl(true)`;
+/// DX-LR30 has dedicated TXEN / RXEN GPIOs that the host toggles around
+/// `set_tx`/`set_rx`.
 pub trait RfSwitchControl {
     type Error;
 
-    async fn init<SPI>(&mut self, dev: &mut Device<SPI>) -> Result<(), Self::Error>
-    where
-        SPI: SpiDevice;
-
+    /// Called once during radio init, after all RF config is in place.
+    /// Dio2 variant: SetDio2AsRfSwitchCtrl is sent by the *driver* (since it
+    /// needs SPI access), and this hook is a no-op.  Pin variant: drive
+    /// both pins low.
+    async fn init(&mut self) -> Result<(), Self::Error>;
     async fn before_tx(&mut self) -> Result<(), Self::Error>;
     async fn before_rx(&mut self) -> Result<(), Self::Error>;
     async fn to_idle(&mut self) -> Result<(), Self::Error>;
+
+    /// True if this is the DIO2-driven variant — the driver will issue
+    /// `SetDio2AsRfSwitchCtrl` itself after switch.init().
+    fn uses_dio2(&self) -> bool;
 }
 
-/// DIO2 drives an external RF switch IC autonomously.
-///
-/// `init` enables the chip's automatic DIO2 switching. The runtime methods
-/// are no-ops; the chip toggles DIO2 a few microseconds before PA ramp-up/down.
+/// DIO2 drives an external RF switch IC autonomously (T114 / Heltec
+/// LR1262 module).  Driver issues `SetDio2AsRfSwitchCtrl(true)` once.
 pub struct Dio2RfSwitch;
 
 impl RfSwitchControl for Dio2RfSwitch {
-    type Error = sx1262::Error;
-
-    async fn init<SPI>(&mut self, dev: &mut Device<SPI>) -> Result<(), Self::Error>
-    where
-        SPI: SpiDevice,
-    {
-        dev.execute_command_async(SetDio2AsRfSwitchCtrl {
-            config: RfSwitchConfig { enable: true },
-        })
-        .await
-        .map(|_| ())
+    type Error = core::convert::Infallible;
+    async fn init(&mut self) -> Result<(), Self::Error> {
+        Ok(())
     }
-
     async fn before_tx(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -189,88 +107,121 @@ impl RfSwitchControl for Dio2RfSwitch {
     async fn to_idle(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
+    fn uses_dio2(&self) -> bool {
+        true
+    }
 }
 
-/// Two MCU GPIOs (TXEN/RXEN) drive a discrete RF switch.
-///
-/// `init` deasserts both pins; switching is done synchronously around
-/// `set_tx`/`set_rx`. DIO2 stays available for IRQ mapping.
-pub struct PinRfSwitch<Txen, Rxen>
-where
-    Txen: OutputPin,
-    Rxen: OutputPin,
-{
-    pub txen: Txen,
-    pub rxen: Rxen,
+/// Two-pin RF switch (DX-LR30 / LR1262-SP module): TXEN and RXEN are
+/// regular GPIOs the host drives around tx/rx.
+pub struct PinRfSwitch<Txen: OutputPin, Rxen: OutputPin> {
+    txen: Txen,
+    rxen: Rxen,
 }
 
-impl<Txen, Rxen> PinRfSwitch<Txen, Rxen>
-where
-    Txen: OutputPin,
-    Rxen: OutputPin,
-{
+impl<Txen: OutputPin, Rxen: OutputPin> PinRfSwitch<Txen, Rxen> {
     pub fn new(txen: Txen, rxen: Rxen) -> Self {
         Self { txen, rxen }
     }
 }
 
-/// Error wrapper for the two-pin switch variant. Either pin can fail
-/// independently.
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum PinSwitchError<TE, RE> {
-    Txen(TE),
-    Rxen(RE),
+pub enum PinSwitchError<TxenErr, RxenErr> {
+    Txen(TxenErr),
+    Rxen(RxenErr),
 }
 
-impl<Txen, Rxen> RfSwitchControl for PinRfSwitch<Txen, Rxen>
-where
-    Txen: OutputPin,
-    Rxen: OutputPin,
-{
-    type Error = PinSwitchError<Txen::Error, Rxen::Error>;
+impl<Txen: OutputPin, Rxen: OutputPin> RfSwitchControl for PinRfSwitch<Txen, Rxen> {
+    type Error = PinSwitchError<
+        <Txen as embedded_hal::digital::ErrorType>::Error,
+        <Rxen as embedded_hal::digital::ErrorType>::Error,
+    >;
 
-    async fn init<SPI>(&mut self, _dev: &mut Device<SPI>) -> Result<(), Self::Error>
-    where
-        SPI: SpiDevice,
-    {
+    async fn init(&mut self) -> Result<(), Self::Error> {
         self.txen.set_low().map_err(PinSwitchError::Txen)?;
         self.rxen.set_low().map_err(PinSwitchError::Rxen)?;
         Ok(())
     }
-
     async fn before_tx(&mut self) -> Result<(), Self::Error> {
         self.rxen.set_low().map_err(PinSwitchError::Rxen)?;
         self.txen.set_high().map_err(PinSwitchError::Txen)?;
         Ok(())
     }
-
     async fn before_rx(&mut self) -> Result<(), Self::Error> {
         self.txen.set_low().map_err(PinSwitchError::Txen)?;
         self.rxen.set_high().map_err(PinSwitchError::Rxen)?;
         Ok(())
     }
-
     async fn to_idle(&mut self) -> Result<(), Self::Error> {
         self.txen.set_low().map_err(PinSwitchError::Txen)?;
         self.rxen.set_low().map_err(PinSwitchError::Rxen)?;
         Ok(())
     }
+    fn uses_dio2(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Main driver
+// GFSK enums (kept for API stability with radio_bench)
 // ---------------------------------------------------------------------------
 
-/// GFSK-only async SX1262 driver.
-pub struct Sx1262Radio<Spi, Dio1, Reset, Switch>
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum GfskBandwidth {
+    Bw4800   = 0x1F,
+    Bw5800   = 0x17,
+    Bw7300   = 0x0F,
+    Bw9700   = 0x1E,
+    Bw11700  = 0x16,
+    Bw14600  = 0x0E,
+    Bw19500  = 0x1D,
+    Bw23400  = 0x15,
+    Bw29300  = 0x0D,
+    Bw39000  = 0x1C,
+    Bw46900  = 0x14,
+    Bw58600  = 0x0C,
+    Bw78200  = 0x1B,
+    Bw93800  = 0x13,
+    Bw117300 = 0x0B,
+    Bw156200 = 0x1A,
+    Bw187200 = 0x12,
+    Bw234300 = 0x0A,
+    Bw312000 = 0x19,
+    Bw373600 = 0x11,
+    Bw467000 = 0x09,
+}
+
+impl GfskBandwidth {
+    /// Old name kept to avoid touching every call site.
+    pub const Bw4670: Self = Self::Bw467000;
+}
+
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum GfskPulseShape {
+    Off  = 0x00,
+    Bt03 = 0x08,
+    Bt05 = 0x09,
+    Bt07 = 0x0A,
+    Bt1  = 0x0B,
+}
+
+// ---------------------------------------------------------------------------
+// Driver
+// ---------------------------------------------------------------------------
+
+pub struct Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>
 where
     Spi: SpiDevice,
+    Busy: Wait,
     Dio1: Wait,
     Reset: OutputPin,
     Switch: RfSwitchControl,
 {
-    dev: Device<Spi>,
+    spi: Spi,
+    busy: Busy,
     dio1: Dio1,
     reset: Reset,
     switch: Switch,
@@ -280,22 +231,60 @@ where
     crc_on: bool,
 }
 
-/// Convenience alias for the wrapper's error type.
-pub type RadioError<Reset, Switch> = Error<
-    <Switch as RfSwitchControl>::Error,
-    <Reset as embedded_hal::digital::ErrorType>::Error,
->;
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct RxPacket {
+    pub len: usize,
+    pub rssi_dbm: i16,
+    pub snr_db: i16,
+    pub crc_ok: bool,
+}
 
-impl<Spi, Dio1, Reset, Switch> Sx1262Radio<Spi, Dio1, Reset, Switch>
+// ---- Command opcodes (datasheet table 12-1) ----
+const CMD_SET_SLEEP: u8 = 0x84;
+const CMD_SET_STANDBY: u8 = 0x80;
+const CMD_SET_TX: u8 = 0x83;
+const CMD_SET_RX: u8 = 0x82;
+const CMD_SET_TX_CW: u8 = 0xD1;
+const CMD_SET_RF_FREQ: u8 = 0x86;
+const CMD_SET_PACKET_TYPE: u8 = 0x8A;
+const CMD_SET_TX_PARAMS: u8 = 0x8E;
+const CMD_SET_PA_CONFIG: u8 = 0x95;
+const CMD_SET_BUFFER_BASE: u8 = 0x8F;
+const CMD_SET_MOD_PARAMS: u8 = 0x8B;
+const CMD_SET_PACKET_PARAMS: u8 = 0x8C;
+const CMD_SET_DIO_IRQ_PARAMS: u8 = 0x08;
+const CMD_GET_IRQ_STATUS: u8 = 0x12;
+const CMD_CLEAR_IRQ_STATUS: u8 = 0x02;
+const CMD_GET_STATUS: u8 = 0xC0;
+const CMD_GET_RX_BUFFER_STATUS: u8 = 0x13;
+const CMD_GET_PACKET_STATUS: u8 = 0x14;
+const CMD_CALIBRATE_IMAGE: u8 = 0x98;
+const CMD_SET_DIO3_AS_TCXO_CTRL: u8 = 0x97;
+const CMD_SET_DIO2_AS_RF_SW: u8 = 0x9D;
+const CMD_SET_REGULATOR_MODE: u8 = 0x96;
+const CMD_SET_RX_TX_FALLBACK_MODE: u8 = 0x93;
+const CMD_WRITE_REGISTER: u8 = 0x0D;
+const CMD_READ_REGISTER: u8 = 0x1D;
+const CMD_WRITE_BUFFER: u8 = 0x0E;
+const CMD_READ_BUFFER: u8 = 0x1E;
+
+// ---- Register addresses we touch ----
+const REG_TX_CLAMP_CONFIG: u16 = 0x08D8;
+const REG_SYNC_WORD_BASE: u16 = 0x06C0;
+
+impl<Spi, Busy, Dio1, Reset, Switch> Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>
 where
     Spi: SpiDevice,
+    Busy: Wait,
     Dio1: Wait,
     Reset: OutputPin,
     Switch: RfSwitchControl,
 {
-    pub fn new(spi: Spi, dio1: Dio1, reset: Reset, switch: Switch) -> Self {
+    pub fn new(spi: Spi, busy: Busy, dio1: Dio1, reset: Reset, switch: Switch) -> Self {
         Self {
-            dev: Device::new(spi),
+            spi,
+            busy,
             dio1,
             reset,
             switch,
@@ -306,86 +295,237 @@ where
         }
     }
 
-    /// Release the SPI device and pins.
-    pub fn release(self) -> (Spi, Dio1, Reset, Switch) {
-        (self.dev.release(), self.dio1, self.reset, self.switch)
+    pub fn release(self) -> (Spi, Busy, Dio1, Reset, Switch) {
+        (self.spi, self.busy, self.dio1, self.reset, self.switch)
     }
 
-    /// Pulse RESET, enter STDBY_RC, set GFSK packet type, calibrate everything,
-    /// initialize the RF switch, and configure DIO1 to OR together TX_DONE,
-    /// RX_DONE, CRC_ERROR, and TIMEOUT.
+    // ---- Low-level SPI primitives ----
+
+    /// Wait for BUSY low.  Per datasheet §8.3.1 this must come before every
+    /// SPI command.  After a CS-high we add a brief grace delay so BUSY
+    /// has time to *rise*; without it, BUSY may still be low at the
+    /// moment of the next call and our `wait_for_low` would no-op even
+    /// though the chip is about to start processing.
+    async fn wait_busy(&mut self) -> Result<(), RadioError<Reset, Switch>> {
+        embassy_time::Timer::after_micros(20).await;
+        self.busy.wait_for_low().await.map_err(|_| Error::Bus)
+    }
+
+    /// Send a write-only command: opcode + parameters.  No response read.
+    async fn cmd(&mut self, opcode: u8, params: &[u8]) -> Result<(), RadioError<Reset, Switch>> {
+        self.wait_busy().await?;
+        // Build a small stack buffer.  Max command is SetPacketParams (9
+        // params), plus opcode = 10 bytes.  Allow up to 16 for headroom.
+        let mut buf = [0u8; 16];
+        buf[0] = opcode;
+        let total = 1 + params.len();
+        if total > buf.len() {
+            return Err(Error::PayloadTooLarge);
+        }
+        buf[1..total].copy_from_slice(params);
+        self.spi.write(&buf[..total]).await.map_err(|_| Error::Spi)
+    }
+
+    /// Send a command and read its response.  Caller supplies opcode +
+    /// params and a response buffer.  The chip returns the status byte
+    /// in place of the response's first byte (we read 1 + N bytes back).
+    /// Returns the chip's raw status byte plus fills `response` with the
+    /// N response bytes.
+    async fn cmd_read(
+        &mut self,
+        opcode: u8,
+        params: &[u8],
+        response: &mut [u8],
+    ) -> Result<u8, RadioError<Reset, Switch>> {
+        self.wait_busy().await?;
+        // Single full-duplex transfer: TX = [opcode, params, NOPs...],
+        // RX = [garbage, status, response...] (the status byte arrives in
+        // the slot AFTER the opcode/params per datasheet).
+        let mut tx = [0u8; 16];
+        let mut rx = [0u8; 16];
+        let prelude = 1 + params.len();
+        let total = prelude + 1 + response.len(); // +1 for status byte
+        if total > tx.len() {
+            return Err(Error::PayloadTooLarge);
+        }
+        tx[0] = opcode;
+        tx[1..prelude].copy_from_slice(params);
+        // Remaining tx bytes stay 0 (NOP).
+        self.spi
+            .transfer(&mut rx[..total], &tx[..total])
+            .await
+            .map_err(|_| Error::Spi)?;
+        let status = rx[prelude];
+        response.copy_from_slice(&rx[prelude + 1..total]);
+        Ok(status)
+    }
+
+    /// WriteRegister opcode: opcode + 16-bit BE address + data.
+    async fn write_register(
+        &mut self,
+        addr: u16,
+        data: &[u8],
+    ) -> Result<(), RadioError<Reset, Switch>> {
+        self.wait_busy().await?;
+        let mut buf = [0u8; 16];
+        buf[0] = CMD_WRITE_REGISTER;
+        buf[1] = (addr >> 8) as u8;
+        buf[2] = addr as u8;
+        let total = 3 + data.len();
+        if total > buf.len() {
+            return Err(Error::PayloadTooLarge);
+        }
+        buf[3..total].copy_from_slice(data);
+        self.spi.write(&buf[..total]).await.map_err(|_| Error::Spi)
+    }
+
+    /// ReadRegister opcode: opcode + 16-bit BE address + 1 NOP (status) +
+    /// N NOPs (data).  Returns the N data bytes (status byte is discarded).
+    async fn read_register(
+        &mut self,
+        addr: u16,
+        out: &mut [u8],
+    ) -> Result<(), RadioError<Reset, Switch>> {
+        self.wait_busy().await?;
+        let mut tx = [0u8; 16];
+        let mut rx = [0u8; 16];
+        tx[0] = CMD_READ_REGISTER;
+        tx[1] = (addr >> 8) as u8;
+        tx[2] = addr as u8;
+        // tx[3] is NOP for the status byte slot; tx[4..] are NOPs for data.
+        let total = 4 + out.len();
+        if total > tx.len() {
+            return Err(Error::PayloadTooLarge);
+        }
+        self.spi
+            .transfer(&mut rx[..total], &tx[..total])
+            .await
+            .map_err(|_| Error::Spi)?;
+        out.copy_from_slice(&rx[4..total]);
+        Ok(())
+    }
+
+    /// WriteBuffer: opcode + offset + data.  Used for TX payload.
+    async fn write_buffer(
+        &mut self,
+        offset: u8,
+        data: &[u8],
+    ) -> Result<(), RadioError<Reset, Switch>> {
+        self.wait_busy().await?;
+        // Use one transaction by chaining on a heapless buffer.  Max
+        // payload is bounded by `payload_max_len` (≤ 255 per chip).  For
+        // the bench-test path (8-byte payload) a 64-byte stack buffer
+        // is plenty.  Accept up to 254 bytes here (256 - 2 = opcode+offset).
+        let mut buf = [0u8; 256];
+        buf[0] = CMD_WRITE_BUFFER;
+        buf[1] = offset;
+        let total = 2 + data.len();
+        if total > buf.len() {
+            return Err(Error::PayloadTooLarge);
+        }
+        buf[2..total].copy_from_slice(data);
+        self.spi.write(&buf[..total]).await.map_err(|_| Error::Spi)
+    }
+
+    /// ReadBuffer: opcode + offset + 1 NOP (status) + N NOPs (data).
+    async fn read_buffer(
+        &mut self,
+        offset: u8,
+        out: &mut [u8],
+    ) -> Result<(), RadioError<Reset, Switch>> {
+        self.wait_busy().await?;
+        let mut tx = [0u8; 256];
+        let mut rx = [0u8; 256];
+        tx[0] = CMD_READ_BUFFER;
+        tx[1] = offset;
+        // tx[2] is NOP for status, tx[3..] are NOPs for data.
+        let total = 3 + out.len();
+        if total > tx.len() {
+            return Err(Error::PayloadTooLarge);
+        }
+        self.spi
+            .transfer(&mut rx[..total], &tx[..total])
+            .await
+            .map_err(|_| Error::Spi)?;
+        out.copy_from_slice(&rx[3..total]);
+        Ok(())
+    }
+
+    // ---- Public configuration API ----
+
+    /// Reset the chip and run the basic init sequence.  Must be called
+    /// FIRST before any other config method.
     ///
-    /// TODO(hardware): the datasheet's >=100 us reset-low pulse and ~10 ms
-    /// post-reset wait are *not* enforced by this driver (we don't take a
-    /// `DelayNs`). Callers should sequence `init` after a board-level
-    /// `Timer::after(Duration::from_millis(10))` or similar. Verify on real
-    /// silicon before trusting the first command.
+    /// Sequence:
+    ///   1. Pulse NRESET low ≥100 µs, release, wait BUSY low (~3 ms POR cal).
+    ///   2. SetStandby(STBY_RC).
+    ///   3. SetDio3AsTcxoCtrl(1.8 V, 5 ms) — Heltec/RAK SX1262 modules need this
+    ///      before any RF op or every SetTx fails with cmd_status=5.
+    ///   4. SetPacketType(GFSK).
+    ///   5. SetDioIrqParams (TX_DONE | RX_DONE | CRC_ERROR | TIMEOUT on DIO1).
     pub async fn init(&mut self) -> Result<(), RadioError<Reset, Switch>> {
-        // Pulse RESET. We don't have a delayer, so the actual low duration is
-        // up to the surrounding code.
+        // Reset pulse.
         self.reset.set_low().map_err(Error::Reset)?;
+        embassy_time::Timer::after_micros(200).await;
         self.reset.set_high().map_err(Error::Reset)?;
+        // POR runs internal calibration; BUSY will go low when complete.
+        self.wait_busy().await?;
 
-        self.dev
-            .execute_command_async(SetStandby {
-                config: StandbyConfig::Rc,
-            })
-            .await?;
+        // SetStandby(STBY_RC = 0).
+        self.cmd(CMD_SET_STANDBY, &[0x00]).await?;
 
-        self.dev
-            .execute_command_async(SetPacketType {
-                packet_type: PacketType::Gfsk,
-            })
-            .await?;
+        // SetRegulatorMode(DC-DC + LDO = 0x01).  Default after POR is
+        // LDO-only, which can underpower the PA at +14 dBm and above and
+        // cause the chip to silently reject SetTx after TX_DONE finishes
+        // (every-other-TX pattern observed without this).  Heltec T114
+        // hardware supports DC-DC (LR1262 module).
+        self.cmd(CMD_SET_REGULATOR_MODE, &[0x01]).await?;
 
-        // Calibrate everything. Bitflags has `::all()` since v2.
-        self.dev
-            .execute_command_async(Calibrate {
-                config: CalibrationConfig::all(),
-            })
-            .await?;
+        // SetDio3AsTcxoCtrl: voltage = V1_8 (0x02), delay = 320 (5 ms in
+        // 15.625 µs steps) — Heltec T114 wires DIO3 to TCXO power.  MUST
+        // come before any RF or calibration command.
+        self.cmd(
+            CMD_SET_DIO3_AS_TCXO_CTRL,
+            &[0x02, 0x00, 0x00, 0x01, 0x40],
+        )
+        .await?;
 
-        // Per-board RF switch init. Dio2 variant issues
-        // `SetDio2AsRfSwitchCtrl{enable=true}`; pin variant drives both pins low.
-        self.switch.init(&mut self.dev).await.map_err(Error::Switch)?;
+        // SetRxTxFallbackMode(FS = 0x40): after TX_DONE / RX_DONE, chip
+        // returns to FS (PLL locked) instead of STBY_RC.  Faster restart
+        // for the next TX, and avoids the chip entering some sub-state
+        // that rejects subsequent SetTx with cmd_status=5.
+        self.cmd(CMD_SET_RX_TX_FALLBACK_MODE, &[0x40]).await?;
 
-        // DIO1 OR mask: TX_DONE | RX_DONE | CRC_ERROR | TIMEOUT.
-        let mask = IrqMask::TX_DONE | IrqMask::RX_DONE | IrqMask::CRC_ERROR | IrqMask::TIMEOUT;
-        self.dev
-            .execute_command_async(SetDioIrqParams {
-                config: DioIrqConfig {
-                    irq_mask: mask,
-                    dio1_mask: mask,
-                    dio2_mask: IrqMask::empty(),
-                    dio3_mask: IrqMask::empty(),
-                },
-            })
-            .await?;
+        // SetPacketType(GFSK = 0).
+        self.cmd(CMD_SET_PACKET_TYPE, &[0x00]).await?;
+
+        // SetDioIrqParams: DIO1 fires on TX_DONE (bit 0) | RX_DONE (bit 1) |
+        // CRC_ERROR (bit 6) | TIMEOUT (bit 9).  Mask = 0x0243.
+        let mask: u16 = 0x0243;
+        let mh = (mask >> 8) as u8;
+        let ml = mask as u8;
+        self.cmd(
+            CMD_SET_DIO_IRQ_PARAMS,
+            &[mh, ml, mh, ml, 0x00, 0x00, 0x00, 0x00],
+        )
+        .await?;
 
         Ok(())
     }
 
-    /// Set RF frequency in Hz. Also runs `CalibrateImage` for the matching
-    /// band (datasheet table 9-2).
     pub async fn set_frequency(
         &mut self,
         hz: u32,
     ) -> Result<(), RadioError<Reset, Switch>> {
         let (f1, f2) = image_cal_band(hz);
-        self.dev
-            .execute_command_async(CalibrateImage {
-                config: ImageCalibConfig { freq1: f1, freq2: f2 },
-            })
-            .await?;
-        self.dev
-            .execute_command_async(SetRfFrequency {
-                config: RfFrequencyConfig { frequency: hz },
-            })
-            .await?;
-        Ok(())
+        self.cmd(CMD_CALIBRATE_IMAGE, &[f1, f2]).await?;
+        // Calibrate takes a few ms; wait_busy at start of next command will block.
+
+        // SetRfFrequency: register value = (hz * 2^25) / 32_000_000.
+        let reg = (((hz as u64) << 25) / 32_000_000) as u32;
+        self.cmd(CMD_SET_RF_FREQ, &reg.to_be_bytes()).await
     }
 
-    /// GFSK modulation parameters.
     pub async fn set_modulation_gfsk(
         &mut self,
         bitrate_bps: u32,
@@ -393,28 +533,21 @@ where
         bandwidth: GfskBandwidth,
         pulse_shape: GfskPulseShape,
     ) -> Result<(), RadioError<Reset, Switch>> {
-        self.dev
-            .execute_command_async(SetModulationParams {
-                params: ModulationParams::Gfsk(GfskModParams {
-                    bit_rate: bitrate_bps,
-                    pulse_shape,
-                    bandwidth,
-                    freq_deviation: deviation_hz,
-                }),
-            })
-            .await?;
-        Ok(())
+        // SetModulationParams (GFSK), datasheet 13.4.5:
+        //   [0..3] BR = (32 * F_XTAL) / bitrate, BE u24
+        //   [3]    pulse shape
+        //   [4]    bandwidth
+        //   [5..8] FDEV = (dev * 2^25) / F_XTAL, BE u24
+        let br_reg = ((32u64 * 32_000_000) / bitrate_bps as u64) as u32; // 24-bit
+        let fdev_reg = (((deviation_hz as u64) << 25) / 32_000_000) as u32; // 24-bit
+        let mut p = [0u8; 8];
+        p[0..3].copy_from_slice(&br_reg.to_be_bytes()[1..4]);
+        p[3] = pulse_shape as u8;
+        p[4] = bandwidth as u8;
+        p[5..8].copy_from_slice(&fdev_reg.to_be_bytes()[1..4]);
+        self.cmd(CMD_SET_MOD_PARAMS, &p).await
     }
 
-    /// Configure variable-length GFSK packet format.
-    ///
-    /// `sync_word` is at most 8 bytes. The chip's sync-word register at
-    /// 0x06C0 is always 8 bytes wide; shorter sync words are zero-padded on
-    /// the right and the active length (in bits) is stored in the
-    /// `SetPacketParams` byte stream.
-    ///
-    /// CRC is fixed to 2-byte if enabled; whitening stays off (link-layer
-    /// scrambling is the protocol stack's job).
     pub async fn set_packet_format(
         &mut self,
         preamble_len: u16,
@@ -427,58 +560,85 @@ where
         }
         let mut sync = [0u8; 8];
         sync[..sync_word.len()].copy_from_slice(sync_word);
-
-        self.dev
-            .write_register_async::<SyncWord>(SyncWord { value: sync })
-            .await?;
+        self.write_register(REG_SYNC_WORD_BASE, &sync).await?;
 
         self.preamble_len = preamble_len;
         self.sync_word_bits = (sync_word.len() as u8) * 8;
         self.payload_max_len = payload_max_len;
         self.crc_on = crc_on;
 
-        // Re-issue SetPacketParams with the configured max payload length.
-        // tx() will rewrite payload_length per packet.
         self.write_packet_params(payload_max_len).await
     }
 
-    /// Configure TX power. Uses the SX1262 (high-power) PA config recommended
-    /// by the datasheet for +22 dBm; output is clamped to `[-9, +22]` dBm.
     pub async fn set_tx_power(
         &mut self,
         dbm: i8,
     ) -> Result<(), RadioError<Reset, Switch>> {
         let dbm = dbm.clamp(-9, 22);
-
-        // SX1262 +22 dBm PA config.
-        self.dev
-            .execute_command_async(SetPaConfig {
-                config: PaConfig {
-                    duty_cycle: 0x04,
-                    hp_max: 0x07,
-                    device_sel: DeviceSelect::Sx1262,
-                    pa_lut: 0x01,
-                },
-            })
+        // PA preset matched to output level (datasheet table 13-21).
+        let (duty_cycle, hp_max) = match dbm {
+            d if d >= 22 => (0x04, 0x07),
+            d if d >= 20 => (0x03, 0x05),
+            d if d >= 17 => (0x02, 0x03),
+            _ => (0x02, 0x02),
+        };
+        // SetPaConfig: [duty, hp_max, dev_sel=0x00 (sx1262), pa_lut=0x01].
+        self.cmd(CMD_SET_PA_CONFIG, &[duty_cycle, hp_max, 0x00, 0x01])
             .await?;
 
-        self.dev
-            .execute_command_async(SetTxParams {
-                params: TxParams {
-                    power: dbm,
-                    ramp_time: RampTime::Micros200,
-                },
-            })
-            .await?;
+        // TxClampConfig workaround (datasheet §15.2): RMW reg 0x08D8 |= 0x1E.
+        let mut clamp = [0u8; 1];
+        self.read_register(REG_TX_CLAMP_CONFIG, &mut clamp).await?;
+        clamp[0] |= 0x1E;
+        self.write_register(REG_TX_CLAMP_CONFIG, &clamp).await?;
+
+        // SetTxParams: [power, ramp_time].  ramp = Micros200 = 0x04.
+        self.cmd(CMD_SET_TX_PARAMS, &[dbm as u8, 0x04]).await
+    }
+
+    /// Finish init.  Issue `SetDio2AsRfSwitchCtrl(true)` for the Dio2
+    /// variant after all RF config is in place; or call into the pin
+    /// switch's idle init for the two-pin variant.
+    pub async fn finish_init(&mut self) -> Result<(), RadioError<Reset, Switch>> {
+        if self.switch.uses_dio2() {
+            self.cmd(CMD_SET_DIO2_AS_RF_SW, &[0x01]).await?;
+        }
+        self.switch.init().await.map_err(Error::Switch)?;
         Ok(())
     }
 
-    /// Transmit a single packet.
-    ///
-    /// switch.before_tx -> SetBufferBaseAddress -> WriteBuffer ->
-    /// SetPacketParams (with this packet's length) -> ClearIrqStatus ->
-    /// SetTx -> wait DIO1 -> GetIrqStatus -> ClearIrqStatus ->
-    /// switch.to_idle -> SetStandby(RC).
+    // ---- TX / RX / status ----
+
+    /// Read raw `(mode, cmd_status)` from `GetStatus`.  Mode = bits 6:4,
+    /// cmd_status = bits 3:1 of the chip's status byte.
+    pub async fn get_status_raw(&mut self) -> Result<(u8, u8), RadioError<Reset, Switch>> {
+        // GetStatus returns the status byte itself as the response slot,
+        // not after — special case per datasheet 13.5.1.  We just send
+        // 0xC0 and read 1 byte.
+        self.wait_busy().await?;
+        let mut rx = [0u8; 2];
+        let tx = [CMD_GET_STATUS, 0x00];
+        self.spi
+            .transfer(&mut rx, &tx)
+            .await
+            .map_err(|_| Error::Spi)?;
+        let status = rx[1];
+        Ok(((status >> 4) & 0x07, (status >> 1) & 0x07))
+    }
+
+    /// Read pending IRQ bitmap via `GetIrqStatus`.
+    pub async fn get_irq_raw(&mut self) -> Result<u16, RadioError<Reset, Switch>> {
+        let mut buf = [0u8; 2];
+        self.cmd_read(CMD_GET_IRQ_STATUS, &[], &mut buf).await?;
+        Ok(u16::from_be_bytes(buf))
+    }
+
+    /// DIAGNOSTIC: enter continuous wave TX mode (no packet, no modulation).
+    /// Used to verify the chip's TX path works at all.
+    pub async fn dbg_tx_cw(&mut self) -> Result<(), RadioError<Reset, Switch>> {
+        self.cmd(CMD_SET_TX_CW, &[]).await
+    }
+
     pub async fn tx(
         &mut self,
         payload: &[u8],
@@ -489,125 +649,83 @@ where
 
         self.switch.before_tx().await.map_err(Error::Switch)?;
 
-        self.dev
-            .execute_command_async(SetBufferBaseAddress {
-                config: BufferBaseAddressConfig {
-                    tx_base_addr: 0,
-                    rx_base_addr: 0,
-                },
-            })
-            .await?;
-        self.dev.write_buffer_async(0, payload).await?;
+        // SetBufferBaseAddress(tx=0, rx=0).
+        self.cmd(CMD_SET_BUFFER_BASE, &[0x00, 0x00]).await?;
+        self.write_buffer(0, payload).await?;
 
-        // Tell the modem how many bytes to send.
+        // Update payload_length in SetPacketParams.
         self.write_packet_params(payload.len() as u8).await?;
 
-        self.dev
-            .execute_command_async(ClearIrqStatus {
-                irq_mask: IrqMask::all(),
-            })
-            .await?;
+        // ClearIrqStatus(all = 0xFFFF).
+        self.cmd(CMD_CLEAR_IRQ_STATUS, &[0xFF, 0xFF]).await?;
 
-        self.dev
-            .execute_command_async(SetTx {
-                timeout: Timeout(0),
-            })
-            .await?;
+        // SetTx with timeout = 0 (no timeout).
+        self.cmd(CMD_SET_TX, &[0x00, 0x00, 0x00]).await?;
 
+        // Wait for DIO1 to fire (TX_DONE / RX_DONE / CRC_ERROR / TIMEOUT).
         self.dio1.wait_for_high().await.map_err(|_| Error::Bus)?;
 
-        let irq = self
-            .dev
-            .execute_command_async(GetIrqStatus)
-            .await?
-            .irq_mask;
-        self.dev
-            .execute_command_async(ClearIrqStatus {
-                irq_mask: IrqMask::all(),
-            })
-            .await?;
+        let irq = self.get_irq_raw().await?;
+        // ClearIrqStatus(all).
+        self.cmd(CMD_CLEAR_IRQ_STATUS, &[0xFF, 0xFF]).await?;
 
         self.switch.to_idle().await.map_err(Error::Switch)?;
-        self.dev
-            .execute_command_async(SetStandby {
-                config: StandbyConfig::Rc,
-            })
-            .await?;
+        // NOTE: do NOT call `SetStandby(RC)` here.  With
+        // RxTxFallbackMode = FS the chip is already back in FS (PLL locked,
+        // PA off) — perfect state for the next TX.  Empirically, calling
+        // SetStandby(RC) after TX_DONE leaves the chip in a sub-state
+        // that rejects the *next* SetTx with cmd_status=5; only after
+        // ~3 seconds of idle does the next SetTx succeed.
 
-        if irq.contains(IrqMask::TX_DONE) {
+        // bit 0 = TX_DONE
+        if irq & 0x0001 != 0 {
             Ok(())
         } else {
-            Err(Error::UnexpectedIrq(irq.bits()))
+            Err(Error::UnexpectedIrq(irq))
         }
     }
 
-    /// Receive a single packet in continuous-RX mode.
-    ///
-    /// Returns on TX_DONE/RX_DONE/CRC_ERROR/TIMEOUT IRQ. CRC errors return
-    /// `Error::CrcMismatch` so the caller can decide whether to drop or keep
-    /// the frame.
     pub async fn rx_continuous(
         &mut self,
         buf: &mut [u8],
     ) -> Result<RxPacket, RadioError<Reset, Switch>> {
         self.switch.before_rx().await.map_err(Error::Switch)?;
 
-        // Re-issue SetPacketParams with the configured max payload length so
-        // the modem accepts up to that many bytes.
+        // Restore packet length to the configured max so any incoming
+        // frame is accepted.
         self.write_packet_params(self.payload_max_len).await?;
 
-        self.dev
-            .execute_command_async(ClearIrqStatus {
-                irq_mask: IrqMask::all(),
-            })
-            .await?;
+        // ClearIrqStatus(all).
+        self.cmd(CMD_CLEAR_IRQ_STATUS, &[0xFF, 0xFF]).await?;
 
-        self.dev
-            .execute_command_async(SetRx {
-                mode: RxMode::Continuous,
-            })
-            .await?;
+        // SetRx with timeout 0xFFFFFF (continuous, no timeout).
+        self.cmd(CMD_SET_RX, &[0xFF, 0xFF, 0xFF]).await?;
 
         self.dio1.wait_for_high().await.map_err(|_| Error::Bus)?;
 
-        let irq = self
-            .dev
-            .execute_command_async(GetIrqStatus)
-            .await?
-            .irq_mask;
-        self.dev
-            .execute_command_async(ClearIrqStatus {
-                irq_mask: IrqMask::all(),
-            })
-            .await?;
+        let irq = self.get_irq_raw().await?;
+        self.cmd(CMD_CLEAR_IRQ_STATUS, &[0xFF, 0xFF]).await?;
 
-        let crc_err = irq.contains(IrqMask::CRC_ERROR);
-        let rx_done = irq.contains(IrqMask::RX_DONE);
-        let timeout = irq.contains(IrqMask::TIMEOUT);
+        let crc_err = irq & 0x0040 != 0; // bit 6
+        let rx_done = irq & 0x0002 != 0; // bit 1
 
         let result = if rx_done {
-            let buf_status = self
-                .dev
-                .execute_command_async(GetRxBufferStatus)
-                .await?
-                .buffer_status;
-            let len = buf_status.payload_length as usize;
-            if len > buf.len() {
+            // GetRxBufferStatus: returns [status, payload_len, rx_start_buffer_pointer].
+            let mut bs = [0u8; 2];
+            self.cmd_read(CMD_GET_RX_BUFFER_STATUS, &[], &mut bs).await?;
+            let payload_len = bs[0] as usize;
+            let rx_start = bs[1];
+            if payload_len > buf.len() {
                 Err(Error::BufferTooSmall)
             } else {
-                self.dev
-                    .read_buffer_async(buf_status.buffer_pointer, &mut buf[..len])
-                    .await?;
-                let pkt = self
-                    .dev
-                    .execute_command_async(GetPacketStatus)
-                    .await?
-                    .packet_status;
-                // FSK packet status: status[0]=RxStatus, status[1]=RssiSync,
-                // status[2]=RssiAvg. Use RssiSync (latched at sync detect).
-                let rssi_dbm = -((pkt.status[1] as i16) >> 1);
+                self.read_buffer(rx_start, &mut buf[..payload_len]).await?;
+                // GetPacketStatus (FSK): [status, RxStatus, RssiSync, RssiAvg].
+                let mut ps = [0u8; 3];
+                self.cmd_read(CMD_GET_PACKET_STATUS, &[], &mut ps).await?;
+                let rssi_sync = ps[1]; // raw
+                let rssi_dbm = -((rssi_sync as i16) >> 1);
                 Ok(RxPacket {
-                    len,
+                    len: payload_len,
                     rssi_dbm,
                     snr_db: 0,
                     crc_ok: !crc_err,
@@ -615,61 +733,44 @@ where
             }
         } else if crc_err {
             Err(Error::CrcMismatch)
-        } else if timeout {
-            Err(Error::UnexpectedIrq(irq.bits()))
         } else {
-            Err(Error::UnexpectedIrq(irq.bits()))
+            Err(Error::UnexpectedIrq(irq))
         };
 
         self.switch.to_idle().await.map_err(Error::Switch)?;
-        self.dev
-            .execute_command_async(SetStandby {
-                config: StandbyConfig::Rc,
-            })
-            .await?;
-
+        self.cmd(CMD_SET_STANDBY, &[0x00]).await?;
         result
     }
 
     // ---- internal helpers ----
 
-    /// Build the 9-byte GFSK `SetPacketParams` payload from current settings
-    /// plus a per-call payload length, and send it.
     async fn write_packet_params(
         &mut self,
         payload_len: u8,
     ) -> Result<(), RadioError<Reset, Switch>> {
-        // Datasheet 13.4.4: GFSK SetPacketParams byte layout:
-        //   [0..2] preamble_length (BE u16, in bits/2 - actually bytes; see ds)
-        //   [2]    preamble_detector_length
-        //   [3]    sync_word_length (in bits, 0..=64)
-        //   [4]    address_filtering
-        //   [5]    packet_type (0=Fixed, 1=Variable)
-        //   [6]    payload_length
-        //   [7]    crc_type
-        //   [8]    whitening_enable
+        // GFSK SetPacketParams (datasheet 13.4.4):
+        //   [0..2] preamble length (bits, BE u16)
+        //   [2]    preamble detector length (Bits16 = 0x05)
+        //   [3]    sync word length (bits, 0..=64)
+        //   [4]    address filtering (Disable = 0x00)
+        //   [5]    packet header type (Variable = 0x01)
+        //   [6]    payload length
+        //   [7]    crc type (Crc2Byte = 0x02; Off = 0x01)
+        //   [8]    whitening enable (0 = off)
         let pl = self.preamble_len.to_be_bytes();
-        let bytes = [
+        let crc_type = if self.crc_on { 0x02 } else { 0x01 };
+        let p = [
             pl[0],
             pl[1],
-            PreambleDetectorLength::Bits16 as u8,
+            0x05, // PreambleDetectorLength::Bits16
             self.sync_word_bits,
-            AddressFiltering::Disable as u8,
-            GfskPacketHeaderType::Variable as u8,
+            0x00,
+            0x01,
             payload_len,
-            if self.crc_on {
-                CrcType::Crc2Byte as u8
-            } else {
-                CrcType::Off as u8
-            },
-            0, // whitening disabled
+            crc_type,
+            0x00,
         ];
-        self.dev
-            .execute_command_async(SetPacketParams {
-                params: PacketParams { params: bytes },
-            })
-            .await?;
-        Ok(())
+        self.cmd(CMD_SET_PACKET_PARAMS, &p).await
     }
 }
 
@@ -686,7 +787,6 @@ fn image_cal_band(hz: u32) -> (u8, u8) {
         779_000_000..=787_000_000 => (0xC1, 0xC5),
         863_000_000..=870_000_000 => (0xD7, 0xDB),
         902_000_000..=928_000_000 => (0xE1, 0xE9),
-        // Default to the 902-928 MHz band - safest for ISM use cases.
         _ => (0xE1, 0xE9),
     }
 }

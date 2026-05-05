@@ -31,11 +31,12 @@ const RF_SYNC_WORD: [u8; 4] = [0xC1, 0x94, 0xC1, 0x94];
 
 /// Apply the bench-test radio configuration.  Caller-side concrete types are
 /// erased through the `Sx1262Radio` generics.
-async fn configure_radio<Spi, Dio1, Reset, Switch>(
-    radio: &mut Sx1262Radio<Spi, Dio1, Reset, Switch>,
+async fn configure_radio<Spi, Busy, Dio1, Reset, Switch>(
+    radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
 ) -> Result<(), RadioError<Reset, Switch>>
 where
     Spi: SpiDevice,
+    Busy: Wait,
     Dio1: Wait,
     Reset: embedded_hal::digital::OutputPin,
     Switch: RfSwitchControl,
@@ -56,17 +57,20 @@ where
         .set_packet_format(RF_PREAMBLE_BITS, &RF_SYNC_WORD, RF_PAYLOAD_MAX, true)
         .await?;
     radio.set_tx_power(RF_TX_POWER_DBM).await?;
+    // RF switch init must be LAST per SX1262 AN1200.36.
+    radio.finish_init().await?;
     Ok(())
 }
 
 /// TX loop: send `[0xDE 0xAD 0xBE 0xEF, seq:u32]` once per second forever.
 /// Toggles the LED on every successful transmission.
-pub async fn run_tx<Spi, Dio1, Reset, Switch, Led>(
-    radio: &mut Sx1262Radio<Spi, Dio1, Reset, Switch>,
+pub async fn run_tx<Spi, Busy, Dio1, Reset, Switch, Led>(
+    radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
     led: &mut Led,
 ) -> !
 where
     Spi: SpiDevice,
+    Busy: Wait,
     Dio1: Wait,
     Reset: embedded_hal::digital::OutputPin,
     Switch: RfSwitchControl,
@@ -97,12 +101,37 @@ where
             (counter >> 8) as u8,
             counter as u8,
         ];
-        match radio.tx(&payload).await {
-            Ok(()) => {
+        // Race radio.tx() against a 2-second timeout.  If TX doesn't fire
+        // TX_DONE in 2 s (transmission of an 8-byte packet at 300 kbps
+        // takes < 1 ms), something's wrong — read SX1262 state for diagnosis.
+        match embassy_futures::select::select(
+            radio.tx(&payload),
+            Timer::after_millis(2000),
+        )
+        .await
+        {
+            embassy_futures::select::Either::First(Ok(())) => {
                 defmt::info!("TX #{}: sent {} bytes", counter, payload.len());
                 let _ = led.toggle();
             }
-            Err(_) => defmt::error!("TX #{}: failed", counter),
+            embassy_futures::select::Either::First(Err(_)) => {
+                defmt::error!("TX #{}: failed", counter)
+            }
+            embassy_futures::select::Either::Second(_) => {
+                let st = radio
+                    .get_status_raw()
+                    .await
+                    .map(|(m, c)| (m, c))
+                    .unwrap_or((0xFF, 0xFF));
+                let irq = radio.get_irq_raw().await.unwrap_or(0xFFFF);
+                defmt::error!(
+                    "TX #{} TIMEOUT after 2s: chip mode={} cmd_status={} irq=0x{:04x}",
+                    counter,
+                    st.0,
+                    st.1,
+                    irq
+                );
+            }
         }
         counter = counter.wrapping_add(1);
         Timer::after_millis(1000).await;
@@ -111,12 +140,13 @@ where
 
 /// RX loop: listen continuously, log every received packet's bytes + RSSI,
 /// toggle the LED on every CRC-good packet.
-pub async fn run_rx<Spi, Dio1, Reset, Switch, Led>(
-    radio: &mut Sx1262Radio<Spi, Dio1, Reset, Switch>,
+pub async fn run_rx<Spi, Busy, Dio1, Reset, Switch, Led>(
+    radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
     led: &mut Led,
 ) -> !
 where
     Spi: SpiDevice,
+    Busy: Wait,
     Dio1: Wait,
     Reset: embedded_hal::digital::OutputPin,
     Switch: RfSwitchControl,
