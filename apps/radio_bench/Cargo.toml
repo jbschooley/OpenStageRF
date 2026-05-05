@@ -10,7 +10,6 @@ osrf-radio-sx126x  = { workspace = true, features = ["defmt"] }
 embedded-hal       = { workspace = true }
 embedded-hal-async = { workspace = true }
 embassy-time       = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
-embassy-futures    = "0.1"
 defmt              = { workspace = true }
 
 [lib]
