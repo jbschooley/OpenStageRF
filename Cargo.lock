@@ -1029,6 +1029,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "osrf-app-link-bench"
+version = "0.1.0"
+dependencies = [
+ "defmt 1.0.1",
+ "embassy-futures",
+ "embassy-time",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "osrf-link",
+ "osrf-radio-sx126x",
+]
+
+[[package]]
 name = "osrf-app-midi-bench"
 version = "0.1.0"
 dependencies = [
@@ -1134,8 +1147,10 @@ name = "osrf-link"
 version = "0.1.0"
 dependencies = [
  "defmt 1.0.1",
+ "embassy-time",
  "embedded-hal 1.0.0",
  "heapless 0.9.2",
+ "osrf-protocols-midi-v1",
 ]
 
 [[package]]
@@ -1275,6 +1290,34 @@ dependencies = [
  "embassy-time",
  "log",
  "osrf-app-blink",
+ "osrf-board-t114",
+ "panic-probe",
+]
+
+[[package]]
+name = "osrf-profile-t114-link-rx"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "defmt 1.0.1",
+ "defmt-rtt",
+ "embassy-executor",
+ "osrf-app-link-bench",
+ "osrf-board-t114",
+ "panic-probe",
+]
+
+[[package]]
+name = "osrf-profile-t114-link-tx"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "defmt 1.0.1",
+ "defmt-rtt",
+ "embassy-executor",
+ "osrf-app-link-bench",
  "osrf-board-t114",
  "panic-probe",
 ]

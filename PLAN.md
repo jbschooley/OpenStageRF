@@ -193,11 +193,17 @@ Replaced with hand-rolled raw SPI command layer in `drivers/radio/sx126x/src/lib
   - `#![cfg_attr(not(test), no_std)]` + `[lib] test = true` — host tests intentionally enabled here despite the project-wide `test = false` convention, because wire-format correctness is the kind of thing that benefits enormously from unit tests.
   - **23 host-side tests pass**, covering: round-trips for all body variants (Heartbeat / 1-,2-,3-byte MIDI / all four FragState values / Unknown event types), explicit byte-level wire-layout assertion (canary against accidental wire breaks), seq packing/unpacking, header AAD layout, all error paths (truncation, wrong version, reserved 0x00 event_type, invalid MIDI length on encode + decode, buffer too small, seq overflow, invalid fragstate, empty SysEx body on encode + decode), spec size table sanity (`HEADER_LEN`, NoteOn = 14 bytes in `none` mode).
   - Compiles clean for both embedded targets (`thumbv7m-none-eabi`, `thumbv7em-none-eabihf`).
-- [ ] `osrf-link`:
-  - `LinkSender`: takes `MidiEvent`, encodes to packet, hands to radio. Generates seq numbers via `(boot_counter, session_seq)`.
-  - `LinkReceiver`: receives raw packet from radio, validates radio-level CRC, decodes, runs replay window check (64-packet sliding window with bitmap), emits dedup'd `MidiEvent` to consumer.
-  - `Watchdog`: timer that fires after 200 ms of no received packets; emits `LinkLost` event to consumer.
-  - `Heartbeat`: timer that emits `MidiEvent::Heartbeat` every 20 ms when no other event has been sent.
+- [x] `osrf-link` data plane (`core/link/src/lib.rs`):
+  - `ReplayWindow` — 64-bit sliding-window bitmap keyed on the full 48-bit `seq` (boot_counter ⊕ session_seq).  Forward jumps shift the bitmap; backwards-within-window are accepted once and rejected on replay; too-old (distance ≥ 64) are rejected.
+  - `LinkSender::{new, no_crypto, encode}` — owns `(boot_counter, session_seq, key_fp)`, calls `proto::encode`, advances `session_seq` per call, errors on overflow.
+  - `LinkReceiver::{new, no_crypto, process}` — calls `proto::decode`, drops on `key_fp` mismatch, drops on replay-window rejection, accepts otherwise.  Returns `RxOutcome::{Accept(Packet), Drop(KeyFpMismatch | Replay)}`.
+  - **16 host tests pass** covering: first-packet accept, replay rejection, strictly-increasing accept, out-of-order within window, too-old boundary (distance 64 vs 63), far-forward jump resets bitmap, short-forward keeps history, boot-counter jump treated as forward, sender seq increment + overflow, sender header layout, receiver accept/replay/key-mismatch/decode-error, receiver out-of-order accept-then-replay.
+  - Compiles clean for both embedded targets.
+- [x] `osrf-link` timer plane:
+  - `WatchdogTimer::{new, kick, wait}` — receiver-side, default 200 ms.  Composed with the radio's `rx_continuous` future via `embassy_futures::select`; each accepted packet kicks the watchdog, expiry surfaces `LinkLost` to the app (which translates to all-notes-off on every channel for the MIDI consumer).
+  - `HeartbeatTimer::{new, note_send, wait}` — transmitter-side, default 20 ms (10× safety margin against the 200 ms RX watchdog).  Composed with the inbound MIDI source via `select`; any send (MIDI event or heartbeat) defers the next heartbeat.
+  - Timer types use `embassy_time::{Instant, Duration, Timer::at}` directly; deadline-based design means kicks before the future resolves are guaranteed to delay (no staleness window).
+  - Behaviour validated end-to-end on hardware (Phase 4); host-side mock-time tests deferred since the deadline math is trivial and the await behavior is what actually matters for link liveness.
 - [ ] `osrf-app-midi-node` TX role: read MIDI from FeatherWing → `LinkSender` → radio
 - [ ] `osrf-app-midi-node` RX role: radio → `LinkReceiver` → on `LinkLost`, send all-notes-off; on event, write to FeatherWing UART
 - [ ] Tests in mock-radio harness: dedup correctness, replay rejection, watchdog firing, heartbeat timing.
