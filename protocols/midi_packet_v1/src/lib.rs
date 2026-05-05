@@ -4,174 +4,109 @@
 //! OpenStageRF Transport Envelope v1 — wire-format encode/decode.
 //!
 //! See `SPEC.md` in this directory for the full specification.  This crate
-//! implements only the wire format; AEAD/MAC computation lives in
-//! `osrf-crypto`, and the link layer (replay window, watchdog, etc.) lives
-//! in `osrf-link`.
+//! implements:
 //!
-//! Milestone 4 scope: the no-crypto path (`key_fp = 0x000000`, no tag).
-//! Lower-level header / body helpers are exposed so a future AEAD-aware
-//! caller can encode the header + plaintext, hand the resulting AAD + body
-//! to a cipher, and append the tag itself — without re-doing the framing.
+//! * Header encode/decode (`encode`, `decode`).
+//! * ChannelVoice and SysExFragment body parsing (`ChannelVoiceIter`,
+//!   `parse_sysex_fragment`, `encode_sysex_fragment_body`).
+//! * Replay-window types (`PacketReplayWindow32`, `EventReplayWindow16`)
+//!   including the modular-arithmetic event window with the
+//!   session-reset fallback for `boot_counter` collisions.
+//!
+//! AEAD/MAC computation lives in `osrf-crypto` (future).  The link
+//! layer (queue, watchdog, SysEx reassembly) lives in `osrf-link`.
+//! This crate is `no_std` and depends only on `heapless` and (optionally)
+//! `defmt`.
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// Transport envelope version byte.  v1 = 0x01.
 pub const VER_V1: u8 = 0x01;
 
-/// Total fixed header length: ver(1) + key_fp(3) + seq(6) + event_type(1).
+/// Total fixed header length:
+/// `ver(1) + key_fp(3) + boot_counter(2) + packet_seq(4) + event_type(1)`.
 ///
 /// The full header is the AEAD AAD per the spec.
 pub const HEADER_LEN: usize = 11;
 
-/// Sentinel meaning "no encryption, no authentication".  When a receiver sees
-/// this in `key_fp`, it skips key lookup and AEAD verification entirely.
+/// Sentinel meaning "no encryption, no authentication".
 pub const KEY_FP_NONE: KeyFp = [0, 0, 0];
 
 /// Reserved sentinel — must not appear on the wire.
 pub const KEY_FP_RESERVED: KeyFp = [0xFF, 0xFF, 0xFF];
 
-/// Sequence numbers are 6 bytes on the wire; this is the maximum representable.
-pub const MAX_SEQ: u64 = (1u64 << 48) - 1;
-
-/// Maximum bytes carried in a `Body::MidiMessage` payload.
-///
-/// Originally a single MIDI channel-voice message (1–3 bytes), this was
-/// relaxed in v1 to allow **batched** raw MIDI bytes — multiple
-/// status-delimited messages concatenated.  The receiver decodes the
-/// stream by MIDI parsing (status bytes have the high bit set; data
-/// bytes don't), so the wire format is unchanged — only the length
-/// invariant relaxes.
-///
-/// 64 bytes is comfortably more than fits in a 64-byte radio packet
-/// after the 11-byte header (53 usable), but accommodates future
-/// configurations with larger payloads.
-pub const MAX_MIDI_MESSAGE_LEN: usize = 64;
-
 /// Three-byte key fingerprint.  See `SPEC.md` § "key_fp".
 pub type KeyFp = [u8; 3];
+
+/// Maximum body bytes (after header, before any AEAD tag) that the encoder
+/// will write.  Sized to fit the RF payload limit minus the header — for
+/// the current 64-byte radio packet, that's `64 - HEADER_LEN = 53`.
+/// Crypto-enabled builds need to leave room for the tag too; that's the
+/// link layer's concern (it supplies a smaller body buffer).
+pub const MAX_BODY_LEN: usize = 53;
+
+/// Maximum SysEx fragment data bytes (excluding the 4-byte fragment
+/// header `[sysex_id:2][frag_idx:1][frag_total:1]`).
+pub const MAX_FRAG_DATA_BYTES: usize = MAX_BODY_LEN - 4;
+
+/// Backward `packet_seq` jump larger than this triggers the session-reset
+/// fallback path in `PacketReplayWindow32`.  Sized to comfortably exceed
+/// the peak `packet_seq` advance over one minute of sustained max-rate
+/// transmission (~90 000 packets/min at 1500 packets/sec).  See SPEC.md
+/// § "Session-reset fallback".
+pub const SESSION_RESET_GAP: u32 = 100_000;
 
 /// Numeric event_type discriminators.  Public so callers can match raw values.
 pub mod event_type {
     pub const HEARTBEAT: u8 = 0x01;
-    pub const MIDI_MESSAGE: u8 = 0x02;
-    pub const MIDI_SYSEX_FRAGMENT: u8 = 0x03;
+    pub const CHANNEL_VOICE: u8 = 0x02;
+    pub const SYSEX_FRAGMENT: u8 = 0x03;
+}
+
+// ── EventType ────────────────────────────────────────────────────────────────
+
+/// Discriminator for the body format.  `Unknown(u8)` preserves any
+/// reserved-future value so the receiver can drop it gracefully.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum EventType {
+    Heartbeat,
+    ChannelVoice,
+    SysExFragment,
+    Unknown(u8),
+}
+
+impl EventType {
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::Heartbeat => event_type::HEARTBEAT,
+            Self::ChannelVoice => event_type::CHANNEL_VOICE,
+            Self::SysExFragment => event_type::SYSEX_FRAGMENT,
+            Self::Unknown(b) => b,
+        }
+    }
+
+    pub const fn from_u8(b: u8) -> Self {
+        match b {
+            event_type::HEARTBEAT => Self::Heartbeat,
+            event_type::CHANNEL_VOICE => Self::ChannelVoice,
+            event_type::SYSEX_FRAGMENT => Self::SysExFragment,
+            _ => Self::Unknown(b),
+        }
+    }
 }
 
 // ── Header ───────────────────────────────────────────────────────────────────
 
-/// Parsed packet header.  `seq` carries the 6-byte wire seq in the low 48
-/// bits of a u64 (high 16 bits are always zero on the wire).
+/// Parsed packet header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Header {
     pub ver: u8,
     pub key_fp: KeyFp,
-    pub seq: u64,
-    pub event_type: u8,
-}
-
-impl Header {
-    /// Pack `(boot_counter, session_seq)` into a single 48-bit `seq`.
-    #[inline]
-    pub const fn make_seq(boot_counter: u16, session_seq: u32) -> u64 {
-        ((boot_counter as u64) << 32) | (session_seq as u64)
-    }
-
-    /// Top 16 bits of `seq`, mirroring the wire layout `[boot_counter:2 || session_seq:4]`.
-    #[inline]
-    pub const fn boot_counter(&self) -> u16 {
-        (self.seq >> 32) as u16
-    }
-
-    /// Bottom 32 bits of `seq`.
-    #[inline]
-    pub const fn session_seq(&self) -> u32 {
-        self.seq as u32
-    }
-}
-
-// ── SysEx fragment state ─────────────────────────────────────────────────────
-
-/// Where in a SysEx message a fragment sits.  See `SPEC.md` § "Body: MIDI_SYSEX_FRAGMENT".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[repr(u8)]
-pub enum FragState {
-    /// First fragment.  Body begins with `0xF0`.
-    First = 0x01,
-    /// Continuation fragment.  No `0xF0`/`0xF7` markers within.
-    Middle = 0x02,
-    /// Final fragment.  Body ends with `0xF7`.
-    Last = 0x03,
-    /// Whole SysEx in one fragment.  Body is `0xF0..0xF7`.
-    Single = 0x04,
-}
-
-impl FragState {
-    pub const fn from_u8(v: u8) -> Option<Self> {
-        match v {
-            0x01 => Some(Self::First),
-            0x02 => Some(Self::Middle),
-            0x03 => Some(Self::Last),
-            0x04 => Some(Self::Single),
-            _ => None,
-        }
-    }
-}
-
-// ── Body ─────────────────────────────────────────────────────────────────────
-
-/// Decoded packet body, borrowing from the on-wire byte buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum Body<'a> {
-    /// `event_type = 0x01`.  Empty body.
-    Heartbeat,
-
-    /// `event_type = 0x02`.  1..=3 raw MIDI bytes.
-    MidiMessage(&'a [u8]),
-
-    /// `event_type = 0x03`.  Body = `[frag_state:1] + sysex_bytes:1..N`.
-    SysExFragment { state: FragState, bytes: &'a [u8] },
-
-    /// Any reserved `event_type` value we don't recognize.  Preserved as-is so
-    /// the link layer can drop / forward according to its forward-compat rules.
-    Unknown { event_type: u8, data: &'a [u8] },
-}
-
-impl<'a> Body<'a> {
-    /// The `event_type` byte that goes in the header.
-    #[inline]
-    pub fn event_type(&self) -> u8 {
-        match self {
-            Self::Heartbeat => event_type::HEARTBEAT,
-            Self::MidiMessage(_) => event_type::MIDI_MESSAGE,
-            Self::SysExFragment { .. } => event_type::MIDI_SYSEX_FRAGMENT,
-            Self::Unknown { event_type, .. } => *event_type,
-        }
-    }
-
-    /// Length of the `event_data` slice (does NOT include the `event_type`
-    /// byte, which is part of the header).
-    #[inline]
-    pub fn data_len(&self) -> usize {
-        match self {
-            Self::Heartbeat => 0,
-            Self::MidiMessage(b) => b.len(),
-            Self::SysExFragment { bytes, .. } => 1 + bytes.len(),
-            Self::Unknown { data, .. } => data.len(),
-        }
-    }
-}
-
-// ── Packet ───────────────────────────────────────────────────────────────────
-
-/// A decoded packet (header + body).  AEAD tag, if any, is stripped before
-/// decode and re-attached after encode by the caller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Packet<'a> {
-    pub header: Header,
-    pub body: Body<'a>,
+    pub boot_counter: u16,
+    pub packet_seq: u32,
+    pub event_type: EventType,
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────
@@ -179,14 +114,10 @@ pub struct Packet<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum EncodeError {
-    /// `out` doesn't fit `HEADER_LEN + body.data_len()` bytes.
+    /// `out` doesn't fit `HEADER_LEN + body.len()` bytes.
     BufferTooSmall,
-    /// `MidiMessage` body must be 1..=3 bytes.
-    InvalidMidiLength,
-    /// `SysExFragment` body must have ≥1 sysex byte.
-    InvalidSysExFragment,
-    /// `seq` exceeds 2^48 - 1 — would overflow the 6-byte wire field.
-    SeqOutOfRange,
+    /// Body exceeds `MAX_BODY_LEN`.
+    BodyTooLarge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,134 +129,331 @@ pub enum DecodeError {
     UnknownVersion(u8),
     /// `event_type = 0x00` is reserved and MUST NOT appear on the wire.
     ReservedEventType,
-    /// `MidiMessage` body wasn't 1..=3 bytes.
-    InvalidMidiLength,
-    /// `SysExFragment` body is missing the fragstate byte or has zero sysex bytes.
-    InvalidSysExFragment,
-    /// `frag_state` byte wasn't a known FragState variant.
-    InvalidFragState(u8),
 }
 
-// ── Encode ───────────────────────────────────────────────────────────────────
+// ── Encode / Decode ──────────────────────────────────────────────────────────
 
-/// Total wire bytes required for `body` (excluding any AEAD tag).
-///
-/// Validates body invariants (MIDI length, non-empty SysEx body) and returns
-/// the same `EncodeError`s `encode` would return for those cases.
-pub fn wire_len(body: &Body<'_>) -> Result<usize, EncodeError> {
-    match body {
-        Body::MidiMessage(b) if b.is_empty() || b.len() > MAX_MIDI_MESSAGE_LEN => {
-            Err(EncodeError::InvalidMidiLength)
-        }
-        Body::SysExFragment { bytes, .. } if bytes.is_empty() => {
-            Err(EncodeError::InvalidSysExFragment)
-        }
-        _ => Ok(HEADER_LEN + body.data_len()),
+/// Encode header + body into `out`.  No AEAD tag is written — that's the
+/// crypto layer's job.  Returns the number of bytes written.
+pub fn encode(out: &mut [u8], header: &Header, body: &[u8]) -> Result<usize, EncodeError> {
+    if body.len() > MAX_BODY_LEN {
+        return Err(EncodeError::BodyTooLarge);
     }
-}
-
-/// Encode header + plaintext body into `out`.  No AEAD tag is written.
-///
-/// Returns the number of bytes written.  An AEAD-using caller computes the
-/// tag over `out[..HEADER_LEN]` (AAD) and `out[HEADER_LEN..returned_len]`
-/// (plaintext, possibly encrypted in place afterwards) and appends the tag
-/// to the slice that follows.
-pub fn encode(out: &mut [u8], header: &Header, body: &Body<'_>) -> Result<usize, EncodeError> {
-    if header.seq > MAX_SEQ {
-        return Err(EncodeError::SeqOutOfRange);
-    }
-    let n = wire_len(body)?;
-    if out.len() < n {
+    let total = HEADER_LEN + body.len();
+    if out.len() < total {
         return Err(EncodeError::BufferTooSmall);
     }
-
-    // Header
     out[0] = header.ver;
     out[1..4].copy_from_slice(&header.key_fp);
-
-    // 6-byte big-endian seq, MSB first.  The top 2 bytes of the u64 are
-    // guaranteed zero by the MAX_SEQ check above.
-    let seq_be = header.seq.to_be_bytes();
-    out[4..10].copy_from_slice(&seq_be[2..8]);
-
-    out[10] = body.event_type();
-
-    // Body
-    match body {
-        Body::Heartbeat => {}
-        Body::MidiMessage(b) => out[HEADER_LEN..HEADER_LEN + b.len()].copy_from_slice(b),
-        Body::SysExFragment { state, bytes } => {
-            out[HEADER_LEN] = *state as u8;
-            out[HEADER_LEN + 1..HEADER_LEN + 1 + bytes.len()].copy_from_slice(bytes);
-        }
-        Body::Unknown { data, .. } => {
-            out[HEADER_LEN..HEADER_LEN + data.len()].copy_from_slice(data)
-        }
-    }
-
-    Ok(n)
+    out[4..6].copy_from_slice(&header.boot_counter.to_be_bytes());
+    out[6..10].copy_from_slice(&header.packet_seq.to_be_bytes());
+    out[10] = header.event_type.as_u8();
+    out[HEADER_LEN..total].copy_from_slice(body);
+    Ok(total)
 }
 
-// ── Decode ───────────────────────────────────────────────────────────────────
-
-/// Parse the 11-byte header + body from `buf`.
-///
-/// AEAD-using callers strip the trailing tag bytes before passing the buffer
-/// in; this function knows nothing about tags.
-pub fn decode<'a>(buf: &'a [u8]) -> Result<Packet<'a>, DecodeError> {
+/// Decode header from `buf`.  Returns the header and a slice over the body
+/// bytes (everything after the header).  The caller is responsible for
+/// further parsing the body based on `header.event_type`.
+pub fn decode(buf: &[u8]) -> Result<(Header, &[u8]), DecodeError> {
     if buf.len() < HEADER_LEN {
         return Err(DecodeError::TooShort);
     }
-
     let ver = buf[0];
     if ver != VER_V1 {
         return Err(DecodeError::UnknownVersion(ver));
     }
-
     let mut key_fp: KeyFp = [0; 3];
     key_fp.copy_from_slice(&buf[1..4]);
-
-    let mut seq_be = [0u8; 8];
-    seq_be[2..8].copy_from_slice(&buf[4..10]);
-    let seq = u64::from_be_bytes(seq_be);
-
-    let event_type = buf[10];
-    let data = &buf[HEADER_LEN..];
-
-    let body = match event_type {
-        0x00 => return Err(DecodeError::ReservedEventType),
-        event_type::HEARTBEAT => Body::Heartbeat,
-        event_type::MIDI_MESSAGE => {
-            if data.is_empty() || data.len() > MAX_MIDI_MESSAGE_LEN {
-                return Err(DecodeError::InvalidMidiLength);
-            }
-            Body::MidiMessage(data)
-        }
-        event_type::MIDI_SYSEX_FRAGMENT => {
-            if data.is_empty() {
-                return Err(DecodeError::InvalidSysExFragment);
-            }
-            let fs_byte = data[0];
-            let state =
-                FragState::from_u8(fs_byte).ok_or(DecodeError::InvalidFragState(fs_byte))?;
-            let bytes = &data[1..];
-            if bytes.is_empty() {
-                return Err(DecodeError::InvalidSysExFragment);
-            }
-            Body::SysExFragment { state, bytes }
-        }
-        _ => Body::Unknown { event_type, data },
-    };
-
-    Ok(Packet {
-        header: Header {
-            ver,
-            key_fp,
-            seq,
-            event_type,
-        },
+    let boot_counter = u16::from_be_bytes([buf[4], buf[5]]);
+    let packet_seq = u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]);
+    let event_type_byte = buf[10];
+    if event_type_byte == 0x00 {
+        return Err(DecodeError::ReservedEventType);
+    }
+    let event_type = EventType::from_u8(event_type_byte);
+    let body = &buf[HEADER_LEN..];
+    Ok((
+        Header { ver, key_fp, boot_counter, packet_seq, event_type },
         body,
-    })
+    ))
+}
+
+// ── ChannelVoice body parsing ────────────────────────────────────────────────
+
+/// Returns the byte length of a MIDI message starting with `status`, or
+/// `None` if `status` is not a valid wire-format status byte.  Running
+/// status, F0/F7 (SysEx markers — those use SysExFragment), and System
+/// Common reserved bytes (F4, F5) are all rejected.
+pub const fn midi_message_length(status: u8) -> Option<usize> {
+    match status & 0xF0 {
+        0xC0 | 0xD0 => Some(2),
+        0x80 | 0x90 | 0xA0 | 0xB0 | 0xE0 => Some(3),
+        0xF0 => match status {
+            0xF1 | 0xF3 => Some(2),
+            0xF2 => Some(3),
+            0xF6 => Some(1),
+            0xF8..=0xFF => Some(1),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Iterator over a CHANNEL_VOICE body.  Yields `(event_seq, midi)` tuples
+/// or an error if the body is malformed.
+pub struct ChannelVoiceIter<'a> {
+    body: &'a [u8],
+}
+
+impl<'a> ChannelVoiceIter<'a> {
+    pub fn new(body: &'a [u8]) -> Self {
+        Self { body }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum ChannelVoiceParseError {
+    /// Ran out of body bytes mid-event.
+    Truncated,
+    /// Status byte isn't a valid MIDI message start.
+    InvalidStatus(u8),
+}
+
+impl<'a> Iterator for ChannelVoiceIter<'a> {
+    type Item = Result<(u16, &'a [u8]), ChannelVoiceParseError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.body.is_empty() {
+            return None;
+        }
+        if self.body.len() < 3 {
+            // Need at least: 2 seq bytes + 1 status byte.
+            self.body = &[];
+            return Some(Err(ChannelVoiceParseError::Truncated));
+        }
+        let event_seq = u16::from_be_bytes([self.body[0], self.body[1]]);
+        let status = self.body[2];
+        let msg_len = match midi_message_length(status) {
+            Some(n) => n,
+            None => {
+                self.body = &[];
+                return Some(Err(ChannelVoiceParseError::InvalidStatus(status)));
+            }
+        };
+        if self.body.len() < 2 + msg_len {
+            self.body = &[];
+            return Some(Err(ChannelVoiceParseError::Truncated));
+        }
+        let midi = &self.body[2..2 + msg_len];
+        self.body = &self.body[2 + msg_len..];
+        Some(Ok((event_seq, midi)))
+    }
+}
+
+// ── SysExFragment body parsing ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct SysExFragmentParts<'a> {
+    pub sysex_id: u16,
+    pub frag_idx: u8,
+    pub frag_total: u8,
+    pub data: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum SysExParseError {
+    /// Body too short to contain the 4-byte fragment header.
+    Truncated,
+    /// `frag_total == 0`.
+    InvalidFragTotal,
+    /// `frag_idx >= frag_total`.
+    InvalidFragIdx { idx: u8, total: u8 },
+}
+
+pub fn parse_sysex_fragment(body: &[u8]) -> Result<SysExFragmentParts<'_>, SysExParseError> {
+    if body.len() < 4 {
+        return Err(SysExParseError::Truncated);
+    }
+    let sysex_id = u16::from_be_bytes([body[0], body[1]]);
+    let frag_idx = body[2];
+    let frag_total = body[3];
+    let data = &body[4..];
+    if frag_total == 0 {
+        return Err(SysExParseError::InvalidFragTotal);
+    }
+    if frag_idx >= frag_total {
+        return Err(SysExParseError::InvalidFragIdx { idx: frag_idx, total: frag_total });
+    }
+    Ok(SysExFragmentParts { sysex_id, frag_idx, frag_total, data })
+}
+
+pub fn encode_sysex_fragment_body(
+    out: &mut [u8],
+    parts: &SysExFragmentParts<'_>,
+) -> Result<usize, EncodeError> {
+    let n = 4 + parts.data.len();
+    if n > MAX_BODY_LEN {
+        return Err(EncodeError::BodyTooLarge);
+    }
+    if out.len() < n {
+        return Err(EncodeError::BufferTooSmall);
+    }
+    out[0..2].copy_from_slice(&parts.sysex_id.to_be_bytes());
+    out[2] = parts.frag_idx;
+    out[3] = parts.frag_total;
+    out[4..n].copy_from_slice(parts.data);
+    Ok(n)
+}
+
+// ── Replay windows ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum CheckOutcome {
+    Accept,
+    /// Same as `Accept` but the receiver should also reset upper-layer
+    /// state (event window, SysEx reassembly).  Emitted by the packet
+    /// replay window when a backward `packet_seq` jump exceeds
+    /// `SESSION_RESET_GAP`, indicating a `boot_counter` collision after
+    /// a TX restart.
+    AcceptSessionReset,
+    Replay,
+    TooOld,
+}
+
+/// 32-bit linear sliding-window replay detector for `packet_seq`.
+///
+/// Tracks the highest seq seen plus a 64-bit bitmap of which of the 64
+/// preceding seqs we've also accepted.  Out-of-order packets within the
+/// window are accepted at most once.  Backward jumps beyond
+/// `SESSION_RESET_GAP` are treated as a fresh session and reset the
+/// window — see SPEC.md § "Session-reset fallback".
+#[derive(Debug, Default, Clone)]
+pub struct PacketReplayWindow32 {
+    high: u32,
+    bitmap: u64,
+    initialised: bool,
+}
+
+impl PacketReplayWindow32 {
+    pub const fn new() -> Self {
+        Self { high: 0, bitmap: 0, initialised: false }
+    }
+
+    pub fn reset(&mut self) {
+        self.high = 0;
+        self.bitmap = 0;
+        self.initialised = false;
+    }
+
+    pub fn high(&self) -> Option<u32> {
+        if self.initialised {
+            Some(self.high)
+        } else {
+            None
+        }
+    }
+
+    pub fn check_and_advance(&mut self, seq: u32) -> CheckOutcome {
+        if !self.initialised {
+            self.high = seq;
+            self.bitmap = 1;
+            self.initialised = true;
+            return CheckOutcome::Accept;
+        }
+        if seq > self.high {
+            let shift = seq - self.high;
+            self.bitmap = if shift >= 64 { 0 } else { self.bitmap << shift };
+            self.bitmap |= 1;
+            self.high = seq;
+            CheckOutcome::Accept
+        } else if seq == self.high {
+            CheckOutcome::Replay
+        } else if self.high - seq >= SESSION_RESET_GAP {
+            self.high = seq;
+            self.bitmap = 1;
+            CheckOutcome::AcceptSessionReset
+        } else if self.high - seq >= 64 {
+            CheckOutcome::TooOld
+        } else {
+            let bit = (self.high - seq) as u64;
+            if self.bitmap & (1u64 << bit) != 0 {
+                CheckOutcome::Replay
+            } else {
+                self.bitmap |= 1u64 << bit;
+                CheckOutcome::Accept
+            }
+        }
+    }
+}
+
+/// 16-bit modular sliding-window replay detector for `event_seq`.
+///
+/// Uses RFC 1982-style serial-number arithmetic: a new seq is "forward"
+/// if the modular distance is in `[1, 32_767]`, "backward" if in
+/// `[32_768, 65_535]`.  Backward by ≤ 64 → check bitmap.  Backward by
+/// > 64 but < 32 768 → too old.  Wraparound (e.g., from 65 535 → 0) is
+/// invisible to the algorithm because `wrapping_sub` does the right
+/// thing.  See SPEC.md § "Event replay window".
+#[derive(Debug, Default, Clone)]
+pub struct EventReplayWindow16 {
+    high: u16,
+    bitmap: u64,
+    initialised: bool,
+}
+
+impl EventReplayWindow16 {
+    pub const fn new() -> Self {
+        Self { high: 0, bitmap: 0, initialised: false }
+    }
+
+    pub fn reset(&mut self) {
+        self.high = 0;
+        self.bitmap = 0;
+        self.initialised = false;
+    }
+
+    pub fn high(&self) -> Option<u16> {
+        if self.initialised {
+            Some(self.high)
+        } else {
+            None
+        }
+    }
+
+    pub fn check_and_advance(&mut self, seq: u16) -> CheckOutcome {
+        if !self.initialised {
+            self.high = seq;
+            self.bitmap = 1;
+            self.initialised = true;
+            return CheckOutcome::Accept;
+        }
+        let d = seq.wrapping_sub(self.high);
+        match d {
+            0 => CheckOutcome::Replay,
+            1..=32_767 => {
+                let shift = d as u32;
+                self.bitmap = if shift >= 64 { 0 } else { self.bitmap << shift };
+                self.bitmap |= 1;
+                self.high = seq;
+                CheckOutcome::Accept
+            }
+            32_768..=65_471 => CheckOutcome::TooOld,
+            65_472..=65_535 => {
+                let bit = (65_536u32 - d as u32) as u64;
+                if self.bitmap & (1u64 << bit) != 0 {
+                    CheckOutcome::Replay
+                } else {
+                    self.bitmap |= 1u64 << bit;
+                    CheckOutcome::Accept
+                }
+            }
+        }
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -334,224 +462,218 @@ pub fn decode<'a>(buf: &'a [u8]) -> Result<Packet<'a>, DecodeError> {
 mod tests {
     use super::*;
 
-    fn header(seq: u64, event_type: u8) -> Header {
+    fn h(boot: u16, seq: u32, et: EventType) -> Header {
         Header {
             ver: VER_V1,
             key_fp: KEY_FP_NONE,
-            seq,
-            event_type,
+            boot_counter: boot,
+            packet_seq: seq,
+            event_type: et,
         }
     }
 
-    // ── Round-trips per body type ─────────────────────────────────────────
+    // ── Header round-trips ────────────────────────────────────────────────
 
     #[test]
     fn round_trip_heartbeat() {
-        let h = header(42, event_type::HEARTBEAT);
+        let hdr = h(7, 42, EventType::Heartbeat);
         let mut buf = [0u8; HEADER_LEN];
-        let n = encode(&mut buf, &h, &Body::Heartbeat).unwrap();
+        let n = encode(&mut buf, &hdr, &[]).unwrap();
         assert_eq!(n, HEADER_LEN);
-        let p = decode(&buf[..n]).unwrap();
-        assert_eq!(p.header, h);
-        assert_eq!(p.body, Body::Heartbeat);
+        let (parsed, body) = decode(&buf[..n]).unwrap();
+        assert_eq!(parsed, hdr);
+        assert!(body.is_empty());
     }
 
     #[test]
-    fn round_trip_midi_three_byte() {
-        let h = header(0x1234_5678, event_type::MIDI_MESSAGE);
-        let midi = [0x90, 60, 100]; // Note On ch 0, note 60, vel 100
+    fn round_trip_channel_voice() {
+        let hdr = h(0xABCD, 0x1234_5678, EventType::ChannelVoice);
+        // Body: (seq=1, NoteOn 60 100), (seq=2, NoteOn 64 100)
+        let body = [
+            0x00, 0x01, 0x90, 60, 100,
+            0x00, 0x02, 0x90, 64, 100,
+        ];
         let mut buf = [0u8; 32];
-        let n = encode(&mut buf, &h, &Body::MidiMessage(&midi)).unwrap();
-        assert_eq!(n, HEADER_LEN + 3);
-        let p = decode(&buf[..n]).unwrap();
-        assert_eq!(p.header.seq, 0x1234_5678);
-        match p.body {
-            Body::MidiMessage(b) => assert_eq!(b, &midi),
-            other => panic!("expected MidiMessage, got {other:?}"),
-        }
+        let n = encode(&mut buf, &hdr, &body).unwrap();
+        assert_eq!(n, HEADER_LEN + body.len());
+        let (parsed, parsed_body) = decode(&buf[..n]).unwrap();
+        assert_eq!(parsed, hdr);
+        assert_eq!(parsed_body, &body);
     }
 
     #[test]
-    fn round_trip_midi_two_byte() {
-        let h = header(1, event_type::MIDI_MESSAGE);
-        let midi = [0xC5, 42]; // Program Change ch 5, program 42
-        let mut buf = [0u8; 32];
-        let n = encode(&mut buf, &h, &Body::MidiMessage(&midi)).unwrap();
-        assert_eq!(n, HEADER_LEN + 2);
-        match decode(&buf[..n]).unwrap().body {
-            Body::MidiMessage(b) => assert_eq!(b, &midi),
-            other => panic!("expected MidiMessage, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn round_trip_midi_one_byte_realtime() {
-        let h = header(2, event_type::MIDI_MESSAGE);
-        let midi = [0xF8]; // System Real-Time: TimingClock
-        let mut buf = [0u8; 16];
-        let n = encode(&mut buf, &h, &Body::MidiMessage(&midi)).unwrap();
-        assert_eq!(n, HEADER_LEN + 1);
-        match decode(&buf[..n]).unwrap().body {
-            Body::MidiMessage(b) => assert_eq!(b, &[0xF8]),
-            other => panic!("expected MidiMessage, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn round_trip_sysex_fragment_first() {
-        let h = header(7, event_type::MIDI_SYSEX_FRAGMENT);
-        let sysex = [0xF0, 0x7E, 0x7F, 0x06, 0x01];
-        let mut buf = [0u8; 32];
-        let n = encode(
-            &mut buf,
-            &h,
-            &Body::SysExFragment {
-                state: FragState::First,
-                bytes: &sysex,
-            },
-        )
-        .unwrap();
-        assert_eq!(n, HEADER_LEN + 1 + sysex.len());
-        match decode(&buf[..n]).unwrap().body {
-            Body::SysExFragment { state, bytes } => {
-                assert_eq!(state, FragState::First);
-                assert_eq!(bytes, &sysex);
-            }
-            other => panic!("expected SysExFragment, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn round_trip_sysex_fragment_all_states() {
-        for &(state, expected_byte) in &[
-            (FragState::First, 0x01u8),
-            (FragState::Middle, 0x02),
-            (FragState::Last, 0x03),
-            (FragState::Single, 0x04),
-        ] {
-            let bytes = [0xAA];
-            let h = header(0, event_type::MIDI_SYSEX_FRAGMENT);
-            let mut buf = [0u8; 16];
-            let n = encode(
-                &mut buf,
-                &h,
-                &Body::SysExFragment {
-                    state,
-                    bytes: &bytes,
-                },
-            )
-            .unwrap();
-            assert_eq!(buf[HEADER_LEN], expected_byte, "fragstate byte for {state:?}");
-            match decode(&buf[..n]).unwrap().body {
-                Body::SysExFragment { state: s2, .. } => assert_eq!(s2, state),
-                other => panic!("expected SysExFragment, got {other:?}"),
-            }
-        }
-    }
-
-    // ── Header / seq layout ────────────────────────────────────────────────
-
-    #[test]
-    fn seq_pack_unpack_round_trip() {
-        let seq = Header::make_seq(0x1234, 0xDEAD_BEEF);
-        assert_eq!(seq, 0x0000_1234_DEAD_BEEFu64);
-        let h = Header {
-            ver: VER_V1,
-            key_fp: KEY_FP_NONE,
-            seq,
-            event_type: event_type::HEARTBEAT,
+    fn round_trip_sysex_fragment() {
+        let hdr = h(1, 9, EventType::SysExFragment);
+        let parts = SysExFragmentParts {
+            sysex_id: 0x4242,
+            frag_idx: 0,
+            frag_total: 1,
+            data: &[0x7E, 0x7F, 0x06, 0x01],
         };
-        assert_eq!(h.boot_counter(), 0x1234);
-        assert_eq!(h.session_seq(), 0xDEAD_BEEF);
+        let mut body_buf = [0u8; 16];
+        let body_n = encode_sysex_fragment_body(&mut body_buf, &parts).unwrap();
+        let mut wire = [0u8; 32];
+        let n = encode(&mut wire, &hdr, &body_buf[..body_n]).unwrap();
+        let (parsed_hdr, parsed_body) = decode(&wire[..n]).unwrap();
+        assert_eq!(parsed_hdr, hdr);
+        let parsed_parts = parse_sysex_fragment(parsed_body).unwrap();
+        assert_eq!(parsed_parts, parts);
     }
 
+    // ── Wire layout ───────────────────────────────────────────────────────
+
     #[test]
-    fn wire_layout_is_exactly_per_spec() {
-        // Known-value test: this byte sequence is the canonical encoding.
-        // Any change here means a wire-format break.
-        let h = Header {
+    fn wire_layout_known_bytes() {
+        let hdr = Header {
             ver: VER_V1,
             key_fp: [0x12, 0x34, 0x56],
-            seq: Header::make_seq(0x00AB, 0xCDEF_0123),
-            event_type: event_type::MIDI_MESSAGE,
+            boot_counter: 0x00AB,
+            packet_seq: 0xCDEF_0123,
+            event_type: EventType::ChannelVoice,
         };
-        let midi = [0x90, 60, 100];
-        let mut buf = [0u8; 14];
-        let n = encode(&mut buf, &h, &Body::MidiMessage(&midi)).unwrap();
-        assert_eq!(n, 14);
+        let body = [0x00, 0x05, 0x90, 60, 100];
+        let mut buf = [0u8; 16];
+        let n = encode(&mut buf, &hdr, &body).unwrap();
+        assert_eq!(n, 16);
         assert_eq!(
             buf,
             [
                 0x01, // ver
                 0x12, 0x34, 0x56, // key_fp
-                0x00, 0xAB, 0xCD, 0xEF, 0x01, 0x23, // seq big-endian, 6 bytes
-                0x02, // event_type = MIDI_MESSAGE
-                0x90, 60, 100, // MIDI bytes
+                0x00, 0xAB, // boot_counter
+                0xCD, 0xEF, 0x01, 0x23, // packet_seq
+                0x02, // event_type = ChannelVoice
+                0x00, 0x05, 0x90, 60, 100, // body
             ]
         );
     }
 
     #[test]
     fn aad_is_first_eleven_bytes() {
-        // Per spec, AAD = ver || key_fp || seq || event_type = first HEADER_LEN bytes.
-        let h = Header {
-            ver: VER_V1,
-            key_fp: [0xAB, 0xCD, 0xEF],
-            seq: 0x123456,
-            event_type: event_type::MIDI_MESSAGE,
-        };
+        // AAD = ver || key_fp || boot_counter || packet_seq || event_type.
+        let hdr = h(0xBEEF, 0xDEAD_BEEF, EventType::ChannelVoice);
         let mut buf = [0u8; 32];
-        encode(&mut buf, &h, &Body::MidiMessage(&[0x90, 60, 100])).unwrap();
-        // The first HEADER_LEN bytes are the AAD.
-        assert_eq!(buf[0], 0x01);
-        assert_eq!(&buf[1..4], &[0xAB, 0xCD, 0xEF]);
-        assert_eq!(&buf[4..10], &[0, 0, 0, 0x12, 0x34, 0x56]);
-        assert_eq!(buf[10], event_type::MIDI_MESSAGE);
+        encode(&mut buf, &hdr, &[0, 1, 0x90, 60, 100]).unwrap();
+        assert_eq!(buf[0], VER_V1);
+        assert_eq!(&buf[1..4], &KEY_FP_NONE);
+        assert_eq!(&buf[4..6], &0xBEEFu16.to_be_bytes());
+        assert_eq!(&buf[6..10], &0xDEAD_BEEFu32.to_be_bytes());
+        assert_eq!(buf[10], event_type::CHANNEL_VOICE);
     }
 
-    // ── Forward compatibility ─────────────────────────────────────────────
+    // ── ChannelVoice parsing ─────────────────────────────────────────────
 
     #[test]
-    fn unknown_event_type_passes_through() {
-        // 0x05 is reserved-future-MIDI; older firmware should preserve it.
-        let h = header(0, 0x05);
-        let data = [1u8, 2, 3];
-        let mut buf = [0u8; 32];
-        let n = encode(
-            &mut buf,
-            &h,
-            &Body::Unknown {
-                event_type: 0x05,
-                data: &data,
-            },
-        )
-        .unwrap();
-        let p = decode(&buf[..n]).unwrap();
-        match p.body {
-            Body::Unknown { event_type, data } => {
-                assert_eq!(event_type, 0x05);
-                assert_eq!(data, &[1, 2, 3]);
-            }
-            other => panic!("expected Unknown, got {other:?}"),
+    fn channel_voice_iter_yields_each_event() {
+        // (seq=10, NoteOn C, NoteOn E, NoteOn G)
+        let body = [
+            0x00, 0x0A, 0x90, 60, 100,
+            0x00, 0x0B, 0x90, 64, 100,
+            0x00, 0x0C, 0x90, 67, 100,
+        ];
+        let events: std::vec::Vec<_> = ChannelVoiceIter::new(&body)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0], (10, &[0x90, 60, 100][..]));
+        assert_eq!(events[1], (11, &[0x90, 64, 100][..]));
+        assert_eq!(events[2], (12, &[0x90, 67, 100][..]));
+    }
+
+    #[test]
+    fn channel_voice_iter_handles_mixed_lengths() {
+        // ProgramChange (2 bytes) + NoteOn (3 bytes) + TimingClock (1 byte)
+        let body = [
+            0x00, 0x01, 0xC5, 42,
+            0x00, 0x02, 0x90, 60, 100,
+            0x00, 0x03, 0xF8,
+        ];
+        let events: std::vec::Vec<_> = ChannelVoiceIter::new(&body)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0], (1, &[0xC5, 42][..]));
+        assert_eq!(events[1], (2, &[0x90, 60, 100][..]));
+        assert_eq!(events[2], (3, &[0xF8][..]));
+    }
+
+    #[test]
+    fn channel_voice_iter_empty_body_yields_nothing() {
+        let events: std::vec::Vec<_> = ChannelVoiceIter::new(&[]).collect();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn channel_voice_iter_truncated_returns_error() {
+        let body = [0x00, 0x01, 0x90, 60]; // missing velocity byte
+        let mut iter = ChannelVoiceIter::new(&body);
+        match iter.next() {
+            Some(Err(ChannelVoiceParseError::Truncated)) => {}
+            other => panic!("expected Truncated, got {other:?}"),
+        }
+        // Iterator is now exhausted.
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn channel_voice_iter_invalid_status_returns_error() {
+        // 0xF4 is reserved (System Common, not allocated).
+        let body = [0x00, 0x01, 0xF4, 0x00];
+        let mut iter = ChannelVoiceIter::new(&body);
+        match iter.next() {
+            Some(Err(ChannelVoiceParseError::InvalidStatus(0xF4))) => {}
+            other => panic!("expected InvalidStatus(0xF4), got {other:?}"),
         }
     }
 
-    // ── Errors ────────────────────────────────────────────────────────────
+    // ── SysEx parsing ────────────────────────────────────────────────────
 
     #[test]
-    fn rejects_unknown_version() {
+    fn parse_sysex_fragment_round_trips() {
+        let parts = SysExFragmentParts {
+            sysex_id: 0x1234,
+            frag_idx: 2,
+            frag_total: 5,
+            data: &[1, 2, 3, 4, 5],
+        };
+        let mut buf = [0u8; 16];
+        let n = encode_sysex_fragment_body(&mut buf, &parts).unwrap();
+        let parsed = parse_sysex_fragment(&buf[..n]).unwrap();
+        assert_eq!(parsed, parts);
+    }
+
+    #[test]
+    fn parse_sysex_fragment_rejects_zero_total() {
+        let body = [0x00, 0x01, 0x00, 0x00, 0xAA];
+        assert_eq!(
+            parse_sysex_fragment(&body),
+            Err(SysExParseError::InvalidFragTotal)
+        );
+    }
+
+    #[test]
+    fn parse_sysex_fragment_rejects_idx_ge_total() {
+        let body = [0x00, 0x01, 0x05, 0x05, 0xAA]; // idx=5, total=5
+        assert_eq!(
+            parse_sysex_fragment(&body),
+            Err(SysExParseError::InvalidFragIdx { idx: 5, total: 5 })
+        );
+    }
+
+    #[test]
+    fn parse_sysex_fragment_rejects_truncated() {
+        assert_eq!(
+            parse_sysex_fragment(&[0x00, 0x01, 0x00]),
+            Err(SysExParseError::Truncated)
+        );
+    }
+
+    // ── Decode error paths ───────────────────────────────────────────────
+
+    #[test]
+    fn decode_rejects_unknown_version() {
         let mut buf = [0u8; HEADER_LEN];
-        encode(
-            &mut buf,
-            &Header {
-                ver: 0x99,
-                key_fp: KEY_FP_NONE,
-                seq: 0,
-                event_type: event_type::HEARTBEAT,
-            },
-            &Body::Heartbeat,
-        )
-        .unwrap();
+        buf[0] = 0x99;
         match decode(&buf) {
             Err(DecodeError::UnknownVersion(0x99)) => {}
             other => panic!("expected UnknownVersion(0x99), got {other:?}"),
@@ -559,160 +681,180 @@ mod tests {
     }
 
     #[test]
-    fn rejects_truncated() {
-        let buf = [0u8; 5];
-        assert_eq!(decode(&buf), Err(DecodeError::TooShort));
-        let buf = [0u8; HEADER_LEN - 1];
-        assert_eq!(decode(&buf), Err(DecodeError::TooShort));
+    fn decode_rejects_truncated() {
+        assert_eq!(decode(&[0u8; 5]), Err(DecodeError::TooShort));
+        assert_eq!(decode(&[0u8; HEADER_LEN - 1]), Err(DecodeError::TooShort));
     }
 
     #[test]
-    fn rejects_reserved_event_type_zero() {
-        let h = header(0, event_type::HEARTBEAT);
+    fn decode_rejects_reserved_event_type_zero() {
         let mut buf = [0u8; HEADER_LEN];
-        encode(&mut buf, &h, &Body::Heartbeat).unwrap();
-        // Manually corrupt event_type to the reserved 0x00.
-        buf[10] = 0x00;
+        buf[0] = VER_V1;
+        // event_type = 0x00 (reserved)
         assert_eq!(decode(&buf), Err(DecodeError::ReservedEventType));
     }
 
     #[test]
-    fn rejects_invalid_midi_length_zero() {
-        let mut buf = [0u8; 32];
-        let h = header(0, event_type::MIDI_MESSAGE);
+    fn decode_preserves_unknown_event_type() {
+        let hdr = h(0, 0, EventType::Unknown(0x05));
+        let mut buf = [0u8; HEADER_LEN + 1];
+        let n = encode(&mut buf, &hdr, &[0xFF]).unwrap();
+        let (parsed, body) = decode(&buf[..n]).unwrap();
+        assert!(matches!(parsed.event_type, EventType::Unknown(0x05)));
+        assert_eq!(body, &[0xFF]);
+    }
+
+    // ── Encode error paths ───────────────────────────────────────────────
+
+    #[test]
+    fn encode_rejects_oversize_body() {
+        let mut buf = [0u8; HEADER_LEN + MAX_BODY_LEN + 8];
+        let body = [0u8; MAX_BODY_LEN + 1];
+        let hdr = h(0, 0, EventType::ChannelVoice);
         assert_eq!(
-            encode(&mut buf, &h, &Body::MidiMessage(&[])),
-            Err(EncodeError::InvalidMidiLength)
+            encode(&mut buf, &hdr, &body),
+            Err(EncodeError::BodyTooLarge)
         );
     }
 
     #[test]
-    fn accepts_batched_midi_message() {
-        // After the v1 batching relaxation, MidiMessage accepts up to
-        // MAX_MIDI_MESSAGE_LEN bytes — multiple status-delimited MIDI
-        // messages concatenated into a single packet body.
-        let mut buf = [0u8; HEADER_LEN + MAX_MIDI_MESSAGE_LEN];
-        let h = header(0, event_type::MIDI_MESSAGE);
-        // 3-note chord = 9 bytes, well within the new limit.
-        let chord = [0x90, 60, 100, 0x90, 64, 100, 0x90, 67, 100];
-        let n = encode(&mut buf, &h, &Body::MidiMessage(&chord)).unwrap();
-        assert_eq!(n, HEADER_LEN + chord.len());
-        let decoded = decode(&buf[..n]).unwrap();
-        match decoded.body {
-            Body::MidiMessage(b) => assert_eq!(b, &chord),
-            other => panic!("expected MidiMessage, got {other:?}"),
+    fn encode_rejects_buffer_too_small() {
+        let mut buf = [0u8; 5];
+        let hdr = h(0, 0, EventType::Heartbeat);
+        assert_eq!(encode(&mut buf, &hdr, &[]), Err(EncodeError::BufferTooSmall));
+    }
+
+    // ── PacketReplayWindow32 ─────────────────────────────────────────────
+
+    #[test]
+    fn packet_replay_first_packet_accepted() {
+        let mut w = PacketReplayWindow32::new();
+        assert_eq!(w.check_and_advance(100), CheckOutcome::Accept);
+    }
+
+    #[test]
+    fn packet_replay_strict_forward_accepted() {
+        let mut w = PacketReplayWindow32::new();
+        assert_eq!(w.check_and_advance(1), CheckOutcome::Accept);
+        assert_eq!(w.check_and_advance(2), CheckOutcome::Accept);
+        assert_eq!(w.check_and_advance(3), CheckOutcome::Accept);
+    }
+
+    #[test]
+    fn packet_replay_same_seq_twice_rejected() {
+        let mut w = PacketReplayWindow32::new();
+        assert_eq!(w.check_and_advance(5), CheckOutcome::Accept);
+        assert_eq!(w.check_and_advance(5), CheckOutcome::Replay);
+    }
+
+    #[test]
+    fn packet_replay_out_of_order_in_window_accepted_once() {
+        let mut w = PacketReplayWindow32::new();
+        assert_eq!(w.check_and_advance(10), CheckOutcome::Accept);
+        assert_eq!(w.check_and_advance(8), CheckOutcome::Accept);
+        assert_eq!(w.check_and_advance(8), CheckOutcome::Replay);
+    }
+
+    #[test]
+    fn packet_replay_too_old_rejected() {
+        let mut w = PacketReplayWindow32::new();
+        assert_eq!(w.check_and_advance(1000), CheckOutcome::Accept);
+        // 1000 - 935 = 65, just outside 64-deep window.
+        assert_eq!(w.check_and_advance(935), CheckOutcome::TooOld);
+    }
+
+    #[test]
+    fn packet_replay_session_reset_on_huge_backward_jump() {
+        let mut w = PacketReplayWindow32::new();
+        assert_eq!(w.check_and_advance(200_000), CheckOutcome::Accept);
+        // Jump backward by 100_000+ → session reset.
+        assert_eq!(
+            w.check_and_advance(50),
+            CheckOutcome::AcceptSessionReset
+        );
+        // Window reset to new high.
+        assert_eq!(w.check_and_advance(50), CheckOutcome::Replay);
+        assert_eq!(w.check_and_advance(51), CheckOutcome::Accept);
+    }
+
+    // ── EventReplayWindow16 ──────────────────────────────────────────────
+
+    #[test]
+    fn event_replay_first_packet_accepted() {
+        let mut w = EventReplayWindow16::new();
+        assert_eq!(w.check_and_advance(0), CheckOutcome::Accept);
+    }
+
+    #[test]
+    fn event_replay_strict_forward_accepted() {
+        let mut w = EventReplayWindow16::new();
+        for s in 0..10 {
+            assert_eq!(w.check_and_advance(s), CheckOutcome::Accept);
         }
     }
 
     #[test]
-    fn rejects_oversize_midi_message() {
-        let mut buf = [0u8; HEADER_LEN + MAX_MIDI_MESSAGE_LEN + 8];
-        let h = header(0, event_type::MIDI_MESSAGE);
-        let too_long = [0u8; MAX_MIDI_MESSAGE_LEN + 1];
-        assert_eq!(
-            encode(&mut buf, &h, &Body::MidiMessage(&too_long)),
-            Err(EncodeError::InvalidMidiLength)
-        );
+    fn event_replay_same_seq_rejected() {
+        let mut w = EventReplayWindow16::new();
+        assert_eq!(w.check_and_advance(42), CheckOutcome::Accept);
+        assert_eq!(w.check_and_advance(42), CheckOutcome::Replay);
     }
 
     #[test]
-    fn decode_rejects_oversize_midi_message() {
-        let total = HEADER_LEN + MAX_MIDI_MESSAGE_LEN + 1;
-        let mut buf = std::vec::Vec::with_capacity(total);
-        buf.resize(total, 0);
-        buf[0] = VER_V1;
-        buf[10] = event_type::MIDI_MESSAGE;
-        // Body is now (MAX + 1) bytes — should reject.
-        assert_eq!(decode(&buf), Err(DecodeError::InvalidMidiLength));
+    fn event_replay_out_of_order_in_window() {
+        let mut w = EventReplayWindow16::new();
+        assert_eq!(w.check_and_advance(100), CheckOutcome::Accept);
+        assert_eq!(w.check_and_advance(98), CheckOutcome::Accept);
+        assert_eq!(w.check_and_advance(98), CheckOutcome::Replay);
     }
 
     #[test]
-    fn rejects_buffer_too_small() {
-        let mut buf = [0u8; 5];
-        let h = header(0, event_type::MIDI_MESSAGE);
-        assert_eq!(
-            encode(&mut buf, &h, &Body::MidiMessage(&[0x90, 60, 100])),
-            Err(EncodeError::BufferTooSmall)
-        );
+    fn event_replay_too_old_rejected() {
+        let mut w = EventReplayWindow16::new();
+        assert_eq!(w.check_and_advance(1000), CheckOutcome::Accept);
+        // 1000 - 935 = 65, just outside 64-deep window.
+        assert_eq!(w.check_and_advance(935), CheckOutcome::TooOld);
     }
 
     #[test]
-    fn rejects_seq_out_of_range() {
-        let mut buf = [0u8; HEADER_LEN];
-        let h = Header {
-            ver: VER_V1,
-            key_fp: KEY_FP_NONE,
-            seq: 1u64 << 48,
-            event_type: event_type::HEARTBEAT,
-        };
-        assert_eq!(
-            encode(&mut buf, &h, &Body::Heartbeat),
-            Err(EncodeError::SeqOutOfRange)
-        );
+    fn event_replay_wraparound_accepted_as_forward() {
+        let mut w = EventReplayWindow16::new();
+        assert_eq!(w.check_and_advance(65530), CheckOutcome::Accept);
+        assert_eq!(w.check_and_advance(65535), CheckOutcome::Accept);
+        // wrap to 0 — modular distance from 65535 = 1, treated as forward.
+        assert_eq!(w.check_and_advance(0), CheckOutcome::Accept);
+        assert_eq!(w.check_and_advance(5), CheckOutcome::Accept);
     }
 
     #[test]
-    fn rejects_invalid_fragstate() {
-        // Forge a SysEx packet with a bogus fragstate byte.
-        let mut buf = [0u8; 14];
-        buf[0] = VER_V1;
-        buf[10] = event_type::MIDI_SYSEX_FRAGMENT;
-        buf[11] = 0x99; // invalid fragstate
-        buf[12] = 0xF0;
-        buf[13] = 0xF7;
-        assert_eq!(decode(&buf), Err(DecodeError::InvalidFragState(0x99)));
+    fn event_replay_out_of_order_across_wraparound() {
+        let mut w = EventReplayWindow16::new();
+        // Receive seq=5 first.
+        assert_eq!(w.check_and_advance(5), CheckOutcome::Accept);
+        // Then seq=65535 — modular distance forward = 65530 (treated as
+        // backward by 6 in our mapping).
+        assert_eq!(w.check_and_advance(65535), CheckOutcome::Accept);
+        // Then seq=0.
+        assert_eq!(w.check_and_advance(0), CheckOutcome::Accept);
+        // Replays of any of those.
+        assert_eq!(w.check_and_advance(5), CheckOutcome::Replay);
+        assert_eq!(w.check_and_advance(65535), CheckOutcome::Replay);
+        assert_eq!(w.check_and_advance(0), CheckOutcome::Replay);
     }
 
     #[test]
-    fn rejects_empty_sysex_body_on_encode() {
-        let mut buf = [0u8; 32];
-        let h = header(0, event_type::MIDI_SYSEX_FRAGMENT);
-        assert_eq!(
-            encode(
-                &mut buf,
-                &h,
-                &Body::SysExFragment {
-                    state: FragState::Single,
-                    bytes: &[],
-                }
-            ),
-            Err(EncodeError::InvalidSysExFragment)
-        );
-    }
-
-    #[test]
-    fn rejects_empty_sysex_body_on_decode() {
-        // SysEx packet with no fragstate byte at all.
-        let mut buf = [0u8; HEADER_LEN];
-        buf[0] = VER_V1;
-        buf[10] = event_type::MIDI_SYSEX_FRAGMENT;
-        assert_eq!(decode(&buf), Err(DecodeError::InvalidSysExFragment));
-
-        // SysEx packet with fragstate but no body bytes.
-        let mut buf = [0u8; HEADER_LEN + 1];
-        buf[0] = VER_V1;
-        buf[10] = event_type::MIDI_SYSEX_FRAGMENT;
-        buf[11] = 0x01;
-        assert_eq!(decode(&buf), Err(DecodeError::InvalidSysExFragment));
-    }
-
-    // ── Sizes — sanity checks against SPEC.md table ────────────────────────
-
-    #[test]
-    fn spec_size_table_none() {
-        // Per SPEC.md "Sizes and timing" table: a NoteOn in `none` mode is 14 bytes.
-        let h = header(1, event_type::MIDI_MESSAGE);
-        let mut buf = [0u8; 32];
-        let n = encode(&mut buf, &h, &Body::MidiMessage(&[0x90, 60, 100])).unwrap();
-        assert_eq!(n, 14);
-    }
-
-    #[test]
-    fn spec_size_table_heartbeat() {
-        // Heartbeat = HEADER_LEN bytes, no body, no tag.
-        let h = header(1, event_type::HEARTBEAT);
-        let mut buf = [0u8; 32];
-        let n = encode(&mut buf, &h, &Body::Heartbeat).unwrap();
-        assert_eq!(n, HEADER_LEN);
+    fn event_replay_no_session_reset_variant_emitted() {
+        // The 16-bit window never emits AcceptSessionReset — only the
+        // 32-bit packet window does.
+        let mut w = EventReplayWindow16::new();
+        let _ = w.check_and_advance(40_000);
+        // Walk through every backward distance and verify no session-reset.
+        for s in [0, 1, 100, 30_000, 35_000, 39_999] {
+            let r = w.check_and_advance(s);
+            assert!(
+                !matches!(r, CheckOutcome::AcceptSessionReset),
+                "got AcceptSessionReset for seq={s}"
+            );
+        }
     }
 }

@@ -2,39 +2,38 @@
 #![no_std]
 #![allow(async_fn_in_trait)]
 
-//! Milestone 4 link-layer bench, board-agnostic.
+//! Link-layer bench, board-agnostic.
 //!
 //! Exercises the full TX→radio→RX path with `osrf-link`'s `LinkSender`,
-//! `LinkReceiver`, `HeartbeatTimer`, and `WatchdogTimer` against the
-//! hand-rolled `osrf-radio-sx126x` driver.  The MIDI byte source (TX) and
-//! sink (RX) are abstracted behind two traits so the bench can run with
-//! either:
+//! `LinkReceiver`, `MidiTxQueue`, `HeartbeatTimer`, and `WatchdogTimer`
+//! against the hand-rolled `osrf-radio-sx126x` driver.  The MIDI byte
+//! source (TX) and sink (RX) are abstracted behind two traits so the
+//! bench can run with either:
 //!
-//! * the synthetic source/sink in [`synthetic`] (current — proves the link
-//!   layer end-to-end without M3 hardware);
-//! * a future UART-backed source/sink wrapping `BufferedUarte` + `MidiParser`
-//!   for the real-MIDI hand-off (one trait impl swap, no runtime changes
-//!   in [`run_tx`] / [`run_rx`]).
+//! * the synthetic source/sink in [`synthetic`] (proves the link layer
+//!   end-to-end without real-MIDI hardware);
+//! * a future UART-backed source/sink wrapping `BufferedUarte` + a MIDI
+//!   parser (one trait impl swap, no runtime changes here).
 //!
-//! The bench keeps the radio packet format trivial: each MIDI message is
-//! wrapped in a single `Body::MidiMessage` packet with the link-layer
-//! sequence number; heartbeats fill silence so the receiver's watchdog
-//! stays fed.  When TX power is cut, the receiver's watchdog fires, and
-//! [`MidiSink::all_notes_off`] is called — that's the M4 exit-criterion
-//! observable.
+//! Each MIDI message is wrapped in a `CHANNEL_VOICE` body with a fresh
+//! `event_seq`; heartbeats fill silence; SysEx (when supported by the
+//! source) is queued at SysEx priority.  When TX power is cut, the
+//! receiver's watchdog fires, [`MidiSink::all_notes_off`] is called, and
+//! the receiver is marked link-down so the next packet (post-restart)
+//! triggers a session reset.
 
 pub mod synthetic;
 
 use core::task::Poll;
 use embassy_futures::poll_once;
 use embassy_futures::select::{select, Either};
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use embedded_hal::digital::StatefulOutputPin;
 use embedded_hal_async::{digital::Wait, spi::SpiDevice};
 
 use osrf_link::{
-    Body, HeartbeatTimer, LinkReceiver, LinkSender, MidiTxQueue, RxDrop, RxOutcome, WatchdogTimer,
-    REALTIME_PRIORITY,
+    EventType, HeartbeatTimer, LinkReceiver, LinkSender, MidiTxQueue, PoppedPacket, QueueKind,
+    RxDrop, RxEvent, WatchdogTimer, MAX_BODY_LEN,
 };
 use osrf_radio_sx126x::{
     GfskBandwidth, GfskPulseShape, RadioError, RfSwitchControl, Sx1262Radio,
@@ -50,58 +49,29 @@ const RF_PREAMBLE_BITS: u16 = 16;
 const RF_PAYLOAD_MAX: u8 = 64;
 const RF_SYNC_WORD: [u8; 4] = [0xC1, 0x94, 0xC1, 0x94];
 
-// ── Link-layer config (M4 spec) ──────────────────────────────────────────────
+// ── Link-layer config ───────────────────────────────────────────────────────
 
 /// Receiver watchdog: 200 ms of silence → assume link lost.
 pub const WATCHDOG_MS: u64 = 200;
 /// Transmitter heartbeat: 10 ms idle → emit a Heartbeat packet.  20× margin
-/// against the receiver's 200 ms watchdog (i.e., the link survives losing
-/// up to 19 consecutive packets before the watchdog fires).
+/// against the receiver's 200 ms watchdog.
 pub const HEARTBEAT_MS: u64 = 10;
-/// Each MIDI batch's wire packet is transmitted this many times.  We
-/// encode the batch ONCE (one `seq`) and resend the exact same wire bytes
-/// `MIDI_REPEAT_COUNT` times, so the receiver's replay window naturally
-/// dedups the copies — the sink fires each logical event exactly once.
-/// At 0.2 % per-packet loss, three copies drop the per-batch miss rate
-/// to (0.002)³ ≈ 8 × 10⁻⁹.  Heartbeats and system-real-time messages stay
-/// single-send (the next heartbeat is ≤ 10 ms away; real-time events are
-/// already frequent and miss-tolerant).
-pub const MIDI_REPEAT_COUNT: u8 = 3;
 
 // ── Source / Sink traits ─────────────────────────────────────────────────────
 
-/// A producer of MIDI byte-sequence messages, one at a time.  The bench TX
-/// loop awaits this and wraps each result in a `Body::MidiMessage` packet.
-///
-/// `next_message` writes the bytes into the caller-supplied scratch buffer
-/// (avoiding `&'a [u8]` self-borrow lifetimes that would force a more
-/// awkward async-fn-in-trait shape) and returns the populated length.
-///
-/// Implementations:
-/// * [`synthetic::ChordHoldSource`] — pre-baked NoteOn chord then idle.
-/// * Future: a `BufferedUarte` + `MidiParser` adapter that emits one
-///   message per parser-recognized event.
 pub trait MidiSource {
     type Error;
-
     /// Wait for the next MIDI message and write its bytes into `buf`.
     /// Returns the number of bytes written.  May resolve only after an
-    /// arbitrarily long delay (e.g., when no MIDI input is available).
+    /// arbitrarily long delay.
     async fn next_message(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error>;
 }
 
-/// A consumer of MIDI byte-sequence messages.  The bench RX loop calls
-/// [`Self::write_message`] for every accepted MIDI body, and
-/// [`Self::all_notes_off`] when the watchdog fires (link lost).
 pub trait MidiSink {
     type Error;
-
-    /// Write a single MIDI message (1..=N bytes).
     async fn write_message(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
-
-    /// Emit "all notes off" on every channel.  Real-MIDI sinks generate
-    /// 16 × `[0xB0+ch, 0x7B, 0x00]`.  The defmt-backed synthetic sink
-    /// just logs the event.  Called by [`run_rx`] on watchdog expiry.
+    /// Emit "all notes off" on every channel.  Called by [`run_rx`] on
+    /// watchdog expiry.
     async fn all_notes_off(&mut self) -> Result<(), Self::Error>;
 }
 
@@ -137,17 +107,10 @@ where
 
 // ── TX loop ─────────────────────────────────────────────────────────────────
 
-/// Run the TX side of the bench: consume MIDI messages from `source`, wrap
-/// each in a `Body::MidiMessage`, transmit via `radio`.  When `source`
-/// goes idle for [`HEARTBEAT_MS`] ms, send a `Body::Heartbeat` instead so
-/// the receiver's watchdog stays fed.
-///
-/// `boot_counter` should be persisted across resets in production so that
-/// the receiver's replay window treats each reset as a fresh forward jump
-/// in `seq`.  For the bench, callers can hard-code a fresh value per power
-/// cycle — the only consequence of reusing a counter is that previously-
-/// transmitted seqs would replay-reject on the receiver, which only
-/// matters across same-session-reboot scenarios.
+/// Run the TX side: consume MIDI messages from `source`, queue them with
+/// status-aware dedup + per-event seq, transmit packets via the credit-
+/// based round-robin queue.  When the queue is empty for `HEARTBEAT_MS`
+/// ms, send a `Heartbeat` instead so the receiver's watchdog stays fed.
 pub async fn run_tx<Spi, Busy, Dio1, Reset, Switch, Led, Source>(
     radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
     led: &mut Led,
@@ -180,28 +143,24 @@ where
     let mut sender = LinkSender::no_crypto(boot_counter);
     let mut hb = HeartbeatTimer::new(Duration::from_millis(HEARTBEAT_MS));
     let mut queue = MidiTxQueue::new();
-    let mut midi_buf = [0u8; RF_PAYLOAD_MAX as usize];
+    let mut midi_buf = [0u8; 4];
+    let mut body_buf = [0u8; MAX_BODY_LEN];
     let mut wire_buf = [0u8; RF_PAYLOAD_MAX as usize];
-    // Body::MidiMessage payload buffer.  Sized to (RF_PAYLOAD_MAX − HEADER_LEN)
-    // so we can pack the largest possible same-priority batch into a single
-    // wire packet.  At 3 bytes per channel-voice message, 53 bytes ≈ 17
-    // events per packet.
-    let mut batch_buf = [0u8; (RF_PAYLOAD_MAX as usize) - osrf_link::HEADER_LEN];
-    let mut hb_count: u32 = 0;
     let mut tx_count: u32 = 0;
+    let mut hb_count: u32 = 0;
     let mut overflow_count: u32 = 0;
 
     loop {
         // 1. Drain any source events into the queue (non-blocking).  Each
-        //    push applies MIDI status-aware dedup; new state cancels stale
-        //    queued state for the same target (NoteOn↔NoteOff, CC, PB, etc.).
+        //    push applies MIDI status-aware dedup and assigns a fresh
+        //    event_seq.
         loop {
             match poll_once(source.next_message(&mut midi_buf)) {
                 Poll::Ready(Ok(n)) => {
-                    if !queue.push(&midi_buf[..n]) {
+                    if !queue.push_channel_voice(&midi_buf[..n]) {
                         overflow_count = overflow_count.wrapping_add(1);
                         defmt::error!(
-                            "link_bench TX: queue overflow! dropping message (overflows={})",
+                            "link_bench TX: queue overflow! dropping (overflows={})",
                             overflow_count
                         );
                     }
@@ -212,58 +171,20 @@ where
             }
         }
 
-        // 2. If the queue has anything to send, batch-pop the front of
-        //    the queue (all entries at the same priority) into one wire
-        //    packet.  Encode ONCE — the resulting packet has a single
-        //    `seq` — and resend the same wire bytes K times.  The
-        //    receiver's replay window dedups the copies, so the sink
-        //    fires each batch exactly once even when all K copies arrive.
-        //
-        //    Real-time batches (priority MAX) ship single-shot: they're
-        //    frequent and miss-tolerant.  Between copies we drain the
-        //    source — if a higher-priority event lands or another
-        //    same-priority batch is ready, we bail early.  Trade-off: a
-        //    miss rate spike from ~8×10⁻⁹ → ~0.2 % for the original
-        //    batch, in exchange for ~3 ms lower latency on the new event.
-        if let Some((batch_n, priority)) = queue.pop_send_batch(&mut batch_buf) {
-            let body = Body::MidiMessage(&batch_buf[..batch_n]);
-            match sender.encode(&body, &mut wire_buf) {
+        // 2. If the queue has anything, pop one packet's worth and TX.
+        //    The credit-based queue handles batching, priority, and
+        //    round-robin retransmits.  Each pop yields a fresh packet
+        //    with a new packet_seq; consumed events are requeued at the
+        //    back of their priority class until their credits exhaust.
+        if let Some(PoppedPacket { kind, body_len }) = queue.pop_packet(&mut body_buf) {
+            let event_type = match kind {
+                QueueKind::ChannelVoice => EventType::ChannelVoice,
+                QueueKind::SysExFragment => EventType::SysExFragment,
+            };
+            match sender.encode(event_type, &body_buf[..body_len], &mut wire_buf) {
                 Ok(wire_n) => {
-                    let copies = if priority == REALTIME_PRIORITY {
-                        1
-                    } else {
-                        MIDI_REPEAT_COUNT
-                    };
-                    for copy_idx in 0..copies {
-                        if let Err(_) = radio.tx(&wire_buf[..wire_n]).await {
-                            defmt::error!("link_bench TX: radio.tx() failed");
-                        }
-                        // Between copies: opportunistically drain the
-                        // source so a chord-followed-by-bend doesn't have
-                        // to wait for all 3 chord retransmits.  If
-                        // anything is now waiting, bail and let the next
-                        // loop iteration handle it.
-                        if copy_idx + 1 < copies {
-                            loop {
-                                match poll_once(source.next_message(&mut midi_buf)) {
-                                    Poll::Ready(Ok(n)) => {
-                                        if !queue.push(&midi_buf[..n]) {
-                                            overflow_count = overflow_count.wrapping_add(1);
-                                            defmt::error!(
-                                                "link_bench TX: queue overflow! (overflows={})",
-                                                overflow_count
-                                            );
-                                        }
-                                        tx_count = tx_count.wrapping_add(1);
-                                    }
-                                    Poll::Ready(Err(_)) => break,
-                                    Poll::Pending => break,
-                                }
-                            }
-                            if !queue.is_empty() {
-                                break;
-                            }
-                        }
+                    if let Err(_) = radio.tx(&wire_buf[..wire_n]).await {
+                        defmt::error!("link_bench TX: radio.tx() failed");
                     }
                 }
                 Err(_) => defmt::error!("link_bench TX: encode failed"),
@@ -274,15 +195,13 @@ where
         }
 
         // 3. Queue empty — wait for either a new source event or the
-        //    heartbeat deadline.  MIDI priority: `select` polls source
-        //    first, and a heartbeat-win is followed by a non-blocking
-        //    re-poll of the source to catch micro-races.
-        let body = match select(source.next_message(&mut midi_buf), hb.wait()).await {
+        //    heartbeat deadline.
+        match select(source.next_message(&mut midi_buf), hb.wait()).await {
             Either::First(Ok(n)) => {
-                if !queue.push(&midi_buf[..n]) {
+                if !queue.push_channel_voice(&midi_buf[..n]) {
                     overflow_count = overflow_count.wrapping_add(1);
                     defmt::error!(
-                        "link_bench TX: queue overflow! dropping message (overflows={})",
+                        "link_bench TX: queue overflow! dropping (overflows={})",
                         overflow_count
                     );
                 }
@@ -291,31 +210,21 @@ where
             }
             Either::First(Err(_)) => {
                 defmt::warn!("link_bench TX: source error; sending heartbeat");
-                Body::Heartbeat
             }
             Either::Second(()) => {
-                match poll_once(source.next_message(&mut midi_buf)) {
-                    Poll::Ready(Ok(n)) => {
-                        if !queue.push(&midi_buf[..n]) {
-                            overflow_count = overflow_count.wrapping_add(1);
-                            defmt::error!(
-                                "link_bench TX: queue overflow! dropping message (overflows={})",
-                                overflow_count
-                            );
-                        }
-                        tx_count = tx_count.wrapping_add(1);
-                        continue;
+                // After heartbeat win, micro-poll source to catch races.
+                if let Poll::Ready(Ok(n)) = poll_once(source.next_message(&mut midi_buf)) {
+                    if !queue.push_channel_voice(&midi_buf[..n]) {
+                        overflow_count = overflow_count.wrapping_add(1);
                     }
-                    _ => {
-                        hb_count = hb_count.wrapping_add(1);
-                        Body::Heartbeat
-                    }
+                    tx_count = tx_count.wrapping_add(1);
+                    continue;
                 }
             }
-        };
+        }
 
-        // Send heartbeat (single copy — the next one is ≤ HEARTBEAT_MS away).
-        match sender.encode(&body, &mut wire_buf) {
+        // Send heartbeat (single copy — next one is ≤ HEARTBEAT_MS away).
+        match sender.encode(EventType::Heartbeat, &[], &mut wire_buf) {
             Ok(wire_n) => {
                 if let Err(_) = radio.tx(&wire_buf[..wire_n]).await {
                     defmt::error!("link_bench TX: radio.tx() failed");
@@ -325,6 +234,7 @@ where
         }
         hb.note_send();
         let _ = led.toggle();
+        hb_count = hb_count.wrapping_add(1);
 
         if (tx_count.wrapping_add(hb_count)) % 500 == 0 {
             defmt::info!(
@@ -340,11 +250,18 @@ where
 
 // ── RX loop ─────────────────────────────────────────────────────────────────
 
-/// Run the RX side: receive packets, dedup via `LinkReceiver`, hand
-/// `Body::MidiMessage` payloads to `sink.write_message`, ignore
-/// `Body::Heartbeat` (just keep the watchdog fed), and on watchdog expiry
-/// (no packet for [`WATCHDOG_MS`] ms) call `sink.all_notes_off` — the M4
-/// exit-criterion observable.
+/// One observable RX event ready to be delivered to the sink.  We buffer
+/// these inside `process()`'s callback and drain them after the call so
+/// the async sink can be awaited without holding the receiver borrow.
+enum BufferedEvent {
+    Midi(heapless::Vec<u8, 8>),
+    SysEx(heapless::Vec<u8, { osrf_link::MAX_SYSEX_BYTES }>),
+}
+
+/// Run the RX side: receive packets, dedup at packet + event level,
+/// reassemble SysEx, hand each surviving event to the sink.  On
+/// watchdog expiry call `sink.all_notes_off` and mark the receiver as
+/// link-down so the next packet triggers a session reset.
 pub async fn run_rx<Spi, Busy, Dio1, Reset, Switch, Led, Sink>(
     radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
     led: &mut Led,
@@ -384,25 +301,20 @@ where
     let mut accepted: u32 = 0;
     let mut accepted_heartbeats: u32 = 0;
     let mut accepted_midi: u32 = 0;
+    let mut accepted_sysex: u32 = 0;
     let mut dropped: u32 = 0;
-    // Count of CRC-mismatch packets — these are usually false-positive
-    // sync detections from noise (the chip's sync-word match fires on
-    // random bits, then the body's CRC fails).  Common on a noisy band;
-    // not actionable per-packet, so we log a summary every 50 instead.
     let mut crc_mismatch: u32 = 0;
-    let mut last_stats_log = embassy_time::Instant::now();
+    let mut last_stats_log = Instant::now();
     let stats_interval = Duration::from_secs(5);
-    // Snapshot of cumulative counters at last stats log, so we can print
-    // per-window deltas alongside totals.
     let mut prev_midi: u32 = 0;
     let mut prev_hb: u32 = 0;
     let mut prev_dropped: u32 = 0;
     let mut prev_crc: u32 = 0;
-    // Track whether we believe the link is currently up so we only emit
-    // ALL_NOTES_OFF on the *transition* from "fed" to "expired".
     let mut link_up = false;
+    let mut events: heapless::Vec<BufferedEvent, 32> = heapless::Vec::new();
 
     loop {
+        events.clear();
         match select(radio.rx_recv(&mut radio_buf), wd.wait()).await {
             Either::First(Ok(pkt)) if pkt.crc_ok => {
                 wd.kick();
@@ -413,43 +325,35 @@ where
                 }
 
                 let n = pkt.len.min(radio_buf.len());
-                match receiver.process(&radio_buf[..n]) {
-                    Ok(RxOutcome::Accept(p)) => {
-                        accepted = accepted.wrapping_add(1);
-                        let _ = led.toggle();
-                        match p.body {
-                            Body::MidiMessage(bytes) => {
-                                accepted_midi = accepted_midi.wrapping_add(1);
-                                defmt::info!(
-                                    "RX #{} MIDI: rssi={}dBm bytes={=[u8]:#x}",
-                                    accepted,
-                                    pkt.rssi_dbm,
-                                    bytes
-                                );
-                                if let Err(_) = sink.write_message(bytes).await {
-                                    defmt::error!("sink write_message failed");
-                                }
-                            }
-                            Body::Heartbeat => {
-                                accepted_heartbeats = accepted_heartbeats.wrapping_add(1);
-                                // Watchdog already kicked above; no-op.
-                            }
-                            Body::SysExFragment { .. } => {
-                                defmt::warn!("RX: SysExFragment not handled in M4 bench");
-                            }
-                            Body::Unknown { event_type, .. } => {
-                                defmt::warn!("RX: Unknown event_type=0x{:02x}", event_type);
-                            }
+                let now = Instant::now();
+                let result = receiver.process(&radio_buf[..n], now, |ev| {
+                    match ev {
+                        RxEvent::Heartbeat => {
+                            accepted_heartbeats = accepted_heartbeats.wrapping_add(1);
+                        }
+                        RxEvent::ChannelVoice(midi) => {
+                            accepted_midi = accepted_midi.wrapping_add(1);
+                            let mut v: heapless::Vec<u8, 8> = heapless::Vec::new();
+                            let _ = v.extend_from_slice(midi);
+                            let _ = events.push(BufferedEvent::Midi(v));
+                        }
+                        RxEvent::SysExComplete(body) => {
+                            accepted_sysex = accepted_sysex.wrapping_add(1);
+                            let mut v: heapless::Vec<u8, { osrf_link::MAX_SYSEX_BYTES }> =
+                                heapless::Vec::new();
+                            let _ = v.extend_from_slice(body);
+                            let _ = events.push(BufferedEvent::SysEx(v));
                         }
                     }
-                    Ok(RxOutcome::Drop(reason)) => {
+                });
+                match result {
+                    Ok(Ok(())) => {
+                        accepted = accepted.wrapping_add(1);
+                        let _ = led.toggle();
+                    }
+                    Ok(Err(reason)) => {
                         dropped = dropped.wrapping_add(1);
-                        // With MIDI triple-send, every MIDI event produces
-                        // 2 expected same-seq replay drops.  Don't log per-
-                        // drop — count is visible in the periodic stats.
-                        // Only log non-Replay reasons (key mismatch is a
-                        // real anomaly worth seeing).
-                        if !matches!(reason, RxDrop::Replay(_)) {
+                        if !matches!(reason, RxDrop::PacketReplay(_)) {
                             defmt::warn!(
                                 "RX dropped: {:?} (accepted={} dropped={})",
                                 reason,
@@ -463,12 +367,26 @@ where
                         defmt::warn!("RX decode error (accepted={} dropped={})", accepted, dropped);
                     }
                 }
+
+                // Drain buffered events to the sink.
+                for ev in events.iter() {
+                    match ev {
+                        BufferedEvent::Midi(bytes) => {
+                            defmt::info!("RX MIDI: {=[u8]:#x}", bytes.as_slice());
+                            if let Err(_) = sink.write_message(bytes).await {
+                                defmt::error!("sink write_message failed");
+                            }
+                        }
+                        BufferedEvent::SysEx(bytes) => {
+                            defmt::info!("RX SysEx: {} bytes", bytes.len());
+                            if let Err(_) = sink.write_message(bytes).await {
+                                defmt::error!("sink SysEx write failed");
+                            }
+                        }
+                    }
+                }
             }
             Either::First(Ok(_)) => {
-                // Likely a false-positive sync detection on noise — the
-                // chip latched on random bits matching our sync word, then
-                // the framed body's CRC didn't match.  Common, harmless,
-                // throttle the log to every 50 events.
                 crc_mismatch = crc_mismatch.wrapping_add(1);
                 if crc_mismatch % 50 == 0 {
                     defmt::warn!("RX: CRC mismatch count = {}", crc_mismatch);
@@ -478,8 +396,6 @@ where
                 defmt::warn!("RX: radio error");
             }
             Either::Second(()) => {
-                // Watchdog fired.  Only emit ALL_NOTES_OFF on the link-down
-                // transition; subsequent watchdog firings stay quiet.
                 if link_up {
                     link_up = false;
                     defmt::warn!(
@@ -489,30 +405,23 @@ where
                     if let Err(_) = sink.all_notes_off().await {
                         defmt::error!("sink all_notes_off failed");
                     }
+                    receiver.mark_link_down();
                     let _ = led.toggle();
                 }
-                // Reset deadline so we don't busy-spin on repeated firings.
                 wd.kick();
             }
         }
 
-        // Periodic packet-success stats — useful for diagnosing whether
-        // the link is dropping due to interference (low success rate)
-        // vs. some firmware bug (success rate fine but link still drops).
-        // Shows per-window deltas (last 5 s) AND cumulative-since-boot.
-        let now = embassy_time::Instant::now();
+        // Periodic stats — useful for diagnosing whether link is dropping
+        // due to interference (low success rate) vs. a firmware bug.
+        let now = Instant::now();
         if now.duration_since(last_stats_log) >= stats_interval {
             let d_midi = accepted_midi.wrapping_sub(prev_midi);
             let d_hb = accepted_heartbeats.wrapping_sub(prev_hb);
             let d_dropped = dropped.wrapping_sub(prev_dropped);
             let d_crc = crc_mismatch.wrapping_sub(prev_crc);
-            // Compute expected from ACTUAL elapsed window (the check above
-            // uses `>=`, so the real elapsed is usually ≥ stats_interval by
-            // a few ms of scheduling jitter).  Otherwise we'd see 501/500
-            // ≠ 0 % loss when the window happens to span 5.01 s.
             let elapsed_ms = now.duration_since(last_stats_log).as_millis() as u32;
             let expected_hb: u32 = elapsed_ms / (HEARTBEAT_MS as u32);
-            // Loss percentage * 10 (so we can print one decimal without floats).
             let loss_x10 = if expected_hb > 0 {
                 let received = d_midi + d_hb;
                 let lost = expected_hb.saturating_sub(received);
@@ -521,7 +430,7 @@ where
                 0
             };
             defmt::info!(
-                "RX last5s: midi={} hb={}/{} loss={}.{}% drop={} crc_err={} | total: midi={} hb={} drop={} crc_err={}",
+                "RX last5s: midi={} hb={}/{} loss={}.{}% drop={} crc_err={} | total: midi={} hb={} sysex={} drop={} crc_err={}",
                 d_midi,
                 d_hb,
                 expected_hb,
@@ -531,6 +440,7 @@ where
                 d_crc,
                 accepted_midi,
                 accepted_heartbeats,
+                accepted_sysex,
                 dropped,
                 crc_mismatch,
             );

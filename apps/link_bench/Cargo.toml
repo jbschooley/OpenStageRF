@@ -12,6 +12,7 @@ embedded-hal       = { workspace = true }
 embedded-hal-async = { workspace = true }
 embassy-time       = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
 embassy-futures    = "0.1"
+heapless           = { workspace = true }
 defmt              = { workspace = true }
 
 [lib]
