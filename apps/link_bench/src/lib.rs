@@ -34,6 +34,7 @@ use embedded_hal_async::{digital::Wait, spi::SpiDevice};
 
 use osrf_link::{
     Body, HeartbeatTimer, LinkReceiver, LinkSender, MidiTxQueue, RxDrop, RxOutcome, WatchdogTimer,
+    REALTIME_PRIORITY,
 };
 use osrf_radio_sx126x::{
     GfskBandwidth, GfskPulseShape, RadioError, RfSwitchControl, Sx1262Radio,
@@ -57,13 +58,14 @@ pub const WATCHDOG_MS: u64 = 200;
 /// against the receiver's 200 ms watchdog (i.e., the link survives losing
 /// up to 19 consecutive packets before the watchdog fires).
 pub const HEARTBEAT_MS: u64 = 10;
-/// Each MIDI message is transmitted this many times — but **round-robin**
-/// via [`MidiTxQueue`] (chord notes interleave: `C E G C E G C E G`), so
-/// the first round delivers the chord with minimal spread (~one
-/// message-time gap between notes) and the next two rounds insure
-/// against per-packet RF loss.  At 0.2 % per-packet loss, three rounds
-/// drop the per-event miss rate to (0.002)³ ≈ 8 × 10⁻⁹.  Heartbeats stay
-/// single-send (next one is ≤ 10 ms away).
+/// Each MIDI batch's wire packet is transmitted this many times.  We
+/// encode the batch ONCE (one `seq`) and resend the exact same wire bytes
+/// `MIDI_REPEAT_COUNT` times, so the receiver's replay window naturally
+/// dedups the copies — the sink fires each logical event exactly once.
+/// At 0.2 % per-packet loss, three copies drop the per-batch miss rate
+/// to (0.002)³ ≈ 8 × 10⁻⁹.  Heartbeats and system-real-time messages stay
+/// single-send (the next heartbeat is ≤ 10 ms away; real-time events are
+/// already frequent and miss-tolerant).
 pub const MIDI_REPEAT_COUNT: u8 = 3;
 
 // ── Source / Sink traits ─────────────────────────────────────────────────────
@@ -177,12 +179,17 @@ where
 
     let mut sender = LinkSender::no_crypto(boot_counter);
     let mut hb = HeartbeatTimer::new(Duration::from_millis(HEARTBEAT_MS));
-    let mut queue = MidiTxQueue::with_repeat_count(MIDI_REPEAT_COUNT);
+    let mut queue = MidiTxQueue::new();
     let mut midi_buf = [0u8; RF_PAYLOAD_MAX as usize];
     let mut wire_buf = [0u8; RF_PAYLOAD_MAX as usize];
-    let mut msg_buf = [0u8; 4]; // single MIDI message
+    // Body::MidiMessage payload buffer.  Sized to (RF_PAYLOAD_MAX − HEADER_LEN)
+    // so we can pack the largest possible same-priority batch into a single
+    // wire packet.  At 3 bytes per channel-voice message, 53 bytes ≈ 17
+    // events per packet.
+    let mut batch_buf = [0u8; (RF_PAYLOAD_MAX as usize) - osrf_link::HEADER_LEN];
     let mut hb_count: u32 = 0;
     let mut tx_count: u32 = 0;
+    let mut overflow_count: u32 = 0;
 
     loop {
         // 1. Drain any source events into the queue (non-blocking).  Each
@@ -191,7 +198,13 @@ where
         loop {
             match poll_once(source.next_message(&mut midi_buf)) {
                 Poll::Ready(Ok(n)) => {
-                    queue.push(&midi_buf[..n]);
+                    if !queue.push(&midi_buf[..n]) {
+                        overflow_count = overflow_count.wrapping_add(1);
+                        defmt::error!(
+                            "link_bench TX: queue overflow! dropping message (overflows={})",
+                            overflow_count
+                        );
+                    }
                     tx_count = tx_count.wrapping_add(1);
                 }
                 Poll::Ready(Err(_)) => break,
@@ -199,16 +212,58 @@ where
             }
         }
 
-        // 2. If the queue has anything to send, take the next message and
-        //    transmit it.  Round-robin: a chord's notes interleave across
-        //    triple-send rounds (C E G C E G C E G), so the first round
-        //    delivers the chord with minimal spread.
-        if let Some(n) = queue.pop_send(&mut msg_buf) {
-            let body = Body::MidiMessage(&msg_buf[..n]);
+        // 2. If the queue has anything to send, batch-pop the front of
+        //    the queue (all entries at the same priority) into one wire
+        //    packet.  Encode ONCE — the resulting packet has a single
+        //    `seq` — and resend the same wire bytes K times.  The
+        //    receiver's replay window dedups the copies, so the sink
+        //    fires each batch exactly once even when all K copies arrive.
+        //
+        //    Real-time batches (priority MAX) ship single-shot: they're
+        //    frequent and miss-tolerant.  Between copies we drain the
+        //    source — if a higher-priority event lands or another
+        //    same-priority batch is ready, we bail early.  Trade-off: a
+        //    miss rate spike from ~8×10⁻⁹ → ~0.2 % for the original
+        //    batch, in exchange for ~3 ms lower latency on the new event.
+        if let Some((batch_n, priority)) = queue.pop_send_batch(&mut batch_buf) {
+            let body = Body::MidiMessage(&batch_buf[..batch_n]);
             match sender.encode(&body, &mut wire_buf) {
                 Ok(wire_n) => {
-                    if let Err(_) = radio.tx(&wire_buf[..wire_n]).await {
-                        defmt::error!("link_bench TX: radio.tx() failed");
+                    let copies = if priority == REALTIME_PRIORITY {
+                        1
+                    } else {
+                        MIDI_REPEAT_COUNT
+                    };
+                    for copy_idx in 0..copies {
+                        if let Err(_) = radio.tx(&wire_buf[..wire_n]).await {
+                            defmt::error!("link_bench TX: radio.tx() failed");
+                        }
+                        // Between copies: opportunistically drain the
+                        // source so a chord-followed-by-bend doesn't have
+                        // to wait for all 3 chord retransmits.  If
+                        // anything is now waiting, bail and let the next
+                        // loop iteration handle it.
+                        if copy_idx + 1 < copies {
+                            loop {
+                                match poll_once(source.next_message(&mut midi_buf)) {
+                                    Poll::Ready(Ok(n)) => {
+                                        if !queue.push(&midi_buf[..n]) {
+                                            overflow_count = overflow_count.wrapping_add(1);
+                                            defmt::error!(
+                                                "link_bench TX: queue overflow! (overflows={})",
+                                                overflow_count
+                                            );
+                                        }
+                                        tx_count = tx_count.wrapping_add(1);
+                                    }
+                                    Poll::Ready(Err(_)) => break,
+                                    Poll::Pending => break,
+                                }
+                            }
+                            if !queue.is_empty() {
+                                break;
+                            }
+                        }
                     }
                 }
                 Err(_) => defmt::error!("link_bench TX: encode failed"),
@@ -224,9 +279,15 @@ where
         //    re-poll of the source to catch micro-races.
         let body = match select(source.next_message(&mut midi_buf), hb.wait()).await {
             Either::First(Ok(n)) => {
-                queue.push(&midi_buf[..n]);
+                if !queue.push(&midi_buf[..n]) {
+                    overflow_count = overflow_count.wrapping_add(1);
+                    defmt::error!(
+                        "link_bench TX: queue overflow! dropping message (overflows={})",
+                        overflow_count
+                    );
+                }
                 tx_count = tx_count.wrapping_add(1);
-                continue; // go back to step 1, drain + send
+                continue;
             }
             Either::First(Err(_)) => {
                 defmt::warn!("link_bench TX: source error; sending heartbeat");
@@ -235,7 +296,13 @@ where
             Either::Second(()) => {
                 match poll_once(source.next_message(&mut midi_buf)) {
                     Poll::Ready(Ok(n)) => {
-                        queue.push(&midi_buf[..n]);
+                        if !queue.push(&midi_buf[..n]) {
+                            overflow_count = overflow_count.wrapping_add(1);
+                            defmt::error!(
+                                "link_bench TX: queue overflow! dropping message (overflows={})",
+                                overflow_count
+                            );
+                        }
                         tx_count = tx_count.wrapping_add(1);
                         continue;
                     }
@@ -261,10 +328,11 @@ where
 
         if (tx_count.wrapping_add(hb_count)) % 500 == 0 {
             defmt::info!(
-                "link_bench TX: midi_events={} heartbeats={} (queue_depth={})",
+                "link_bench TX: midi_events={} heartbeats={} queue_depth={} overflows={}",
                 tx_count,
                 hb_count,
-                queue.len()
+                queue.len(),
+                overflow_count
             );
         }
     }

@@ -17,7 +17,7 @@ pub use proto::{
 };
 
 pub mod midi_tx;
-pub use midi_tx::{MidiTxQueue, DEFAULT_REPEAT_COUNT, QUEUE_CAPACITY};
+pub use midi_tx::{MidiTxQueue, QUEUE_CAPACITY, REALTIME_PRIORITY, REGULAR_PRIORITY};
 
 // ---------------------------------------------------------------------------
 // ReplayWindow — 64-entry sliding-window bitmap

@@ -66,7 +66,7 @@ Discriminates the body content. The value is **part of the AAD** — it is authe
 |---|---|---|
 | `0x00` | RESERVED | Do not transmit. Receivers MUST drop. |
 | `0x01` | `HEARTBEAT` | Keepalive. `event_data` is empty (0 bytes). |
-| `0x02` | `MIDI_MESSAGE` | Single MIDI message. `event_data` = 1 to 3 raw MIDI bytes (status + 0–2 data). |
+| `0x02` | `MIDI_MESSAGE` | One or more concatenated MIDI messages. `event_data` = 1..=64 raw MIDI bytes (status + data, status-byte-delimited). |
 | `0x03` | `MIDI_SYSEX_FRAGMENT` | Fragment of a SysEx message. `event_data` = `[frag_state:1] + sysex_bytes`. |
 | `0x04`–`0x0F` | reserved for future MIDI extensions | |
 | `0x10`–`0x1F` | reserved for AUDIO_FRAME body types (defined when v3 audio ships) | |
@@ -75,15 +75,19 @@ Discriminates the body content. The value is **part of the AAD** — it is authe
 
 #### Body: `MIDI_MESSAGE` (event_type 0x02)
 
-`event_data` = 1 to 3 bytes of raw MIDI:
+`event_data` = 1 to `MAX_MIDI_MESSAGE_LEN` (64) bytes of raw MIDI, holding **one or more** concatenated MIDI messages with no inter-message framing — the receiver delimits messages by the standard MIDI status-byte rule (status bytes have the high bit set; data bytes don't).
+
+Per-message lengths:
 
 - 1 byte: System Real-Time messages (`0xF8`–`0xFF`) — Timing Clock, Start, Continue, Stop, Active Sensing, System Reset
 - 2 bytes: Program Change (`0xCn`), Channel Pressure (`0xDn`), Song Select (`0xF3`), MIDI Time Code Quarter Frame (`0xF1`)
 - 3 bytes: Note On (`0x9n`), Note Off (`0x8n`), Polyphonic Pressure (`0xAn`), Control Change (`0xBn`), Pitch Bend (`0xEn`), Song Position (`0xF2`)
 
-**Running status is not used on the wire.** Each packet carries the full status byte. The TX-side parser may have used running status to consume bytes from a DIN MIDI stream, but the protocol always sends explicit status. Senders MUST NOT compress consecutive same-status messages by omitting the status byte.
+**Running status is not used on the wire.** Each message in the packet carries its full status byte. Senders MUST NOT compress consecutive same-status messages by omitting the status byte.
 
-`MIDI_MESSAGE` packets MUST contain exactly one MIDI message. Bundling multiple messages into one packet is not supported in v1.
+**Batching policy** (sender-side): messages may be batched into one `MIDI_MESSAGE` packet to amortise the 11-byte header across multiple events. Implementations are free to choose how aggressive to be — a sender that has multiple events ready at the same priority/urgency MAY pack them into one packet; otherwise it sends single-message packets for minimum latency. Batching together messages that have unrelated timing requirements (e.g. mixing System Real-Time tempo events with channel-voice events) is a quality-of-implementation concern and SHOULD be avoided.
+
+SysEx body fragments still use `MIDI_SYSEX_FRAGMENT` (`0x03`) and are not eligible for inclusion in `MIDI_MESSAGE` batches.
 
 #### Body: `MIDI_SYSEX_FRAGMENT` (event_type 0x03)
 
