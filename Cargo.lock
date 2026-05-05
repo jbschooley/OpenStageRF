@@ -1063,7 +1063,6 @@ name = "osrf-app-radio-bench"
 version = "0.1.0"
 dependencies = [
  "defmt 1.0.1",
- "embassy-futures",
  "embassy-time",
  "embedded-hal 1.0.0",
  "embedded-hal-async",

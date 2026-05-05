@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #![no_std]
+// Trait methods are async on purpose (board-specific switch impls do GPIO
+// toggles which await embassy-nrf futures); we don't expose this driver to
+// `Send`-required runtimes so the auto-trait warning is just noise.
+#![allow(async_fn_in_trait)]
 
 //! Hand-rolled SX1262 driver — raw SPI commands per Semtech datasheet
 //! DS_SX1261-2_V2.1, Table 12-1.  Replaces the previous `sx1262 = "0.3"`
@@ -194,7 +198,8 @@ pub enum GfskBandwidth {
 }
 
 impl GfskBandwidth {
-    /// Old name kept to avoid touching every call site.
+    /// Short alias for `Bw467000`.  The radio_bench config uses this name.
+    #[allow(non_upper_case_globals)]
     pub const Bw4670: Self = Self::Bw467000;
 }
 
@@ -241,7 +246,6 @@ pub struct RxPacket {
 }
 
 // ---- Command opcodes (datasheet table 12-1) ----
-const CMD_SET_SLEEP: u8 = 0x84;
 const CMD_SET_STANDBY: u8 = 0x80;
 const CMD_SET_TX: u8 = 0x83;
 const CMD_SET_RX: u8 = 0x82;

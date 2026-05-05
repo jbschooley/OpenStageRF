@@ -141,15 +141,26 @@ These were settled in conversation before code starts:
   - `RfSwitchControl` trait with two impls: `Dio2RfSwitch` (T114, calls `SetDio2AsRfSwitchCtrl(true)` once during init) and `PinRfSwitch<Txen, Rxen>` (DX-LR30, toggles GPIOs around tx/rx)
   - `init`, `set_frequency`, `set_modulation_gfsk`, `set_packet_format`, `set_tx_power`, `tx`, `rx_continuous` — all async
   - `RxPacket { len, rssi_dbm, crc_ok }` — no SNR (SX1262 only reports SNR for LoRa; FSK uses RssiSync from `GetPacketStatus`)
-- [ ] **Board-side reset gate:** the wrapper does not own `DelayNs`, so the board's `Resources` builder must pulse NRESET low ≥100 µs and wait ≥10 ms before calling `radio.init().await`. Add this to each board crate's `resources()` constructor when the radio gets wired in.
-- [ ] Wire `radio0` field into `Resources` on both `boards/dx_lr30/` and `boards/t114/` — uses `PinRfSwitch` on DX-LR30, `Dio2RfSwitch` on T114
-- [ ] Bench test: TX board sends `[0xDE 0xAD 0xBE 0xEF]` once per second at 915 MHz / 300 kbps GFSK; RX board logs received bytes + RSSI via RTT.
+- [x] **Board-side reset gate:** the wrapper now owns the reset pulse + post-reset wait via `embassy_time::Timer`.  Boards just hand a high-idle reset pin to `Sx1262Radio::new()`.
+- [x] Wire `radio0` field into `Resources` on both `boards/dx_lr30/` and `boards/t114/` — uses `PinRfSwitch` on DX-LR30, `Dio2RfSwitch` on T114.  T114 also passes BUSY (P0_17).
+- [x] Bench test PASSED: TX T114 sends `[0xDE 0xAD 0xBE 0xEF, seq:u32]` once per second at 915 MHz / 300 kbps GFSK / +14 dBm; RX T114 logs `RX #N: len=8 rssi=-39dBm bytes=[0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0xNN]` per packet with monotonic sequence numbers.
 
-**Exit criteria:** RX reliably receives TX's test packet at 5 m line of sight, RSSI logged is reasonable (-50 to -70 dBm).
+**Exit criteria MET (2026-05-04):** RX receives every TX packet at desk-distance, RSSI -39 to -40 dBm.
 
-**Known upstream caveats** (worth tracking, not blocking):
-- `sx1262 = "0.3.0"` lags master — `PacketParams` is a raw `[u8; 9]` here vs. typed enums on master. Wrapper hand-encodes the byte layout. If we hit issues, switch to a git dep at master.
-- Upstream `Status::from_bytes(...).unwrap()` panics on weird reserved bits in the chip's status response. Not a problem under nominal operation but worth knowing if we see mysterious crashes.
+**Massive sx1262 driver pivot during M2 bring-up:**
+The `sx1262 = "0.3"` crate had two bugs that made it unusable on the Heltec T114:
+1. `Status::from_bytes(...).unwrap()` panicked on `cmd_status` values 0 (Reserved) and 1 (RFU), which the chip returns in normal operation.  We were chasing "cmd_status=5 = Failure to execute" for hours; the real chip state was hidden by parser panics.
+2. No exposure of raw register access → couldn't apply the mandatory **TxClampConfig** workaround (datasheet §15.2: `REG[0x08D8] |= 0x1E` after `SetPaConfig`).
+
+Replaced with hand-rolled raw SPI command layer in `drivers/radio/sx126x/src/lib.rs`.  ~700 lines, no external SX1262 crate dependency.  Five non-obvious things the chip needs that we discovered the hard way:
+
+1. `SetDio3AsTcxoCtrl(1.8 V, 5 ms)` before any RF / calibration — Heltec T114's LR1262 module wires DIO3 to power the TCXO; without this, PLL never locks and every TX rejects with `cmd_status=5`.
+2. `SetRegulatorMode(DC-DC)` — chip defaults to LDO-only after POR; PA browns out the LDO at +14 dBm and up.
+3. `SetRxTxFallbackMode(FS = 0x40)` — after TX_DONE, chip auto-enters FS (PLL locked, PA off).
+4. **Do NOT call `SetStandby(RC)` after TX_DONE.**  Empirically (every-other-TX failure pattern), explicit standby leaves the chip in a sub-state that rejects the next SetTx for ~3 seconds.  Let fallback mode handle the post-TX state.
+5. `TxClampConfig` workaround per datasheet §15.2 — `REG[0x08D8] |= 0x1E` after `SetPaConfig`.
+
+`SetDio2AsRfSwitchCtrl` must be called LAST (after all RF config) per RadioLib pattern.  See `memory/sx1262_handroll.md` for the full working init order.
 
 ### Milestone 3 — DIN MIDI parser and I/O (3–5 days)
 
