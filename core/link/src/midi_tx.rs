@@ -2,25 +2,29 @@
 
 //! MIDI-aware transmit queue with round-robin redundancy.
 //!
-//! Each message gets queued with `repeat_count` "send credits".  On
-//! every `pop_send` call we take the entry at the front and consume one
-//! credit; if any remain, the entry is re-inserted at the position
-//! corresponding to its remaining-credit count — keeping the queue
-//! ordered by descending credit (FIFO within the same credit level).
+//! Each message is queued with a priority (regular = `REGULAR_PRIORITY`,
+//! system real-time = `REALTIME_PRIORITY`).  `pop_send_batch` removes
+//! the front-of-queue entries that share a priority, concatenating
+//! their bytes — the caller (`run_tx`) then encodes that batch ONCE and
+//! retransmits the same wire bytes K times for redundancy.  Same wire
+//! bytes → same `seq` → the receiver's replay window automatically
+//! dedups the retransmits, so the receiver's sink fires each logical
+//! event exactly once.
 //!
-//! That gives two desirable properties at once:
+//! Trade-offs vs. an earlier per-credit round-robin design:
 //!
-//! 1. **Round-robin within a burst.**  A 3-note chord pushed in rapid
-//!    succession comes out as `C, E, G, C, E, G, C, E, G` — first round
-//!    delivers all three notes with ~one-message-time spread; rounds
-//!    two and three insure against per-packet RF loss.
-//! 2. **New events preempt later rounds of older events.**  If a new
-//!    note is tapped while an existing chord is on its 2nd or 3rd round,
-//!    the new note (3 credits remaining) jumps in front of the older
-//!    entries (≤ 2 credits remaining) for its **first** send.  The older
-//!    entries' subsequent rounds resume immediately after — they only
-//!    lose ~1.5 ms of wait time per burst, never miss out on their
-//!    redundancy.
+//! * The receiver dedups for free instead of needing a separate
+//!   content-aware dedup layer.
+//! * Chord spread is already minimal (the whole chord goes in one
+//!   packet thanks to batching), so the round-robin's main benefit no
+//!   longer applies.
+//! * Same-priority events that arrive mid-burst (after we've already
+//!   popped a batch) can still preempt the remaining retransmit copies
+//!   — `run_tx` checks the queue between copies and bails early if a
+//!   new event is waiting.  The trade-off is the original batch may
+//!   only get 1 or 2 of its 3 copies delivered (~0.2% miss rate
+//!   instead of 8 × 10⁻⁹), in exchange for ~3 ms lower latency for the
+//!   new event.
 //!
 //! On `push`, MIDI status semantics are used to cancel stale queued
 //! messages so the queue never holds opposing-state ghosts:
@@ -43,12 +47,13 @@
 use heapless::Vec;
 
 /// Maximum queued messages (each ≤ 4 wire bytes).  Sized for worst-case
-/// keyboard chord bursts (10-finger chord = 10 events × 3 send credits =
-/// 30 slots) plus headroom.  At ~10 bytes per entry that's ~640 B RAM.
+/// keyboard chord bursts plus headroom for system-real-time interleaving.
+/// At ~10 bytes per entry that's ~640 B RAM.
 pub const QUEUE_CAPACITY: usize = 64;
 
-/// Default redundancy: each message is sent this many times round-robin.
-pub const DEFAULT_REPEAT_COUNT: u8 = 3;
+/// Priority value used for regular channel-voice / system-common messages.
+/// Lower than `REALTIME_PRIORITY` so real-time events preempt them.
+pub const REGULAR_PRIORITY: u8 = 1;
 
 /// Maximum bytes per MIDI message stored in the queue.  Channel messages
 /// are 1–3 bytes; we round up to 4 so 4-byte System Exclusive headers
@@ -57,41 +62,30 @@ pub const DEFAULT_REPEAT_COUNT: u8 = 3;
 /// separately via the `Body::SysExFragment` path.
 const MAX_MSG_BYTES: usize = 4;
 
-/// Priority value used for system real-time messages (0xF8–0xFF).  These
+/// Priority value for system real-time messages (0xF8–0xFF).  These
 /// carry tempo / transport semantics (Timing Clock, Start, Stop, Continue,
 /// Active Sensing, Reset) that are jitter-sensitive and should preempt
-/// any pending channel-voice traffic.  We park them above the regular
-/// priority range so they always sort to the front of the queue.
-const REALTIME_PRIORITY: u8 = u8::MAX;
+/// any pending channel-voice traffic.
+pub const REALTIME_PRIORITY: u8 = u8::MAX;
 
 #[derive(Debug, Clone)]
 struct Entry {
     bytes: Vec<u8, MAX_MSG_BYTES>,
-    sends_remaining: u8,
-    /// Queue ordering key — higher = closer to the front.  For regular
-    /// messages this tracks `sends_remaining` (so a fresh event with 3
-    /// credits outranks any in-progress event with ≤ 2 left, but as it
-    /// ages through its rounds it falls back).  For real-time messages
-    /// it's pinned at `REALTIME_PRIORITY` so they stay at the front
-    /// until exhausted.
+    /// Queue ordering key — higher = closer to the front.  Real-time =
+    /// `REALTIME_PRIORITY` (preempts everything); regular channel-voice
+    /// = `REGULAR_PRIORITY`.
     priority: u8,
 }
 
-/// Round-robin redundant MIDI transmit queue with status-aware dedup.
+/// Priority-ordered MIDI transmit queue with status-aware dedup.
 pub struct MidiTxQueue {
     entries: Vec<Entry, QUEUE_CAPACITY>,
-    repeat_count: u8,
 }
 
 impl MidiTxQueue {
     pub fn new() -> Self {
-        Self::with_repeat_count(DEFAULT_REPEAT_COUNT)
-    }
-
-    pub fn with_repeat_count(repeat_count: u8) -> Self {
         Self {
             entries: Vec::new(),
-            repeat_count: repeat_count.max(1),
         }
     }
 
@@ -101,6 +95,12 @@ impl MidiTxQueue {
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Priority of the front entry, or `None` if empty.  Used by `run_tx`
+    /// to check for preempting events between retransmit copies.
+    pub fn front_priority(&self) -> Option<u8> {
+        self.entries.first().map(|e| e.priority)
     }
 
     /// Queue a MIDI message for redundant send.  Applies dedup rules
@@ -115,15 +115,16 @@ impl MidiTxQueue {
         }
         let status = bytes[0];
 
-        // System real-time (0xF8..=0xFF): jitter-sensitive.  Single-send,
-        // top-priority — they preempt any pending channel-voice traffic.
-        // No dedup (each carries unique semantics; e.g., two adjacent
+        // System real-time (0xF8..=0xFF): jitter-sensitive.  Top priority
+        // — preempt any pending channel-voice traffic.  Caller is
+        // responsible for sending real-time batches single-shot (no
+        // retransmit) since they're frequent and miss-tolerant.  No
+        // dedup (each carries unique semantics; e.g., two adjacent
         // Timing Clocks aren't redundant — they advance the receiver's
         // tempo counter independently).
         if status >= 0xF8 {
             let mut entry = Entry {
                 bytes: Vec::new(),
-                sends_remaining: 1,
                 priority: REALTIME_PRIORITY,
             };
             let _ = entry.bytes.extend_from_slice(bytes);
@@ -172,44 +173,58 @@ impl MidiTxQueue {
 
         let mut entry = Entry {
             bytes: Vec::new(),
-            sends_remaining: self.repeat_count,
-            priority: self.repeat_count,
+            priority: REGULAR_PRIORITY,
         };
         // SAFETY: bytes.len() ≤ MAX_MSG_BYTES (checked above).
         let _ = entry.bytes.extend_from_slice(bytes);
         self.insert_by_priority(entry).is_ok()
     }
 
-    /// Pop the next message to send.  Copies its bytes into `out`,
-    /// returns the number of bytes written.  Front of the queue is
-    /// always the highest-credit, oldest-arrived entry — so this
-    /// returns either a brand-new event's first copy or an in-progress
-    /// event's next round, whichever is more "urgent" by credit count.
-    /// If the popped entry has any credits remaining, it's re-inserted
-    /// at the position matching its (now-decremented) credit level.
-    /// Returns `None` if the queue is empty.
-    pub fn pop_send(&mut self, out: &mut [u8]) -> Option<usize> {
+    /// Pop a batch of front-of-queue entries that share the same
+    /// priority, concatenating their MIDI bytes into `out`.  Consumed
+    /// entries are removed from the queue — no automatic retransmits.
+    /// `run_tx` encodes this batch ONCE and resends the same wire bytes
+    /// K times for redundancy (so the receiver's replay window dedups
+    /// the copies by `seq`).
+    ///
+    /// Same-priority-only batching means real-time messages (priority
+    /// MAX) always go in their own packet — never bundled with regular
+    /// channel-voice events.
+    ///
+    /// Returns `Some((bytes_written, priority))` or `None` if the queue
+    /// is empty.  `priority` lets the caller choose retransmit count
+    /// (regular = K copies, real-time = 1 copy).
+    pub fn pop_send_batch(&mut self, out: &mut [u8]) -> Option<(usize, u8)> {
         if self.entries.is_empty() {
             return None;
         }
-        // remove(0) is O(n) but n is bounded small; fine.
-        let mut entry = self.entries.remove(0);
-        let n = entry.bytes.len();
-        if n > out.len() {
-            return None; // caller's buffer too small
-        }
-        out[..n].copy_from_slice(&entry.bytes);
-        entry.sends_remaining = entry.sends_remaining.saturating_sub(1);
-        if entry.sends_remaining > 0 {
-            // Regular messages: priority follows credits (3 → 2 → 1 → done).
-            // Real-time messages: priority pinned at REALTIME_PRIORITY for
-            // their whole lifetime so they stay at the front.
-            if entry.priority != REALTIME_PRIORITY {
-                entry.priority = entry.sends_remaining;
+        let target_priority = self.entries[0].priority;
+        let mut total_len = 0usize;
+        let mut consumed = 0usize;
+
+        while let Some(entry) = self.entries.get(consumed) {
+            if entry.priority != target_priority {
+                break;
             }
-            let _ = self.insert_by_priority(entry);
+            let n = entry.bytes.len();
+            if total_len + n > out.len() {
+                break;
+            }
+            out[total_len..total_len + n].copy_from_slice(&entry.bytes);
+            total_len += n;
+            consumed += 1;
         }
-        Some(n)
+
+        if consumed == 0 {
+            return None;
+        }
+
+        // Remove the consumed entries from the front.
+        for _ in 0..consumed {
+            self.entries.remove(0);
+        }
+
+        Some((total_len, target_priority))
     }
 
     /// Insert `entry` at the position that keeps the queue ordered by
@@ -279,64 +294,95 @@ fn is_status(e: &Entry, status_high: u8, ch: u8) -> bool {
 mod tests {
     use super::*;
 
-    fn pop_all(q: &mut MidiTxQueue) -> Vec<std::vec::Vec<u8>, 64> {
-        let mut out = [0u8; MAX_MSG_BYTES];
-        let mut all: Vec<std::vec::Vec<u8>, 64> = Vec::new();
-        while let Some(n) = q.pop_send(&mut out) {
-            let _ = all.push(out[..n].to_vec());
+    fn drain_batches(q: &mut MidiTxQueue) -> Vec<(std::vec::Vec<u8>, u8), 64> {
+        let mut out = [0u8; 64];
+        let mut all: Vec<(std::vec::Vec<u8>, u8), 64> = Vec::new();
+        while let Some((n, priority)) = q.pop_send_batch(&mut out) {
+            let _ = all.push((out[..n].to_vec(), priority));
         }
         all
     }
 
     #[test]
-    fn round_robin_chord() {
-        // C, E, G (on ch 0, vel 100) → expect C E G C E G C E G.
+    fn chord_pops_as_single_batch() {
         let mut q = MidiTxQueue::new();
         q.push(&[0x90, 60, 100]);
         q.push(&[0x90, 64, 100]);
         q.push(&[0x90, 67, 100]);
-        let drained = pop_all(&mut q);
-        assert_eq!(drained.len(), 9);
-        // Pattern: notes 60, 64, 67 repeating.
-        let expected_notes = [60, 64, 67, 60, 64, 67, 60, 64, 67];
-        for (i, msg) in drained.iter().enumerate() {
-            assert_eq!(msg[0], 0x90, "msg {i}: status");
-            assert_eq!(msg[1], expected_notes[i], "msg {i}: note");
-        }
+        // All three are regular priority and FIFO — pop_send_batch
+        // returns them concatenated in one batch and empties the queue.
+        let batches = drain_batches(&mut q);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].0,
+            vec![0x90, 60, 100, 0x90, 64, 100, 0x90, 67, 100]
+        );
+        assert_eq!(batches[0].1, REGULAR_PRIORITY);
     }
 
     #[test]
-    fn new_event_preempts_in_progress_round_robin() {
-        // Send chord (C, E, G), simulate one round of round-robin sends
-        // (drain 3 sends), then push a new note B — B's first copy
-        // should jump in front of the chord notes' second copies.
+    fn realtime_preempts_chord() {
+        // Press chord, then a Timing Clock arrives before the chord has
+        // been popped.  TC should pop FIRST as its own batch.
         let mut q = MidiTxQueue::new();
         q.push(&[0x90, 60, 100]); // C
         q.push(&[0x90, 64, 100]); // E
         q.push(&[0x90, 67, 100]); // G
+        q.push(&[0xF8]); // Timing Clock — arrives last, but priority MAX
+        let batches = drain_batches(&mut q);
+        assert_eq!(batches.len(), 2);
+        // First batch: TC alone at priority MAX.
+        assert_eq!(batches[0].0, vec![0xF8]);
+        assert_eq!(batches[0].1, REALTIME_PRIORITY);
+        // Second batch: chord at REGULAR_PRIORITY.
+        assert_eq!(
+            batches[1].0,
+            vec![0x90, 60, 100, 0x90, 64, 100, 0x90, 67, 100]
+        );
+        assert_eq!(batches[1].1, REGULAR_PRIORITY);
+    }
 
-        // Simulate sending C, E, G one round each.
-        let mut tmp = [0u8; MAX_MSG_BYTES];
-        for _ in 0..3 {
-            assert!(q.pop_send(&mut tmp).is_some());
-        }
-        // At this point chord notes have 2 credits remaining each.
-
-        // New tap arrives.  Should jump ahead.
-        q.push(&[0x90, 71, 100]); // B (new, 3 credits)
-
-        // Next pop should be B (priority 3 > existing priority 2).
-        let n = q.pop_send(&mut tmp).unwrap();
+    #[test]
+    fn new_event_arriving_after_pop_goes_to_back() {
+        // Pop the chord, then a new note arrives — pop again returns it.
+        let mut q = MidiTxQueue::new();
+        q.push(&[0x90, 60, 100]);
+        q.push(&[0x90, 64, 100]);
+        let mut tmp = [0u8; 64];
+        assert!(q.pop_send_batch(&mut tmp).is_some());
+        assert!(q.is_empty());
+        q.push(&[0x90, 71, 100]); // B
+        let (n, _) = q.pop_send_batch(&mut tmp).unwrap();
         assert_eq!(&tmp[..n], &[0x90, 71, 100]);
+    }
 
-        // After B's first send (now 2 credits), it goes back into
-        // round-robin with the chord notes — they all have 2 credits.
-        // Next pop should resume with C, then E, G, then B again.
-        let drained = pop_all(&mut q);
-        let notes: std::vec::Vec<u8> = drained.iter().map(|m| m[1]).collect();
-        // Order: C, E, G, B, C, E, G, B  (rounds 2 and 3 of all notes,
-        // with B appended after the priority-2 group).
-        assert_eq!(notes, vec![60, 64, 67, 71, 60, 64, 67, 71]);
+    /// Concatenate every batch's bytes into one flat Vec.  Used by the
+    /// dedup tests where ordering within a batch doesn't matter — only
+    /// which messages survive.
+    fn drain_all_bytes(q: &mut MidiTxQueue) -> std::vec::Vec<u8> {
+        let mut all = std::vec::Vec::new();
+        for (bytes, _) in drain_batches(q) {
+            all.extend_from_slice(&bytes);
+        }
+        all
+    }
+
+    /// Split a flat byte buffer into MIDI messages by status byte length.
+    /// Only handles the channel-voice statuses our tests use.
+    fn split_messages(bytes: &[u8]) -> std::vec::Vec<&[u8]> {
+        let mut out = std::vec::Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let s = bytes[i];
+            let n = match s & 0xF0 {
+                0xC0 | 0xD0 => 2,
+                0x80 | 0x90 | 0xA0 | 0xB0 | 0xE0 => 3,
+                _ => 1,
+            };
+            out.push(&bytes[i..i + n]);
+            i += n;
+        }
+        out
     }
 
     #[test]
@@ -345,26 +391,20 @@ mod tests {
         q.push(&[0x90, 60, 100]); // NoteOn C
         q.push(&[0x90, 64, 100]); // NoteOn E
         q.push(&[0x80, 60, 0]); // NoteOff C — should cancel NoteOn C
-        let drained = pop_all(&mut q);
-        // Should NOT contain any NoteOn for note 60.
-        for m in &drained {
+        let bytes = drain_all_bytes(&mut q);
+        let msgs = split_messages(&bytes);
+        // No NoteOn for note 60 should survive.
+        for m in &msgs {
             if m[0] & 0xF0 == 0x90 {
                 assert_ne!(m[1], 60, "stale NoteOn(C) survived NoteOff");
             }
         }
-        // NoteOn E should still be sent 3 times.
-        let e_count = drained
-            .iter()
-            .filter(|m| m[0] == 0x90 && m[1] == 64)
-            .count();
-        assert_eq!(e_count, 3);
-        // NoteOff C should be sent 3 times (insurance against any NoteOn copy
-        // already in flight).
-        let off_c_count = drained
-            .iter()
-            .filter(|m| m[0] == 0x80 && m[1] == 60)
-            .count();
-        assert_eq!(off_c_count, 3);
+        // NoteOn E and NoteOff C remain (each appears once — retransmits
+        // are now done by run_tx, not the queue).
+        let e_count = msgs.iter().filter(|m| m[0] == 0x90 && m[1] == 64).count();
+        assert_eq!(e_count, 1);
+        let off_c_count = msgs.iter().filter(|m| m[0] == 0x80 && m[1] == 60).count();
+        assert_eq!(off_c_count, 1);
     }
 
     #[test]
@@ -373,23 +413,18 @@ mod tests {
         q.push(&[0xB0, 7, 50]); // Volume 50
         q.push(&[0xB0, 7, 90]); // Volume 90 — should cancel the 50
         q.push(&[0xB0, 64, 127]); // Sustain ON — different ctrl, kept
-        let drained = pop_all(&mut q);
-        // Only volumes of 90 should survive.
-        for m in &drained {
+        let bytes = drain_all_bytes(&mut q);
+        let msgs = split_messages(&bytes);
+        // Only Volume=90 should survive.
+        for m in &msgs {
             if m[0] == 0xB0 && m[1] == 7 {
                 assert_eq!(m[2], 90, "stale Volume CC value survived");
             }
         }
-        let vol_count = drained
-            .iter()
-            .filter(|m| m[0] == 0xB0 && m[1] == 7)
-            .count();
-        assert_eq!(vol_count, 3);
-        let sus_count = drained
-            .iter()
-            .filter(|m| m[0] == 0xB0 && m[1] == 64)
-            .count();
-        assert_eq!(sus_count, 3);
+        let vol_count = msgs.iter().filter(|m| m[0] == 0xB0 && m[1] == 7).count();
+        assert_eq!(vol_count, 1);
+        let sus_count = msgs.iter().filter(|m| m[0] == 0xB0 && m[1] == 64).count();
+        assert_eq!(sus_count, 1);
     }
 
     #[test]
@@ -397,36 +432,33 @@ mod tests {
         let mut q = MidiTxQueue::new();
         q.push(&[0xE0, 0, 64]); // Centre
         q.push(&[0xE0, 0x40, 0x70]); // Bent up — should cancel centre
-        let drained = pop_all(&mut q);
-        // Only the bent-up value should appear.
-        for m in &drained {
+        let bytes = drain_all_bytes(&mut q);
+        let msgs = split_messages(&bytes);
+        for m in &msgs {
             if m[0] == 0xE0 {
                 assert_eq!((m[1], m[2]), (0x40, 0x70));
             }
         }
-        assert_eq!(drained.iter().filter(|m| m[0] == 0xE0).count(), 3);
+        assert_eq!(msgs.iter().filter(|m| m[0] == 0xE0).count(), 1);
     }
 
     #[test]
     fn note_on_cancels_pending_note_off_same_note() {
         // Rapid release-then-re-press: NoteOff queued, then NoteOn arrives.
-        // Without cancellation, the pending NoteOff copies would arrive at
-        // the receiver after the NoteOn and turn the re-struck note off.
+        // Without cancellation, a still-queued NoteOff would arrive after
+        // the NoteOn and turn the re-struck note off.
         let mut q = MidiTxQueue::new();
         q.push(&[0x80, 60, 0]); // NoteOff C
         q.push(&[0x90, 60, 100]); // NoteOn C — should cancel the NoteOff
-        let drained = pop_all(&mut q);
-        // No NoteOff for note 60 should survive.
-        for m in &drained {
+        let bytes = drain_all_bytes(&mut q);
+        let msgs = split_messages(&bytes);
+        for m in &msgs {
             if m[0] == 0x80 {
                 assert_ne!(m[1], 60, "stale NoteOff(C) survived NoteOn");
             }
         }
-        let on_count = drained
-            .iter()
-            .filter(|m| m[0] == 0x90 && m[1] == 60)
-            .count();
-        assert_eq!(on_count, 3); // NoteOn fully triple-sent
+        let on_count = msgs.iter().filter(|m| m[0] == 0x90 && m[1] == 60).count();
+        assert_eq!(on_count, 1);
     }
 
     #[test]
@@ -435,12 +467,10 @@ mod tests {
         let mut q = MidiTxQueue::new();
         q.push(&[0x90, 60, 100]);
         q.push(&[0x90, 60, 100]);
-        let drained = pop_all(&mut q);
-        let n_count = drained
-            .iter()
-            .filter(|m| m[0] == 0x90 && m[1] == 60)
-            .count();
-        assert_eq!(n_count, 6); // both events, 3× each
+        let bytes = drain_all_bytes(&mut q);
+        let msgs = split_messages(&bytes);
+        let n_count = msgs.iter().filter(|m| m[0] == 0x90 && m[1] == 60).count();
+        assert_eq!(n_count, 2);
     }
 
     #[test]
@@ -448,49 +478,28 @@ mod tests {
         let mut q = MidiTxQueue::new();
         q.push(&[0xB0, 7, 50]); // ch 0, Vol 50
         q.push(&[0xB1, 7, 90]); // ch 1, Vol 90 — different channel, kept
-        let drained = pop_all(&mut q);
-        let ch0 = drained.iter().filter(|m| m[0] == 0xB0).count();
-        let ch1 = drained.iter().filter(|m| m[0] == 0xB1).count();
-        assert_eq!(ch0, 3);
-        assert_eq!(ch1, 3);
+        let bytes = drain_all_bytes(&mut q);
+        let msgs = split_messages(&bytes);
+        let ch0 = msgs.iter().filter(|m| m[0] == 0xB0).count();
+        let ch1 = msgs.iter().filter(|m| m[0] == 0xB1).count();
+        assert_eq!(ch0, 1);
+        assert_eq!(ch1, 1);
     }
 
     #[test]
-    fn realtime_message_preempts_chord() {
-        // Press a chord, then a Timing Clock arrives mid-burst — TC should
-        // jump to the absolute front of the queue and send single-shot.
+    fn batch_pop_respects_buffer_size() {
         let mut q = MidiTxQueue::new();
-        q.push(&[0x90, 60, 100]); // C
-        q.push(&[0x90, 64, 100]); // E
-        q.push(&[0x90, 67, 100]); // G
-
-        // Pretend C and E got their first send already (round 1 in flight).
-        let mut tmp = [0u8; MAX_MSG_BYTES];
-        q.pop_send(&mut tmp); // C
-        q.pop_send(&mut tmp); // E
-
-        // Timing Clock arrives.
-        q.push(&[0xF8]);
-
-        // Next pop should be Timing Clock (priority MAX, ahead of even
-        // fresh-credit-3 entries).
-        let n = q.pop_send(&mut tmp).unwrap();
-        assert_eq!(&tmp[..n], &[0xF8]);
-        // TC has sends_remaining=1 originally, now 0 → dropped.
-        // Next pop should be G (still priority 3, freshest).
-        let n = q.pop_send(&mut tmp).unwrap();
-        assert_eq!(tmp[..n], [0x90, 67, 100]);
-    }
-
-    #[test]
-    fn realtime_message_single_send_only() {
-        // Real-time messages aren't redundantly sent (they're frequent and
-        // miss-tolerant; Timing Clock at 48 Hz with single-send means a
-        // lost clock skews tempo by 1/48 of a quarter note for one beat).
-        let mut q = MidiTxQueue::new();
-        q.push(&[0xF8]); // Timing Clock
-        let drained = pop_all(&mut q);
-        assert_eq!(drained.len(), 1, "real-time message sent more than once");
+        q.push(&[0x90, 60, 100]);
+        q.push(&[0x90, 64, 100]);
+        q.push(&[0x90, 67, 100]);
+        // Buffer fits only 2 messages = 6 bytes.
+        let mut out = [0u8; 6];
+        let (n, _) = q.pop_send_batch(&mut out).unwrap();
+        assert_eq!(n, 6);
+        assert_eq!(&out[..6], &[0x90, 60, 100, 0x90, 64, 100]);
+        // Third message remains.
+        let (n2, _) = q.pop_send_batch(&mut [0u8; 64]).unwrap();
+        assert_eq!(n2, 3);
     }
 
     #[test]

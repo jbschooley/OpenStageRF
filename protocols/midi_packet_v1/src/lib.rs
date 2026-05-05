@@ -33,6 +33,20 @@ pub const KEY_FP_RESERVED: KeyFp = [0xFF, 0xFF, 0xFF];
 /// Sequence numbers are 6 bytes on the wire; this is the maximum representable.
 pub const MAX_SEQ: u64 = (1u64 << 48) - 1;
 
+/// Maximum bytes carried in a `Body::MidiMessage` payload.
+///
+/// Originally a single MIDI channel-voice message (1–3 bytes), this was
+/// relaxed in v1 to allow **batched** raw MIDI bytes — multiple
+/// status-delimited messages concatenated.  The receiver decodes the
+/// stream by MIDI parsing (status bytes have the high bit set; data
+/// bytes don't), so the wire format is unchanged — only the length
+/// invariant relaxes.
+///
+/// 64 bytes is comfortably more than fits in a 64-byte radio packet
+/// after the 11-byte header (53 usable), but accommodates future
+/// configurations with larger payloads.
+pub const MAX_MIDI_MESSAGE_LEN: usize = 64;
+
 /// Three-byte key fingerprint.  See `SPEC.md` § "key_fp".
 pub type KeyFp = [u8; 3];
 
@@ -200,7 +214,9 @@ pub enum DecodeError {
 /// the same `EncodeError`s `encode` would return for those cases.
 pub fn wire_len(body: &Body<'_>) -> Result<usize, EncodeError> {
     match body {
-        Body::MidiMessage(b) if b.is_empty() || b.len() > 3 => Err(EncodeError::InvalidMidiLength),
+        Body::MidiMessage(b) if b.is_empty() || b.len() > MAX_MIDI_MESSAGE_LEN => {
+            Err(EncodeError::InvalidMidiLength)
+        }
         Body::SysExFragment { bytes, .. } if bytes.is_empty() => {
             Err(EncodeError::InvalidSysExFragment)
         }
@@ -280,7 +296,7 @@ pub fn decode<'a>(buf: &'a [u8]) -> Result<Packet<'a>, DecodeError> {
         0x00 => return Err(DecodeError::ReservedEventType),
         event_type::HEARTBEAT => Body::Heartbeat,
         event_type::MIDI_MESSAGE => {
-            if data.is_empty() || data.len() > 3 {
+            if data.is_empty() || data.len() > MAX_MIDI_MESSAGE_LEN {
                 return Err(DecodeError::InvalidMidiLength);
             }
             Body::MidiMessage(data)
@@ -571,10 +587,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_midi_length_four_bytes() {
-        let mut buf = [0u8; 32];
+    fn accepts_batched_midi_message() {
+        // After the v1 batching relaxation, MidiMessage accepts up to
+        // MAX_MIDI_MESSAGE_LEN bytes — multiple status-delimited MIDI
+        // messages concatenated into a single packet body.
+        let mut buf = [0u8; HEADER_LEN + MAX_MIDI_MESSAGE_LEN];
         let h = header(0, event_type::MIDI_MESSAGE);
-        let too_long = [0x90, 60, 100, 0x80];
+        // 3-note chord = 9 bytes, well within the new limit.
+        let chord = [0x90, 60, 100, 0x90, 64, 100, 0x90, 67, 100];
+        let n = encode(&mut buf, &h, &Body::MidiMessage(&chord)).unwrap();
+        assert_eq!(n, HEADER_LEN + chord.len());
+        let decoded = decode(&buf[..n]).unwrap();
+        match decoded.body {
+            Body::MidiMessage(b) => assert_eq!(b, &chord),
+            other => panic!("expected MidiMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_oversize_midi_message() {
+        let mut buf = [0u8; HEADER_LEN + MAX_MIDI_MESSAGE_LEN + 8];
+        let h = header(0, event_type::MIDI_MESSAGE);
+        let too_long = [0u8; MAX_MIDI_MESSAGE_LEN + 1];
         assert_eq!(
             encode(&mut buf, &h, &Body::MidiMessage(&too_long)),
             Err(EncodeError::InvalidMidiLength)
@@ -582,12 +616,13 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_invalid_midi_length_four_bytes() {
-        // Forge a packet with event_type=MIDI_MESSAGE and 4 body bytes.
-        let mut buf = [0u8; 15];
+    fn decode_rejects_oversize_midi_message() {
+        let total = HEADER_LEN + MAX_MIDI_MESSAGE_LEN + 1;
+        let mut buf = std::vec::Vec::with_capacity(total);
+        buf.resize(total, 0);
         buf[0] = VER_V1;
         buf[10] = event_type::MIDI_MESSAGE;
-        buf[11..15].copy_from_slice(&[0x90, 60, 100, 50]);
+        // Body is now (MAX + 1) bytes — should reject.
         assert_eq!(decode(&buf), Err(DecodeError::InvalidMidiLength));
     }
 
