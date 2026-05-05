@@ -22,6 +22,13 @@ use osrf_board_t114 as board;
 use defmt_rtt as _;
 use panic_probe as _;
 
+// Required for any T114 binary — VTOR + bootloader peripheral teardown.
+// See `osrf_board_t114::bootloader_handoff()` for the rationale.
+#[cortex_m_rt::pre_init]
+unsafe fn pre_init() {
+    board::bootloader_handoff();
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     #[cfg(feature = "usb-log")]
@@ -29,7 +36,7 @@ async fn main(spawner: Spawner) {
         let (r, usbd) = board::resources_and_usbd_with(board::clocks::usb_config());
         board::usb_log::spawn(&spawner, usbd);
         Timer::after_millis(500).await;
-        spawner.spawn(usb_heartbeat().unwrap());
+        spawner.spawn(usb_heartbeat()).unwrap();
         r
     };
     #[cfg(not(feature = "usb-log"))]

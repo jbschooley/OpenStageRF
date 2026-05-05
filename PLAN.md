@@ -57,9 +57,29 @@ These were settled in conversation before code starts:
       main.rs and reverted once peripherals are validated.
       RTT logs deferred until SWD wiring is added (would require tack-soldering
       to PA13/PA14 on the QFP48).
-- [ ] First flash on **T114** (in flight in a parallel agent).
+- [x] First flash on **T114** — `profiles/t114_blink` blinks the green LED on P1_03 at 1 Hz.
+      Flashing path is **UF2 over the Heltec `ht-n5262 0.9.0` bootloader** (double-tap
+      reset → drag-drop onto T114BOOT volume).  Required ~6 hours of bring-up work because
+      the bootloader hand-off has a stack of hardware quirks that are *not* documented in
+      Heltec's docs:
+        1. **No SoftDevice on this unit.** The bootloader's `is_sd_existed()` returns false,
+           so user app must be at `0x1000` (MBR_SIZE), not `0x26000` (SD_SIZE) as every
+           Adafruit/Meshtastic doc claims for factory T114s.  `boards/t114/memory.x` FLASH
+           ORIGIN = `0x00001000`.  UF2 conversion: `python uf2conv.py firmware.bin -c -b 0x1000 -f 0xADA52840`.
+        2. **`#[cortex_m_rt::pre_init]` must call `osrf_board_t114::bootloader_handoff()`**:
+           VTOR relocation (cortex-m-rt does NOT do this), NVIC ICER/ICPR clear, RTC
+           INTENCLR/EVTENCLR/CLEAR, all-TIMERs stop+shutdown, GPIOTE config clear, PPI CHENCLR,
+           LFCLK STOP.  Without each piece, different things break in different combinations
+           (LED stuck driven by leftover GPIOTE, embassy time driver wedged at first `.await`,
+           executor frozen by stray USBD interrupts firing through cortex-m-rt's
+           `DefaultHandler` infinite-loop).
+        3. **`mipidsi::Builder::init()` hangs** on this hardware — every other piece of
+           `build_resources` (SX1262 SPI, UARTE1, raw TWISPI1 SPI write, 120 ms
+           `Delay::delay_ms`) verified working in isolation via stepwise diagnostic.  Display
+           field removed from `Resources` until smoke-test development debugs it.
+           `profiles/t114_ui_demo` is broken with a TODO header until then.
 
-**Exit criteria:** `cargo run -p osrf-app-midi-node --target thumbv7m-none-eabi --features dx_lr30` flashes the board and shows logs.
+**Exit criteria:** `cargo run -p osrf-app-midi-node --target thumbv7m-none-eabi --features dx_lr30` flashes the board and shows logs. **Met for T114** via `firmware.uf2` flow; deferred for DX-LR30 until USART1-via-CH340C logging is wired (see Milestone 1).
 
 ### Milestone 1 — schematic verification + hardware bring-up (3–5 days)
 
@@ -71,10 +91,42 @@ These were settled in conversation before code starts:
 - [x] Smoke test `examples/smoke.rs` for both boards — LED, SX1262 reset/BUSY/DIO1/CS, MIDI UART init.
       Run: `cargo run --example smoke -p osrf-board-dx-lr30 --target thumbv7m-none-eabi`
       Run: `cargo run --example smoke -p osrf-board-t114    --target thumbv7em-none-eabihf`
-- [ ] Wire ST-Link SWD: SWDIO, SWCLK, GND, optionally NRST
+- [x] **T114 SWD wired** (ST-Link V2 → SWDIO/SWCLK/RST/GND test points on the back of the PCB)
+- [x] **T114 smoke run on real hardware** — all checks PASS:
+      LED P1_03 toggles, button P1_10 reads released (pull-up OK), VEXT P0_21 toggles,
+      SX1262 BUSY=false post-reset (chip alive and in standby), DIO1=false (idle as expected),
+      CS toggles cleanly.  Embassy time driver matches wall-clock to 0.0006% over 200 ms = LFRC fine.
+- [ ] **DX-LR30 SWD: NOT POSSIBLE on this carrier.** PA13/SWDIO and PA14/SWCLK are not broken
+      out to either H3 or H4 expansion header (verified 2026-05-04 against
+      `LR30-SP PCBA schematic diagram.pdf`).  Tack-soldering to the QFP48 chip pads is the only
+      SWD path.  Two practical alternatives:
+        a. Re-route logs via the on-board CH340C USART1 bridge (PA9/PA10 → USB-Serial).  The
+           board crate already exposes `dx_lr30::debug_uart` for this.  Requires adding
+           defmt-over-UART (e.g. `defmt-bbq` + a USART1 forwarder task) or routing `log::*`
+           through the bridge similar to T114's `usb-log` feature.  No SWD probe needed.
+        b. Ship without runtime logs; trust visual / multimeter / scope verification of the
+           pinmap (reasonable since the same Resources builder works on T114 and the schematic
+           pin assignments are committed).
 - [ ] Wire Adafruit MIDI FeatherWing on the chosen board's MIDI UART pins
 - [ ] (RX side only) wire I²C OLED (DX-LR30) or onboard ST7789 (T114) + buttons
 - [ ] Run `smoke` example on each board; fix any pin mismatches found
+
+**Infrastructure changes during M1 bring-up:**
+- `.cargo/config.toml`: added `[env] DEFMT_LOG = "info"` workspace-wide.  Without this, defmt
+  filters log macros to no-ops at compile time and RTT shows nothing despite a valid SEGGER
+  control block.  Verified by inspecting RTT WrOff register on the running chip.
+- `.cargo/config.toml`: T114 runner uses `--rtt-scan-memory` (probe-rs 0.31 default symbol
+  lookup misses our control block at 0x20000010 since `memory.x` puts RAM origin at 0x20000008).
+- `Embed.toml`: added for cargo-embed as a fallback RTT viewer; same chip + scan-memory config.
+- `osrf-board-t114::bootloader_handoff()`: VTOR + NVIC + RTC/TIMER/GPIOTE/PPI/LFCLK teardown
+  every UF2-flashed binary must call from `#[pre_init]`.  Hardware-specific to the Heltec
+  `ht-n5262 0.9.0` bootloader hand-off; not something C/Arduino would avoid.
+- `boards/t114/memory.x`: FLASH ORIGIN = `0x00001000` (this T114 unit has no SoftDevice; the
+  bootloader's `is_sd_existed()` returns false → user app at MBR_SIZE, not SD_SIZE).
+- `Resources::display` removed from T114; `mipidsi::Builder::init()` hangs after every other
+  build_resources step (radio SPI, UART, raw TWISPI1 SPI write, 120 ms `Delay::delay_ms`)
+  verified in isolation.  Deferred to whenever UI work resumes.  `profiles/t114_ui_demo` is
+  intentionally broken with a TODO header until we revisit.
 
 **Exit criteria:** schematic-verified pinmap committed; all GPIOs respond on real hardware.
 

@@ -26,6 +26,7 @@ pub mod clocks;
 // table 78); CH2/CH3 are taken by SPI1 above, so I²C and the radio do not
 // fight for DMA channels.
 bind_interrupts!(struct Irqs {
+    EXTI2         => exti::InterruptHandler<interrupt::typelevel::EXTI2>;
     EXTI15_10     => exti::InterruptHandler<interrupt::typelevel::EXTI15_10>;
     DMA1_CHANNEL2 => dma::InterruptHandler<peripherals::DMA1_CH2>;
     DMA1_CHANNEL3 => dma::InterruptHandler<peripherals::DMA1_CH3>;
@@ -135,7 +136,8 @@ pub type Radio0 = osrf_radio_sx126x::Sx1262Radio<
         embassy_stm32::gpio::Output<'static>,
         embassy_time::Delay,
     >,
-    embassy_stm32::exti::ExtiInput<'static, embassy_stm32::mode::Async>,
+    embassy_stm32::exti::ExtiInput<'static, embassy_stm32::mode::Async>, // BUSY (PA2)
+    embassy_stm32::exti::ExtiInput<'static, embassy_stm32::mode::Async>, // DIO1
     embassy_stm32::gpio::Output<'static>,
     osrf_radio_sx126x::PinRfSwitch<embassy_stm32::gpio::Output<'static>, embassy_stm32::gpio::Output<'static>>,
 >;
@@ -222,26 +224,26 @@ pub fn resources() -> Resources {
     let spi_dev = embedded_hal_bus::spi::ExclusiveDevice::new(spi, cs, embassy_time::Delay)
         .expect("CS pin set_high cannot fail (Infallible)");
 
+    // ── BUSY = PA2, EXTI2-driven async input ────────────────────────────────
+    // `Sx1262Radio::wait_busy()` polls this between SPI commands.
+    let busy = ExtiInput::new(p.PA2, p.EXTI2, Pull::None, Irqs);
+
     // ── DIO1 = PC15, EXTI15-driven async input ──────────────────────────────
     let dio1 = ExtiInput::new(p.PC15, p.EXTI15, Pull::Down, Irqs);
 
     // ── NRESET = PA3 ────────────────────────────────────────────────────────
-    let mut reset = Output::new(p.PA3, Level::High, Speed::Medium);
+    let reset = Output::new(p.PA3, Level::High, Speed::Medium);
 
     // ── RF switch GPIOs (TXEN=PA0, RXEN=PA1, both idle low) ─────────────────
     let txen = Output::new(p.PA0, Level::Low, Speed::Medium);
     let rxen = Output::new(p.PA1, Level::Low, Speed::Medium);
 
-    // ── Hardware reset pulse: low ≥100 µs, then ≥10 ms post-reset wait ──────
-    // We don't have an async runtime up yet, so use cycle-counted busy-waits.
-    // SYSCLK is 64 MHz (HSI+PLL): 1 µs ≈ 64 cycles, 1 ms ≈ 64 000.  Be generous.
-    reset.set_low();
-    cortex_m::asm::delay(64 * 200);          // ~200 µs
-    reset.set_high();
-    cortex_m::asm::delay(64_000 * 15);       // ~15 ms
+    // Reset pulse + post-reset wait now happen inside `Sx1262Radio::init()`,
+    // which uses `Timer::after` and `wait_busy` for the proper sequence.
 
     let radio0 = osrf_radio_sx126x::Sx1262Radio::new(
         spi_dev,
+        busy,
         dio1,
         reset,
         osrf_radio_sx126x::PinRfSwitch::new(txen, rxen),
