@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#![no_std]
+#![no_main]
+
+//! Milestone 4 link-layer bench, RX side, T114 deployment.
+//!
+//! Wires the T114 board's `radio0` + `status_led` into
+//! `osrf_app_link_bench::run_rx` with the [`DefmtLogSink`]: every accepted
+//! MIDI message is logged via defmt, and on watchdog expiry the link-lost
+//! event triggers a logged ALL_NOTES_OFF.
+//!
+//! When the MIDI FeatherWing arrives (Milestone 3 hardware), swap the
+//! `DefmtLogSink` import for a `BufferedUarteSink` (or equivalent) — no
+//! changes to `run_rx` itself.
+
+use embassy_executor::Spawner;
+use osrf_app_link_bench::{run_rx, synthetic::DefmtLogSink};
+use osrf_board_t114 as board;
+
+use defmt_rtt as _;
+use panic_probe as _;
+
+#[cortex_m_rt::pre_init]
+unsafe fn pre_init() {
+    board::bootloader_handoff();
+}
+
+#[embassy_executor::main]
+async fn main(_spawner: Spawner) {
+    let mut r = board::resources();
+    defmt::info!("OpenStageRF link bench RX — T114 starting");
+
+    let mut sink = DefmtLogSink;
+    run_rx(&mut r.radio0, &mut r.status_led, &mut sink).await
+}

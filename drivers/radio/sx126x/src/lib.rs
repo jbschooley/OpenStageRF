@@ -689,22 +689,30 @@ where
         }
     }
 
-    pub async fn rx_continuous(
+    /// One-time RX setup.  Puts the chip in continuous RX mode (timeout
+    /// 0xFFFFFF) and configures the packet length filter.  Idempotent —
+    /// safe to call again from RX mode (acts as a refresh).
+    ///
+    /// Call ONCE at the start of receive operation, then call
+    /// [`Self::rx_recv`] in a loop.  Don't go to standby between packets:
+    /// the ~400 µs of TX → RX transition time is enough to miss the next
+    /// packet on busy links.
+    pub async fn rx_start(&mut self) -> Result<(), RadioError<Reset, Switch>> {
+        self.switch.before_rx().await.map_err(Error::Switch)?;
+        self.write_packet_params(self.payload_max_len).await?;
+        self.cmd(CMD_CLEAR_IRQ_STATUS, &[0xFF, 0xFF]).await?;
+        self.cmd(CMD_SET_RX, &[0xFF, 0xFF, 0xFF]).await?;
+        Ok(())
+    }
+
+    /// Wait for the next packet.  Chip stays in continuous RX after.
+    /// Caller is responsible for `rx_start` once before the loop and
+    /// (eventually) calling some other state-changing method (`tx`,
+    /// `set_standby`, etc.) to leave RX.
+    pub async fn rx_recv(
         &mut self,
         buf: &mut [u8],
     ) -> Result<RxPacket, RadioError<Reset, Switch>> {
-        self.switch.before_rx().await.map_err(Error::Switch)?;
-
-        // Restore packet length to the configured max so any incoming
-        // frame is accepted.
-        self.write_packet_params(self.payload_max_len).await?;
-
-        // ClearIrqStatus(all).
-        self.cmd(CMD_CLEAR_IRQ_STATUS, &[0xFF, 0xFF]).await?;
-
-        // SetRx with timeout 0xFFFFFF (continuous, no timeout).
-        self.cmd(CMD_SET_RX, &[0xFF, 0xFF, 0xFF]).await?;
-
         self.dio1.wait_for_high().await.map_err(|_| Error::Bus)?;
 
         let irq = self.get_irq_raw().await?;
@@ -713,34 +721,44 @@ where
         let crc_err = irq & 0x0040 != 0; // bit 6
         let rx_done = irq & 0x0002 != 0; // bit 1
 
-        let result = if rx_done {
+        if rx_done {
             // GetRxBufferStatus: returns [status, payload_len, rx_start_buffer_pointer].
             let mut bs = [0u8; 2];
             self.cmd_read(CMD_GET_RX_BUFFER_STATUS, &[], &mut bs).await?;
             let payload_len = bs[0] as usize;
             let rx_start = bs[1];
             if payload_len > buf.len() {
-                Err(Error::BufferTooSmall)
-            } else {
-                self.read_buffer(rx_start, &mut buf[..payload_len]).await?;
-                // GetPacketStatus (FSK): [status, RxStatus, RssiSync, RssiAvg].
-                let mut ps = [0u8; 3];
-                self.cmd_read(CMD_GET_PACKET_STATUS, &[], &mut ps).await?;
-                let rssi_sync = ps[1]; // raw
-                let rssi_dbm = -((rssi_sync as i16) >> 1);
-                Ok(RxPacket {
-                    len: payload_len,
-                    rssi_dbm,
-                    snr_db: 0,
-                    crc_ok: !crc_err,
-                })
+                return Err(Error::BufferTooSmall);
             }
+            self.read_buffer(rx_start, &mut buf[..payload_len]).await?;
+            // GetPacketStatus (FSK): [status, RxStatus, RssiSync, RssiAvg].
+            let mut ps = [0u8; 3];
+            self.cmd_read(CMD_GET_PACKET_STATUS, &[], &mut ps).await?;
+            let rssi_sync = ps[1]; // raw
+            let rssi_dbm = -((rssi_sync as i16) >> 1);
+            Ok(RxPacket {
+                len: payload_len,
+                rssi_dbm,
+                snr_db: 0,
+                crc_ok: !crc_err,
+            })
         } else if crc_err {
             Err(Error::CrcMismatch)
         } else {
             Err(Error::UnexpectedIrq(irq))
-        };
+        }
+    }
 
+    /// One-shot convenience: `rx_start` + `rx_recv` + standby.  Useful for
+    /// occasional receive-then-do-something flows.  For high-rate continuous
+    /// reception, prefer the explicit `rx_start` / `rx_recv` loop, which
+    /// avoids the ~400 µs RX↔standby transition between packets.
+    pub async fn rx_continuous(
+        &mut self,
+        buf: &mut [u8],
+    ) -> Result<RxPacket, RadioError<Reset, Switch>> {
+        self.rx_start().await?;
+        let result = self.rx_recv(buf).await;
         self.switch.to_idle().await.map_err(Error::Switch)?;
         self.cmd(CMD_SET_STANDBY, &[0x00]).await?;
         result
