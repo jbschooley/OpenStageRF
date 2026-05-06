@@ -26,7 +26,7 @@
 //! `run_tx` itself.
 
 use embassy_executor::Spawner;
-use osrf_app_link_bench::{run_tx, synthetic::ScenarioSource};
+use osrf_app_link_bench::{run_tx, synthetic::ScenarioSource, LinkBenchConfig};
 use osrf_board_t114 as board;
 
 use defmt_rtt as _;
@@ -53,8 +53,19 @@ async fn main(_spawner: Spawner) {
     let boot_counter = read_random_u16();
     defmt::info!("boot_counter = {} (random per-boot)", boot_counter);
 
+    // RF + link-layer config.  Today: hardcoded default.  Future: load
+    // from flash so the UI can edit frequency / TX power / sync word.
+    let config = LinkBenchConfig::default_915();
+
     let mut source = ScenarioSource::new();
-    run_tx(&mut r.radio0, &mut r.status_led, &mut source, boot_counter).await
+    run_tx(
+        &mut r.radio0,
+        &mut r.status_led,
+        &mut source,
+        boot_counter,
+        &config,
+    )
+    .await
 }
 
 /// Pull two random bytes from the nRF52840 RNG peripheral and pack them

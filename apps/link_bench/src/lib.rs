@@ -37,29 +37,71 @@ use osrf_radio_sx126x::{
     GfskBandwidth, GfskPulseShape, RadioError, RfSwitchControl, Sx1262Radio,
 };
 
-// ── Bench radio config (matches radio_bench so packets interop) ─────────────
+// ── Bench config ────────────────────────────────────────────────────────────
 
-const RF_FREQUENCY_HZ: u32 = 915_000_000;
-const RF_BITRATE_BPS: u32 = 300_000;
-const RF_DEVIATION_HZ: u32 = 50_000;
-// Maximum TX power on the SX1262 is +22 dBm (HP PA mode).  At stage
-// distances (>1 m) path loss eats most of the link-budget headroom, so
-// we run flat-out for maximum range and interference robustness.  At
-// ~6 in benchtop with this power the RX front end is mildly saturated
-// (~−1 dBm at the antenna), causing ~3–6 % loss and occasional 200 ms
-// demod lockups; for benchtop testing drop to −9 dBm temporarily.
-const RF_TX_POWER_DBM: i8 = 22;
-const RF_PREAMBLE_BITS: u16 = 16;
-const RF_PAYLOAD_MAX: u8 = 64;
-const RF_SYNC_WORD: [u8; 4] = [0xC1, 0x94, 0xC1, 0x94];
+/// Compile-time maximum radio packet length.  Used to size the static
+/// wire / radio buffers.  The runtime payload length is set by
+/// [`LinkBenchConfig::payload_max`] and MUST be ≤ this.
+pub const RF_PAYLOAD_MAX: u8 = 64;
 
-// ── Link-layer config ───────────────────────────────────────────────────────
+/// All link-bench tunables in one struct.  RF parameters (frequency,
+/// modulation, sync word, TX power) and link-layer timing
+/// (watchdog/heartbeat) live here so they can come from a UI / flash
+/// store later without a function-signature break.
+///
+/// `RF_PAYLOAD_MAX` is intentionally NOT in this struct — it sizes
+/// compile-time-static buffers and changing it requires a recompile.
+/// The runtime `payload_max` field can be ≤ `RF_PAYLOAD_MAX` to use
+/// shorter framing if a future radio config requires it.
+#[derive(Debug, Clone, Copy)]
+pub struct LinkBenchConfig {
+    // ── RF (must match between TX and RX) ──
+    pub frequency_hz: u32,
+    pub bitrate_bps: u32,
+    pub deviation_hz: u32,
+    pub gfsk_bandwidth: GfskBandwidth,
+    pub pulse_shape: GfskPulseShape,
+    pub preamble_bits: u16,
+    pub payload_max: u8,
+    pub sync_word: [u8; 4],
 
-/// Receiver watchdog: 200 ms of silence → assume link lost.
-pub const WATCHDOG_MS: u64 = 200;
-/// Transmitter heartbeat: 10 ms idle → emit a Heartbeat packet.  20× margin
-/// against the receiver's 200 ms watchdog.
-pub const HEARTBEAT_MS: u64 = 10;
+    // ── TX-only knobs ──
+    /// SX1262 supports −9..=+22 dBm.  Use +22 for stage range; drop to
+    /// ~−9 for benchtop testing inside ~1 m or the receiver front end
+    /// gets saturated (~3–6 % loss + occasional demod lockups).
+    pub tx_power_dbm: i8,
+
+    // ── Link layer ──
+    /// Receiver watchdog timeout.  Default 200 ms — fires `all_notes_off`
+    /// on this much silence.
+    pub watchdog_ms: u64,
+    /// Idle-fill heartbeat interval.  Default 10 ms.  20× safety margin
+    /// against the 200 ms watchdog.
+    pub heartbeat_ms: u64,
+    // Reserved for future: KeyFp, AEAD cipher_id, frequency-hop table,
+    // device_id, paired-peer device id, etc.
+}
+
+impl LinkBenchConfig {
+    /// Default 915 MHz / 300 kbps GFSK / +22 dBm config — what every
+    /// existing T114 deployment uses today.  Use as the starting point
+    /// before passing into `configure_radio` / `run_tx` / `run_rx`.
+    pub const fn default_915() -> Self {
+        Self {
+            frequency_hz: 915_000_000,
+            bitrate_bps: 300_000,
+            deviation_hz: 50_000,
+            gfsk_bandwidth: GfskBandwidth::Bw4670,
+            pulse_shape: GfskPulseShape::Bt05,
+            preamble_bits: 16,
+            payload_max: RF_PAYLOAD_MAX,
+            sync_word: [0xC1, 0x94, 0xC1, 0x94],
+            tx_power_dbm: 22,
+            watchdog_ms: 200,
+            heartbeat_ms: 10,
+        }
+    }
+}
 
 // ── Source / Sink traits ─────────────────────────────────────────────────────
 
@@ -92,8 +134,13 @@ pub trait MidiSink {
 
 // ── Radio configuration shared by both ends ─────────────────────────────────
 
-async fn configure_radio<Spi, Busy, Dio1, Reset, Switch>(
+/// Apply a `LinkBenchConfig` to the radio.  Idempotent — safe to call
+/// again to update RF parameters at runtime (the chip enters and leaves
+/// standby per `set_*` call).  Caller must ensure no `radio.tx()` /
+/// `radio.rx_recv()` is in flight while this runs.
+pub async fn configure_radio<Spi, Busy, Dio1, Reset, Switch>(
     radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
+    config: &LinkBenchConfig,
 ) -> Result<(), RadioError<Reset, Switch>>
 where
     Spi: SpiDevice,
@@ -103,19 +150,24 @@ where
     Switch: RfSwitchControl,
 {
     radio.init().await?;
-    radio.set_frequency(RF_FREQUENCY_HZ).await?;
+    radio.set_frequency(config.frequency_hz).await?;
     radio
         .set_modulation_gfsk(
-            RF_BITRATE_BPS,
-            RF_DEVIATION_HZ,
-            GfskBandwidth::Bw4670,
-            GfskPulseShape::Bt05,
+            config.bitrate_bps,
+            config.deviation_hz,
+            config.gfsk_bandwidth,
+            config.pulse_shape,
         )
         .await?;
     radio
-        .set_packet_format(RF_PREAMBLE_BITS, &RF_SYNC_WORD, RF_PAYLOAD_MAX, true)
+        .set_packet_format(
+            config.preamble_bits,
+            &config.sync_word,
+            config.payload_max,
+            true,
+        )
         .await?;
-    radio.set_tx_power(RF_TX_POWER_DBM).await?;
+    radio.set_tx_power(config.tx_power_dbm).await?;
     radio.finish_init().await?;
     Ok(())
 }
@@ -124,13 +176,15 @@ where
 
 /// Run the TX side: consume MIDI messages from `source`, queue them with
 /// status-aware dedup + per-event seq, transmit packets via the credit-
-/// based round-robin queue.  When the queue is empty for `HEARTBEAT_MS`
-/// ms, send a `Heartbeat` instead so the receiver's watchdog stays fed.
+/// based round-robin queue.  When the queue is empty for
+/// `config.heartbeat_ms`, send a `Heartbeat` instead so the receiver's
+/// watchdog stays fed.
 pub async fn run_tx<Spi, Busy, Dio1, Reset, Switch, Led, Source>(
     radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
     led: &mut Led,
     source: &mut Source,
     boot_counter: u16,
+    config: &LinkBenchConfig,
 ) -> !
 where
     Spi: SpiDevice,
@@ -141,7 +195,7 @@ where
     Led: StatefulOutputPin,
     Source: MidiSource,
 {
-    if let Err(_) = configure_radio(radio).await {
+    if let Err(_) = configure_radio(radio, config).await {
         defmt::error!("link_bench TX: radio configure failed; halting");
         loop {
             Timer::after_millis(1000).await;
@@ -149,14 +203,14 @@ where
     }
     defmt::info!(
         "link_bench TX: {} Hz / {} bps GFSK / +{} dBm, boot_counter={}",
-        RF_FREQUENCY_HZ,
-        RF_BITRATE_BPS,
-        RF_TX_POWER_DBM,
+        config.frequency_hz,
+        config.bitrate_bps,
+        config.tx_power_dbm,
         boot_counter
     );
 
     let mut sender = LinkSender::no_crypto(boot_counter);
-    let mut hb = HeartbeatTimer::new(Duration::from_millis(HEARTBEAT_MS));
+    let mut hb = HeartbeatTimer::new(Duration::from_millis(config.heartbeat_ms));
     let mut queue = MidiTxQueue::new();
     let mut midi_buf = [0u8; 4];
     let mut body_buf = [0u8; MAX_BODY_LEN];
@@ -166,14 +220,17 @@ where
     let mut overflow_count: u32 = 0;
 
     loop {
+        let now = Instant::now();
+
         // 1. Drain any source events into the queue (non-blocking).
         //    `try_next` is sync and safe to call repeatedly; each event
         //    that's "due" right now goes into the queue with status-aware
-        //    dedup + a fresh event_seq.
+        //    dedup + a fresh event_seq.  NoteOff pushes also queue
+        //    delayed retransmit copies based on `now`.
         loop {
             match source.try_next(&mut midi_buf) {
                 Ok(Some(n)) => {
-                    if !queue.push_channel_voice(&midi_buf[..n]) {
+                    if !queue.push_channel_voice(&midi_buf[..n], now) {
                         overflow_count = overflow_count.wrapping_add(1);
                         defmt::error!(
                             "link_bench TX: queue overflow! dropping (overflows={})",
@@ -187,12 +244,11 @@ where
             }
         }
 
-        // 2. If the queue has anything, pop one packet's worth and TX.
-        //    The credit-based queue handles batching, priority, and
-        //    round-robin retransmits.  Each pop yields a fresh packet
-        //    with a new packet_seq; consumed events are requeued at the
-        //    back of their priority class until their credits exhaust.
-        if let Some(PoppedPacket { kind, body_len }) = queue.pop_packet(&mut body_buf) {
+        // 2. If the queue has anything eligible, pop one packet's worth
+        //    and TX.  The credit-based queue handles batching, priority,
+        //    round-robin retransmits, and time-spread NoteOff redundancy
+        //    (delayed copies stay queued until their `next_eligible`).
+        if let Some(PoppedPacket { kind, body_len }) = queue.pop_packet(now, &mut body_buf) {
             let event_type = match kind {
                 QueueKind::ChannelVoice => EventType::ChannelVoice,
                 QueueKind::SysExFragment => EventType::SysExFragment,
@@ -223,7 +279,7 @@ where
             }
         }
 
-        // Send heartbeat (single copy — next one is ≤ HEARTBEAT_MS away).
+        // Send heartbeat (single copy — next one is ≤ heartbeat_ms away).
         match sender.encode(EventType::Heartbeat, &[], &mut wire_buf) {
             Ok(wire_n) => {
                 if let Err(_) = radio.tx(&wire_buf[..wire_n]).await {
@@ -266,6 +322,7 @@ pub async fn run_rx<Spi, Busy, Dio1, Reset, Switch, Led, Sink>(
     radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
     led: &mut Led,
     sink: &mut Sink,
+    config: &LinkBenchConfig,
 ) -> !
 where
     Spi: SpiDevice,
@@ -276,7 +333,7 @@ where
     Led: StatefulOutputPin,
     Sink: MidiSink,
 {
-    if let Err(_) = configure_radio(radio).await {
+    if let Err(_) = configure_radio(radio, config).await {
         defmt::error!("link_bench RX: radio configure failed; halting");
         loop {
             Timer::after_millis(1000).await;
@@ -290,13 +347,13 @@ where
     }
     defmt::info!(
         "link_bench RX: listening on {} Hz / {} bps GFSK, watchdog={}ms",
-        RF_FREQUENCY_HZ,
-        RF_BITRATE_BPS,
-        WATCHDOG_MS
+        config.frequency_hz,
+        config.bitrate_bps,
+        config.watchdog_ms
     );
 
     let mut receiver = LinkReceiver::no_crypto();
-    let mut wd = WatchdogTimer::new(Duration::from_millis(WATCHDOG_MS));
+    let mut wd = WatchdogTimer::new(Duration::from_millis(config.watchdog_ms));
     let mut radio_buf = [0u8; RF_PAYLOAD_MAX as usize];
     let mut accepted: u32 = 0;
     let mut accepted_heartbeats: u32 = 0;
@@ -305,7 +362,7 @@ where
     let mut dropped: u32 = 0;
     let mut crc_mismatch: u32 = 0;
     let mut last_stats_log = Instant::now();
-    let stats_interval = Duration::from_secs(5);
+    let stats_interval = Duration::from_secs(1);
     let mut prev_midi: u32 = 0;
     let mut prev_hb: u32 = 0;
     let mut prev_accepted: u32 = 0;
@@ -406,7 +463,7 @@ where
                     link_up = false;
                     defmt::warn!(
                         "link_bench RX: LINK LOST (no packet for {}ms) → all-notes-off",
-                        WATCHDOG_MS
+                        config.watchdog_ms
                     );
                     if let Err(_) = sink.all_notes_off().await {
                         defmt::error!("sink all_notes_off failed");
@@ -454,7 +511,7 @@ where
                 _ => (0, 0),
             };
             defmt::info!(
-                "RX last5s: pkts={}/{} loss={}.{}% midi_ev={} hb={} drop={} crc_err={} | total: pkts={} midi_ev={} hb={} sysex={} drop={} crc_err={}",
+                "RX last1s: pkts={}/{} loss={}.{}% midi_ev={} hb={} drop={} crc_err={} | total: pkts={} midi_ev={} hb={} sysex={} drop={} crc_err={}",
                 d_accepted,
                 tx_count,
                 loss_x10 / 10,
