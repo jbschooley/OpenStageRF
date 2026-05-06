@@ -36,6 +36,7 @@
 //! intervening NoteOff) also aren't deduped — those are legitimate
 //! re-strikes with potentially different velocity.  Same for two NoteOffs.
 
+use embassy_time::{Duration, Instant};
 use heapless::Vec;
 use osrf_protocols_midi_v1::MAX_FRAG_DATA_BYTES;
 
@@ -61,6 +62,22 @@ pub const DEFAULT_CREDITS: u8 = 3;
 /// Maximum bytes per stored MIDI message.  Channel-voice is 1–3 bytes;
 /// 4 leaves headroom for short System-Common messages.
 pub const MAX_MSG_BYTES: usize = 4;
+
+/// Time-spread NoteOff retransmits.  In addition to the K=3 immediate
+/// retransmit through the main entry (default credit-based round-robin
+/// delivery in ~3 ms), each NoteOff push also queues a single extra
+/// copy at each of these offsets.  This protects against bursty RF
+/// interference up to ~30 ms long taking out all three immediate
+/// copies — the +30 ms or +60 ms delayed copy survives.  Both delayed
+/// copies share the original NoteOff's `event_seq` so the receiver's
+/// replay window dedups them; the sink fires NoteOff exactly once.
+///
+/// Cancellation: a subsequent NoteOn for the same (channel, note) runs
+/// `dedup_for_incoming`, which scans the queue for any NoteOff matching
+/// that note and removes it — including the delayed copies.  So a
+/// rapid release-then-restrike doesn't fire stray NoteOffs after the
+/// new NoteOn.
+pub const NOTE_OFF_DELAYED_RETRANSMITS_MS: &[u32] = &[30, 60];
 
 /// Discriminates queue entry kinds.  Pop_packet only batches entries of
 /// the same kind (channel-voice events never bundle with SysEx fragments).
@@ -89,6 +106,11 @@ struct Entry {
     priority: u8,
     credits: u8,
     payload: EntryPayload,
+    /// Earliest time this entry is eligible to be popped.  `None` means
+    /// "always eligible".  Used by the time-spread NoteOff retransmits:
+    /// the +30 ms and +60 ms copies have `next_eligible` set so they
+    /// stay in the queue but don't pop until their time arrives.
+    next_eligible: Option<Instant>,
 }
 
 impl Entry {
@@ -96,6 +118,13 @@ impl Entry {
         match &self.payload {
             EntryPayload::ChannelVoice { .. } => QueueKind::ChannelVoice,
             EntryPayload::SysExFragment { .. } => QueueKind::SysExFragment,
+        }
+    }
+
+    fn is_eligible(&self, now: Instant) -> bool {
+        match self.next_eligible {
+            None => true,
+            Some(due) => now >= due,
         }
     }
 }
@@ -138,7 +167,11 @@ impl MidiTxQueue {
     /// assigns a fresh `event_seq`, inserts by priority + FIFO.  Returns
     /// `false` if the queue is full.  Empty / oversize messages are
     /// silently ignored.
-    pub fn push_channel_voice(&mut self, midi: &[u8]) -> bool {
+    ///
+    /// `now` is the current `embassy_time::Instant`, used to schedule
+    /// the time-spread NoteOff retransmit copies (see
+    /// [`NOTE_OFF_DELAYED_RETRANSMITS_MS`]).
+    pub fn push_channel_voice(&mut self, midi: &[u8], now: Instant) -> bool {
         if midi.is_empty() || midi.len() > MAX_MSG_BYTES {
             return false;
         }
@@ -162,12 +195,44 @@ impl MidiTxQueue {
         let mut bytes: Vec<u8, MAX_MSG_BYTES> = Vec::new();
         // SAFETY: midi.len() <= MAX_MSG_BYTES (checked above).
         let _ = bytes.extend_from_slice(midi);
-        self.insert_by_priority(Entry {
-            priority,
-            credits,
-            payload: EntryPayload::ChannelVoice { event_seq, midi: bytes },
-        })
-        .is_ok()
+        let main_ok = self
+            .insert_by_priority(Entry {
+                priority,
+                credits,
+                payload: EntryPayload::ChannelVoice {
+                    event_seq,
+                    midi: bytes.clone(),
+                },
+                next_eligible: None,
+            })
+            .is_ok();
+
+        // For NoteOff specifically (status nibble 0x80), queue extra
+        // delayed copies that fire later in time.  This protects against
+        // bursty interference taking out all 3 immediate retransmits.
+        // All delayed copies share the SAME `event_seq` as the main
+        // entry — the receiver's replay window dedups them, so the sink
+        // still fires NoteOff exactly once.
+        //
+        // If the queue is full when adding a delayed copy, we silently
+        // skip it — the main K=3 still ships and is the primary
+        // delivery guarantee.
+        if main_ok && status & 0xF0 == 0x80 {
+            for &delay_ms in NOTE_OFF_DELAYED_RETRANSMITS_MS {
+                let due = now + Duration::from_millis(delay_ms as u64);
+                let _ = self.insert_by_priority(Entry {
+                    priority,
+                    credits: 1,
+                    payload: EntryPayload::ChannelVoice {
+                        event_seq,
+                        midi: bytes.clone(),
+                    },
+                    next_eligible: Some(due),
+                });
+            }
+        }
+
+        main_ok
     }
 
     /// Fragment a complete SysEx body (without F0/F7) and queue all
@@ -198,6 +263,7 @@ impl MidiTxQueue {
                     frag_total,
                     data,
                 },
+                next_eligible: None,
             });
         }
         Some(sysex_id)
@@ -207,23 +273,38 @@ impl MidiTxQueue {
     /// priority AND kind.  Writes the body bytes to `out` and returns
     /// `(kind, len)`.  Consumed entries are decremented; survivors
     /// (credits > 0) are requeued at the back of their priority class.
-    /// Returns `None` if the queue is empty.
+    /// Returns `None` if no eligible entries are in the queue at `now`.
+    ///
+    /// `now` is the current `embassy_time::Instant`; entries with a
+    /// future `next_eligible` are skipped (they wait their turn — see
+    /// [`NOTE_OFF_DELAYED_RETRANSMITS_MS`]).
     ///
     /// Body format:
     /// * `ChannelVoice`: `[event_seq:2][midi:1..3] [event_seq:2][midi:1..3] ...`
     /// * `SysExFragment`: `[sysex_id:2][frag_idx:1][frag_total:1][data]`
     ///   (always exactly one fragment per packet)
-    pub fn pop_packet(&mut self, out: &mut [u8]) -> Option<PoppedPacket> {
-        let front = self.entries.first()?;
-        let target_priority = front.priority;
-        let target_kind = front.kind();
+    pub fn pop_packet(&mut self, now: Instant, out: &mut [u8]) -> Option<PoppedPacket> {
+        // Find the first eligible entry — that establishes the priority
+        // and kind we'll batch in this packet.  Ineligible entries
+        // (delayed retransmits not yet due) are silently skipped; they
+        // remain in the queue for a later pop.
+        let pivot = self.entries.iter().position(|e| e.is_eligible(now))?;
+        let target_priority = self.entries[pivot].priority;
+        let target_kind = self.entries[pivot].kind();
         let mut written = 0usize;
-        let mut consumed_count = 0usize;
+        let mut consumed_indices: Vec<usize, QUEUE_CAPACITY> = Vec::new();
 
-        // Walk consecutive entries that match priority + kind.
-        for entry in self.entries.iter() {
+        // Walk forward from the pivot.  Take eligible entries that share
+        // priority + kind.  Skip ineligible same-priority+kind entries
+        // (they stay in the queue).  Stop on priority/kind change — that
+        // marks the end of the current "batch class".
+        for i in pivot..self.entries.len() {
+            let entry = &self.entries[i];
             if entry.priority != target_priority || entry.kind() != target_kind {
                 break;
+            }
+            if !entry.is_eligible(now) {
+                continue;
             }
             let needed = match &entry.payload {
                 EntryPayload::ChannelVoice { midi, .. } => 2 + midi.len(),
@@ -250,7 +331,7 @@ impl MidiTxQueue {
                 }
             }
             written += needed;
-            consumed_count += 1;
+            let _ = consumed_indices.push(i);
 
             // SysEx is always one fragment per packet.
             if matches!(target_kind, QueueKind::SysExFragment) {
@@ -258,24 +339,25 @@ impl MidiTxQueue {
             }
         }
 
-        if consumed_count == 0 {
+        if consumed_indices.is_empty() {
             return None;
         }
 
         // Decrement credits and split into "still alive" vs "drained".
-        // Walk in reverse so removals don't shift earlier indices.
+        // Remove from highest index to lowest so earlier indices stay
+        // valid during the loop.  Then reverse the collected survivors
+        // so they're re-inserted in their original consumption order
+        // (oldest first), preserving FIFO at the back of the priority
+        // class — important for round-robin retransmit behavior.
         let mut requeue: Vec<Entry, QUEUE_CAPACITY> = Vec::new();
-        for _ in 0..consumed_count {
-            let mut entry = self.entries.remove(0);
+        for &idx in consumed_indices.iter().rev() {
+            let mut entry = self.entries.remove(idx);
             entry.credits = entry.credits.saturating_sub(1);
             if entry.credits > 0 {
                 let _ = requeue.push(entry);
             }
         }
-        // Re-insert survivors at the back of their priority class.  They
-        // were originally consecutive at the same priority, so we can
-        // batch-insert by walking from front.
-        for entry in requeue {
+        for entry in requeue.into_iter().rev() {
             let _ = self.insert_by_priority(entry);
         }
 
@@ -283,6 +365,37 @@ impl MidiTxQueue {
             kind: target_kind,
             body_len: written,
         })
+    }
+
+    /// Earliest time at which `pop_packet` could plausibly produce a
+    /// packet, based on the next_eligible deadlines of currently-queued
+    /// entries.  `Some(deadline)` if some entries are queued but all
+    /// ineligible (so a later `pop_packet(now)` will succeed once `now`
+    /// reaches the deadline).  `None` if the queue is empty or has at
+    /// least one entry already eligible.  Used by `run_tx` to decide
+    /// how long to wait before retrying.
+    pub fn next_eligibility(&self) -> Option<Instant> {
+        let mut earliest: Option<Instant> = None;
+        let mut any_eligible = false;
+        for e in self.entries.iter() {
+            match e.next_eligible {
+                None => {
+                    any_eligible = true;
+                    break;
+                }
+                Some(due) => {
+                    earliest = Some(match earliest {
+                        Some(prev) if prev < due => prev,
+                        _ => due,
+                    });
+                }
+            }
+        }
+        if any_eligible {
+            None
+        } else {
+            earliest
+        }
     }
 
     fn alloc_event_seq(&mut self) -> u16 {
@@ -351,16 +464,34 @@ impl Default for MidiTxQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use osrf_protocols_midi_v1::{ChannelVoiceIter, parse_sysex_fragment};
+    use osrf_protocols_midi_v1::{parse_sysex_fragment, ChannelVoiceIter};
 
-    /// Helper: drain all packets, returning a Vec of (kind, body_bytes).
-    fn drain(q: &mut MidiTxQueue) -> std::vec::Vec<(QueueKind, std::vec::Vec<u8>)> {
+    /// Reference time for tests that don't care about the time-spread
+    /// NoteOff retransmits.  At `T0`, only the immediate-eligible
+    /// (`next_eligible: None`) entries pop — the +30 ms / +60 ms NoteOff
+    /// copies stay in the queue.  Tests that need to drain those use
+    /// `T_FAR_FUTURE`.
+    const T0: Instant = Instant::from_ticks(0);
+    /// "Pop everything" sentinel — far enough in the future that every
+    /// queued entry is eligible.  Used by the legacy tests via
+    /// `drain_at(q, T_FAR_FUTURE)` so the addition of delayed NoteOff
+    /// copies doesn't change their packet counts.
+    const T_FAR_FUTURE: Instant = Instant::from_ticks(1_000_000_000);
+
+    /// Helper: drain all eligible packets at `now`, returning a Vec of
+    /// (kind, body_bytes).
+    fn drain_at(q: &mut MidiTxQueue, now: Instant) -> std::vec::Vec<(QueueKind, std::vec::Vec<u8>)> {
         let mut out = std::vec::Vec::new();
         let mut buf = [0u8; 64];
-        while let Some(pkt) = q.pop_packet(&mut buf) {
+        while let Some(pkt) = q.pop_packet(now, &mut buf) {
             out.push((pkt.kind, buf[..pkt.body_len].to_vec()));
         }
         out
+    }
+
+    /// Drain at `T_FAR_FUTURE` so all delayed retransmits also fire.
+    fn drain(q: &mut MidiTxQueue) -> std::vec::Vec<(QueueKind, std::vec::Vec<u8>)> {
+        drain_at(q, T_FAR_FUTURE)
     }
 
     /// Decode one ChannelVoice packet body into a Vec of (event_seq, midi_bytes).
@@ -378,9 +509,9 @@ mod tests {
     #[test]
     fn chord_batches_into_one_packet() {
         let mut q = MidiTxQueue::new();
-        assert!(q.push_channel_voice(&[0x90, 60, 100]));
-        assert!(q.push_channel_voice(&[0x90, 64, 100]));
-        assert!(q.push_channel_voice(&[0x90, 67, 100]));
+        assert!(q.push_channel_voice(&[0x90, 60, 100], T0));
+        assert!(q.push_channel_voice(&[0x90, 64, 100], T0));
+        assert!(q.push_channel_voice(&[0x90, 67, 100], T0));
         let packets = drain(&mut q);
         // Drained means K=3 retransmits — three packets, each with all
         // three notes (same event_seqs across copies).
@@ -407,18 +538,18 @@ mod tests {
     #[test]
     fn realtime_preempts_chord() {
         let mut q = MidiTxQueue::new();
-        q.push_channel_voice(&[0x90, 60, 100]);
-        q.push_channel_voice(&[0x90, 64, 100]);
-        q.push_channel_voice(&[0x90, 67, 100]);
-        q.push_channel_voice(&[0xF8]); // Timing Clock — preempts everything
+        q.push_channel_voice(&[0x90, 60, 100], T0);
+        q.push_channel_voice(&[0x90, 64, 100], T0);
+        q.push_channel_voice(&[0x90, 67, 100], T0);
+        q.push_channel_voice(&[0xF8], T0); // Timing Clock — preempts everything
         let mut buf = [0u8; 64];
         // First pop: TC alone (real-time priority is its own batch).
-        let pkt = q.pop_packet(&mut buf).unwrap();
+        let pkt = q.pop_packet(T0, &mut buf).unwrap();
         let events = decode_cv(&buf[..pkt.body_len]);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].1, vec![0xF8]);
         // Second pop: chord at REGULAR_PRIORITY.
-        let pkt = q.pop_packet(&mut buf).unwrap();
+        let pkt = q.pop_packet(T0, &mut buf).unwrap();
         let events = decode_cv(&buf[..pkt.body_len]);
         assert_eq!(events.len(), 3);
     }
@@ -427,18 +558,18 @@ mod tests {
     fn empty_queue_pops_none() {
         let mut q = MidiTxQueue::new();
         let mut buf = [0u8; 64];
-        assert!(q.pop_packet(&mut buf).is_none());
+        assert!(q.pop_packet(T0, &mut buf).is_none());
     }
 
     #[test]
     fn buffer_too_small_takes_partial_batch() {
         let mut q = MidiTxQueue::new();
-        q.push_channel_voice(&[0x90, 60, 100]);
-        q.push_channel_voice(&[0x90, 64, 100]);
-        q.push_channel_voice(&[0x90, 67, 100]);
+        q.push_channel_voice(&[0x90, 60, 100], T0);
+        q.push_channel_voice(&[0x90, 64, 100], T0);
+        q.push_channel_voice(&[0x90, 67, 100], T0);
         // 11 bytes fits 2 events (5 + 5 = 10, third would need 5 more).
         let mut buf = [0u8; 11];
-        let pkt = q.pop_packet(&mut buf).unwrap();
+        let pkt = q.pop_packet(T0, &mut buf).unwrap();
         let events = decode_cv(&buf[..pkt.body_len]);
         assert_eq!(events.len(), 2);
     }
@@ -448,7 +579,7 @@ mod tests {
     #[test]
     fn each_event_transmits_default_credits_times() {
         let mut q = MidiTxQueue::new();
-        q.push_channel_voice(&[0x90, 60, 100]);
+        q.push_channel_voice(&[0x90, 60, 100], T0);
         let packets = drain(&mut q);
         assert_eq!(packets.len(), DEFAULT_CREDITS as usize);
         // Each retransmit has the same event_seq.
@@ -462,12 +593,12 @@ mod tests {
     #[test]
     fn new_event_after_pop_goes_to_back() {
         let mut q = MidiTxQueue::new();
-        q.push_channel_voice(&[0x90, 60, 100]); // C, seq=N
+        q.push_channel_voice(&[0x90, 60, 100], T0); // C, seq=N
         let mut buf = [0u8; 64];
-        let _ = q.pop_packet(&mut buf).unwrap(); // C copy 1, C now at K=2
-        q.push_channel_voice(&[0x90, 64, 100]); // E, seq=N+1, behind C
+        let _ = q.pop_packet(T0, &mut buf).unwrap(); // C copy 1, C now at K=2
+        q.push_channel_voice(&[0x90, 64, 100], T0); // E, seq=N+1, behind C
         // Next pop batches both C(K=2) and E(K=3) since same priority+kind.
-        let pkt = q.pop_packet(&mut buf).unwrap();
+        let pkt = q.pop_packet(T0, &mut buf).unwrap();
         let events = decode_cv(&buf[..pkt.body_len]);
         assert_eq!(events.len(), 2);
         // Order: C first (older), E second.
@@ -480,9 +611,9 @@ mod tests {
     #[test]
     fn note_off_cancels_pending_note_on_in_queue() {
         let mut q = MidiTxQueue::new();
-        q.push_channel_voice(&[0x90, 60, 100]); // NoteOn C
-        q.push_channel_voice(&[0x90, 64, 100]); // NoteOn E
-        q.push_channel_voice(&[0x80, 60, 0]); // NoteOff C — cancels NoteOn C
+        q.push_channel_voice(&[0x90, 60, 100], T0); // NoteOn C
+        q.push_channel_voice(&[0x90, 64, 100], T0); // NoteOn E
+        q.push_channel_voice(&[0x80, 60, 0], T0); // NoteOff C — cancels NoteOn C
         let packets = drain(&mut q);
         // Inspect first packet — NoteOn C must be absent.
         let first_events = decode_cv(&packets[0].1);
@@ -497,10 +628,10 @@ mod tests {
         // The key correctness property: cancel works EVEN AFTER the
         // NoteOn has been popped once (it's still in the queue at K=2).
         let mut q = MidiTxQueue::new();
-        q.push_channel_voice(&[0x90, 60, 100]);
+        q.push_channel_voice(&[0x90, 60, 100], T0);
         let mut buf = [0u8; 64];
-        let _ = q.pop_packet(&mut buf).unwrap(); // first transmit, K=2 left
-        q.push_channel_voice(&[0x80, 60, 0]); // cancel
+        let _ = q.pop_packet(T0, &mut buf).unwrap(); // first transmit, K=2 left
+        q.push_channel_voice(&[0x80, 60, 0], T0); // cancel
         let packets = drain(&mut q);
         // None of the remaining packets should contain NoteOn C.
         for (_, body) in &packets {
@@ -527,8 +658,8 @@ mod tests {
     #[test]
     fn note_on_cancels_pending_note_off_same_note() {
         let mut q = MidiTxQueue::new();
-        q.push_channel_voice(&[0x80, 60, 0]); // NoteOff C
-        q.push_channel_voice(&[0x90, 60, 100]); // NoteOn C — cancels NoteOff
+        q.push_channel_voice(&[0x80, 60, 0], T0); // NoteOff C
+        q.push_channel_voice(&[0x90, 60, 100], T0); // NoteOn C — cancels NoteOff
         let packets = drain(&mut q);
         for (_, body) in &packets {
             for (_, midi) in decode_cv(body) {
@@ -540,9 +671,9 @@ mod tests {
     #[test]
     fn cc_overrides_pending_cc_same_controller() {
         let mut q = MidiTxQueue::new();
-        q.push_channel_voice(&[0xB0, 7, 50]); // Volume 50
-        q.push_channel_voice(&[0xB0, 7, 90]); // Volume 90 — cancels 50
-        q.push_channel_voice(&[0xB0, 64, 127]); // Sustain — different ctrl, kept
+        q.push_channel_voice(&[0xB0, 7, 50], T0); // Volume 50
+        q.push_channel_voice(&[0xB0, 7, 90], T0); // Volume 90 — cancels 50
+        q.push_channel_voice(&[0xB0, 64, 127], T0); // Sustain — different ctrl, kept
         let packets = drain(&mut q);
         for (_, body) in &packets {
             for (_, midi) in decode_cv(body) {
@@ -556,8 +687,8 @@ mod tests {
     #[test]
     fn pitch_bend_overrides_pending_pitch_bend() {
         let mut q = MidiTxQueue::new();
-        q.push_channel_voice(&[0xE0, 0, 64]);
-        q.push_channel_voice(&[0xE0, 0x40, 0x70]);
+        q.push_channel_voice(&[0xE0, 0, 64], T0);
+        q.push_channel_voice(&[0xE0, 0x40, 0x70], T0);
         let packets = drain(&mut q);
         for (_, body) in &packets {
             for (_, midi) in decode_cv(body) {
@@ -572,8 +703,8 @@ mod tests {
     fn note_on_not_deduped_against_other_note_on() {
         // Re-strike: same note pressed twice without intervening NoteOff.
         let mut q = MidiTxQueue::new();
-        q.push_channel_voice(&[0x90, 60, 100]);
-        q.push_channel_voice(&[0x90, 60, 100]);
+        q.push_channel_voice(&[0x90, 60, 100], T0);
+        q.push_channel_voice(&[0x90, 60, 100], T0);
         let packets = drain(&mut q);
         // Both events present in each packet.
         let events = decode_cv(&packets[0].1);
@@ -587,8 +718,8 @@ mod tests {
     #[test]
     fn different_channels_dont_interfere() {
         let mut q = MidiTxQueue::new();
-        q.push_channel_voice(&[0xB0, 7, 50]); // ch 0
-        q.push_channel_voice(&[0xB1, 7, 90]); // ch 1
+        q.push_channel_voice(&[0xB0, 7, 50], T0); // ch 0
+        q.push_channel_voice(&[0xB1, 7, 90], T0); // ch 1
         let packets = drain(&mut q);
         let events = decode_cv(&packets[0].1);
         assert_eq!(events.len(), 2);
@@ -600,10 +731,10 @@ mod tests {
     fn timing_clocks_dont_dedup() {
         let mut q = MidiTxQueue::new();
         for _ in 0..3 {
-            q.push_channel_voice(&[0xF8]);
+            q.push_channel_voice(&[0xF8], T0);
         }
         let mut buf = [0u8; 64];
-        let pkt = q.pop_packet(&mut buf).unwrap();
+        let pkt = q.pop_packet(T0, &mut buf).unwrap();
         let events = decode_cv(&buf[..pkt.body_len]);
         // Three TCs all batched at REALTIME_PRIORITY, distinct event_seqs.
         assert_eq!(events.len(), 3);
@@ -622,7 +753,7 @@ mod tests {
         let body = [0x7E, 0x7F, 0x06, 0x01]; // GM Inquiry
         let id = q.push_sysex(&body).unwrap();
         let mut buf = [0u8; 64];
-        let pkt = q.pop_packet(&mut buf).unwrap();
+        let pkt = q.pop_packet(T0, &mut buf).unwrap();
         assert_eq!(pkt.kind, QueueKind::SysExFragment);
         let parts = parse_sysex_fragment(&buf[..pkt.body_len]).unwrap();
         assert_eq!(parts.sysex_id, id);
@@ -642,7 +773,7 @@ mod tests {
         // Drain first round (one fragment per packet).
         let mut seen_idxs = std::vec::Vec::new();
         loop {
-            let Some(pkt) = q.pop_packet(&mut buf) else { break };
+            let Some(pkt) = q.pop_packet(T0, &mut buf) else { break };
             assert_eq!(pkt.kind, QueueKind::SysExFragment);
             let parts = parse_sysex_fragment(&buf[..pkt.body_len]).unwrap();
             assert_eq!(parts.sysex_id, id);
@@ -662,28 +793,249 @@ mod tests {
     fn channel_voice_preempts_sysex() {
         let mut q = MidiTxQueue::new();
         q.push_sysex(&[0x7E, 0x7F]);
-        q.push_channel_voice(&[0x90, 60, 100]);
+        q.push_channel_voice(&[0x90, 60, 100], T0);
         let mut buf = [0u8; 64];
         // First pop: ChannelVoice (REGULAR_PRIORITY > SYSEX_PRIORITY).
-        let pkt = q.pop_packet(&mut buf).unwrap();
+        let pkt = q.pop_packet(T0, &mut buf).unwrap();
         assert_eq!(pkt.kind, QueueKind::ChannelVoice);
     }
 
     #[test]
     fn sysex_doesnt_bundle_with_channel_voice() {
         let mut q = MidiTxQueue::new();
-        q.push_channel_voice(&[0x90, 60, 100]);
+        q.push_channel_voice(&[0x90, 60, 100], T0);
         q.push_sysex(&[0x7E, 0x7F]);
         let mut buf = [0u8; 64];
-        let pkt = q.pop_packet(&mut buf).unwrap();
+        let pkt = q.pop_packet(T0, &mut buf).unwrap();
         assert_eq!(pkt.kind, QueueKind::ChannelVoice); // CV first
-        let pkt = q.pop_packet(&mut buf).unwrap();
+        let pkt = q.pop_packet(T0, &mut buf).unwrap();
         // Eventually CV's K=3 finishes and SysEx pops.
         if pkt.kind == QueueKind::ChannelVoice {
             // Drain remaining CV retransmits.
-            let _ = q.pop_packet(&mut buf);
-            let pkt = q.pop_packet(&mut buf).unwrap();
+            let _ = q.pop_packet(T0, &mut buf);
+            let pkt = q.pop_packet(T0, &mut buf).unwrap();
             assert_eq!(pkt.kind, QueueKind::SysExFragment);
+        }
+    }
+
+    // ── Time-spread NoteOff retransmits ──────────────────────────────────
+
+    #[test]
+    fn note_off_pushes_main_plus_delayed_copies() {
+        let mut q = MidiTxQueue::new();
+        q.push_channel_voice(&[0x80, 60, 0], T0);
+        // 1 main entry + 2 delayed copies = 3 entries in the queue.
+        assert_eq!(q.len(), 3);
+    }
+
+    #[test]
+    fn delayed_note_off_copies_dont_pop_before_their_time() {
+        let mut q = MidiTxQueue::new();
+        q.push_channel_voice(&[0x80, 60, 0], T0);
+        // At T0, only the main entry's K=3 retransmits are eligible.
+        // Drain those 3 and the queue should return None — the delayed
+        // copies are still ineligible.
+        let packets = drain_at(&mut q, T0);
+        assert_eq!(packets.len(), 3, "expected K=3 main retransmits at T0");
+        assert!(!q.is_empty(), "delayed copies should still be queued");
+        assert_eq!(q.len(), 2, "exactly 2 delayed copies left");
+    }
+
+    #[test]
+    fn delayed_note_off_copies_fire_after_their_deadline() {
+        let mut q = MidiTxQueue::new();
+        q.push_channel_voice(&[0x80, 60, 0], T0);
+        // Drain main K=3 at T0.
+        let _ = drain_at(&mut q, T0);
+        assert_eq!(q.len(), 2);
+
+        // At T0 + 30 ms, the +30 ms delayed copy is eligible.  Pop it.
+        let t30 = T0 + Duration::from_millis(30);
+        let packets = drain_at(&mut q, t30);
+        assert_eq!(packets.len(), 1, "+30 ms delayed copy fires");
+        assert_eq!(q.len(), 1, "the +60 ms copy still pending");
+
+        // At T0 + 60 ms, the +60 ms copy is eligible too.
+        let t60 = T0 + Duration::from_millis(60);
+        let packets = drain_at(&mut q, t60);
+        assert_eq!(packets.len(), 1, "+60 ms delayed copy fires");
+        assert!(q.is_empty(), "all NoteOff copies drained");
+    }
+
+    #[test]
+    fn delayed_note_off_copies_share_event_seq_with_main() {
+        // All 5 wire packets (K=3 main + 2 delayed) carry the SAME
+        // event_seq so the receiver's replay window dedups them and the
+        // sink fires NoteOff exactly once.
+        let mut q = MidiTxQueue::new();
+        q.push_channel_voice(&[0x80, 60, 0], T0);
+
+        let mut buf = [0u8; 64];
+        // First pop: main K=3 → K=2.
+        let pkt = q.pop_packet(T0, &mut buf).unwrap();
+        let main_seq = decode_cv(&buf[..pkt.body_len])[0].0;
+
+        // Drain rest of main retransmits at T0.
+        let _ = drain_at(&mut q, T0); // main K=2, K=1
+
+        // Pop the +30 ms delayed copy in isolation.
+        let t30 = T0 + Duration::from_millis(30);
+        let pkt30 = q.pop_packet(t30, &mut buf).unwrap();
+        let events_30 = decode_cv(&buf[..pkt30.body_len]);
+        assert_eq!(events_30.len(), 1);
+        assert_eq!(events_30[0].0, main_seq, "+30 ms copy must share event_seq");
+        assert_eq!(events_30[0].1, vec![0x80, 60, 0]);
+
+        // Pop the +60 ms delayed copy.
+        let t60 = T0 + Duration::from_millis(60);
+        let pkt60 = q.pop_packet(t60, &mut buf).unwrap();
+        let events_60 = decode_cv(&buf[..pkt60.body_len]);
+        assert_eq!(events_60.len(), 1);
+        assert_eq!(events_60[0].0, main_seq, "+60 ms copy must share event_seq");
+        assert_eq!(events_60[0].1, vec![0x80, 60, 0]);
+    }
+
+    #[test]
+    fn note_on_cancels_pending_delayed_note_off_copies() {
+        // Rapid release-then-restrike: NoteOff queues main + 2 delayed.
+        // A NoteOn for the same note before the delayed copies fire
+        // must remove them — otherwise a delayed NoteOff would arrive
+        // at the receiver AFTER the NoteOn and turn the new strike off.
+        let mut q = MidiTxQueue::new();
+        q.push_channel_voice(&[0x80, 60, 0], T0); // NoteOff C
+        assert_eq!(q.len(), 3);
+
+        // Drain main K=3 (the NoteOff packets that already went out).
+        let _ = drain_at(&mut q, T0);
+        assert_eq!(q.len(), 2, "delayed copies still pending");
+
+        // Restrike before the delayed NoteOffs fire.
+        q.push_channel_voice(&[0x90, 60, 100], T0); // NoteOn C
+        assert_eq!(
+            q.len(),
+            1,
+            "delayed NoteOffs should be cancelled, only NoteOn left"
+        );
+
+        // Drain everything at far future — only the NoteOn copies fire.
+        let packets = drain_at(&mut q, T_FAR_FUTURE);
+        for (_, body) in &packets {
+            for (_, midi) in decode_cv(body) {
+                assert_ne!(
+                    midi,
+                    vec![0x80, 60, 0],
+                    "stale delayed NoteOff survived NoteOn restrike"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn note_on_for_different_note_doesnt_cancel_delayed_note_off() {
+        // NoteOff C queues delayed copies.  NoteOn for E (different
+        // note) must NOT cancel them — they're for note 60.
+        let mut q = MidiTxQueue::new();
+        q.push_channel_voice(&[0x80, 60, 0], T0); // NoteOff C
+        let _ = drain_at(&mut q, T0); // main K=3
+        assert_eq!(q.len(), 2, "delayed NoteOff C copies still pending");
+
+        q.push_channel_voice(&[0x90, 64, 100], T0); // NoteOn E (different note)
+        // NoteOn E shouldn't touch NoteOff C delayed copies.
+        assert_eq!(q.len(), 3, "1 NoteOn E + 2 delayed NoteOff C");
+
+        // The delayed NoteOff C copies still fire at their times.
+        let packets = drain_at(&mut q, T_FAR_FUTURE);
+        let mut saw_off_c = false;
+        for (_, body) in &packets {
+            for (_, midi) in decode_cv(body) {
+                if midi == [0x80, 60, 0] {
+                    saw_off_c = true;
+                }
+            }
+        }
+        assert!(saw_off_c, "delayed NoteOff C should still fire");
+    }
+
+    #[test]
+    fn note_off_chord_release_queues_delayed_copies_per_note() {
+        // Releasing a 3-note chord pushes 3 NoteOffs.  Each gets its
+        // own main + 2 delayed = 9 entries total.  All 9 stay queued
+        // and fire at appropriate times.
+        let mut q = MidiTxQueue::new();
+        q.push_channel_voice(&[0x80, 60, 0], T0);
+        q.push_channel_voice(&[0x80, 64, 0], T0);
+        q.push_channel_voice(&[0x80, 67, 0], T0);
+        assert_eq!(q.len(), 9, "3 NoteOffs × (1 main + 2 delayed)");
+
+        // Drain main batch at T0 — all 3 mains batched together × K=3.
+        let main_packets = drain_at(&mut q, T0);
+        assert_eq!(main_packets.len(), 3, "K=3 retransmits of the chord-off");
+        for (_, body) in &main_packets {
+            let events = decode_cv(body);
+            assert_eq!(events.len(), 3, "each packet has all 3 NoteOffs");
+        }
+
+        // 6 delayed copies still waiting (3 NoteOffs × 2 delays each).
+        assert_eq!(q.len(), 6);
+
+        // At +30 ms, the 3 delayed30 copies are eligible — batch into 1
+        // packet with all 3 NoteOffs.
+        let t30 = T0 + Duration::from_millis(30);
+        let mut buf = [0u8; 64];
+        let pkt = q.pop_packet(t30, &mut buf).unwrap();
+        let events = decode_cv(&buf[..pkt.body_len]);
+        assert_eq!(events.len(), 3, "all 3 +30 ms delayed copies batch");
+
+        // At +60 ms, the 3 delayed60 copies fire similarly.
+        let t60 = T0 + Duration::from_millis(60);
+        let pkt = q.pop_packet(t60, &mut buf).unwrap();
+        let events = decode_cv(&buf[..pkt.body_len]);
+        assert_eq!(events.len(), 3, "all 3 +60 ms delayed copies batch");
+
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn delayed_copies_dont_block_eligible_new_events() {
+        // Queue has only delayed NoteOff copies (ineligible at T0).
+        // A new NoteOn arrives at T0 — it must not be blocked behind
+        // the delayed copies.
+        let mut q = MidiTxQueue::new();
+        q.push_channel_voice(&[0x80, 60, 0], T0);
+        let _ = drain_at(&mut q, T0); // pop main K=3
+        assert_eq!(q.len(), 2, "delayed copies remain");
+
+        q.push_channel_voice(&[0x90, 64, 100], T0); // unrelated NoteOn
+
+        // pop_packet at T0 should return the eligible NoteOn, NOT
+        // wait for the delayed NoteOff copies.
+        let mut buf = [0u8; 64];
+        let pkt = q.pop_packet(T0, &mut buf).unwrap();
+        let events = decode_cv(&buf[..pkt.body_len]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1, vec![0x90, 64, 100]);
+    }
+
+    #[test]
+    fn next_eligibility_reports_earliest_ineligible() {
+        let mut q = MidiTxQueue::new();
+        q.push_channel_voice(&[0x80, 60, 0], T0);
+        // While main is still in queue (eligible), next_eligibility = None.
+        assert!(q.next_eligibility().is_none());
+
+        // After draining main, only delayed copies remain (ineligible).
+        let _ = drain_at(&mut q, T0);
+        match q.next_eligibility() {
+            Some(t) => assert_eq!(t, T0 + Duration::from_millis(30)),
+            None => panic!("expected Some(deadline) when only delayed copies left"),
+        }
+
+        // After draining the +30 ms copy, the +60 ms is the earliest.
+        let t30 = T0 + Duration::from_millis(30);
+        let _ = drain_at(&mut q, t30);
+        match q.next_eligibility() {
+            Some(t) => assert_eq!(t, T0 + Duration::from_millis(60)),
+            None => panic!("expected Some(deadline) for +60 ms copy"),
         }
     }
 }

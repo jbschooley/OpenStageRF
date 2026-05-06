@@ -14,7 +14,7 @@
 //! changes to `run_rx` itself.
 
 use embassy_executor::Spawner;
-use osrf_app_link_bench::{run_rx, synthetic::DefmtLogSink};
+use osrf_app_link_bench::{run_rx, synthetic::DefmtLogSink, LinkBenchConfig};
 use osrf_board_t114 as board;
 
 use defmt_rtt as _;
@@ -30,6 +30,11 @@ async fn main(_spawner: Spawner) {
     let mut r = board::resources();
     defmt::info!("OpenStageRF link bench RX — T114 starting");
 
+    // RF + link-layer config.  Must match the TX side's config.  Today:
+    // hardcoded default.  Future: load from flash so the UI can edit
+    // frequency / sync word / watchdog timing.
+    let config = LinkBenchConfig::default_915();
+
     let mut sink = DefmtLogSink;
-    run_rx(&mut r.radio0, &mut r.status_led, &mut sink).await
+    run_rx(&mut r.radio0, &mut r.status_led, &mut sink, &config).await
 }
