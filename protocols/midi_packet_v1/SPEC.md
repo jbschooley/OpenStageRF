@@ -85,7 +85,7 @@ Discriminates the body content.  Authenticated (in AAD) but not encrypted, so re
 | Value | Body type | Use |
 |---|---|---|
 | `0x00` | RESERVED | Do not transmit. Receivers MUST drop. |
-| `0x01` | `HEARTBEAT` | Keepalive.  Body is empty. |
+| `0x01` | `HEARTBEAT` | Keepalive.  Body is 2 bytes: active-channel mask. |
 | `0x02` | `CHANNEL_VOICE` | One or more `(event_seq, midi_message)` tuples. |
 | `0x03` | `SYSEX_FRAGMENT` | One fragment of a larger SysEx message. |
 | `0x04`–`0x0F` | reserved for future MIDI extensions | |
@@ -153,7 +153,39 @@ A SysEx whose first fragment is lost is unrecoverable — the receiver has no wa
 
 #### Body: `HEARTBEAT` (event_type 0x01)
 
-Empty (0 bytes).  Sent by TX whenever the queue has been silent for `HEARTBEAT_PERIOD_MS` (default 10 ms).  Receiver uses heartbeat arrivals to feed the link watchdog.
+```
+[active_channel_mask:2]
+```
+
+The body is 2 bytes, big-endian: a 16-bit bitmap where bit `i` (LSB =
+bit 0) is set if and only if the transmitter's local
+[`ChannelNoteCounts`] has at least one note pressed on MIDI channel
+`i`.  Channel 0 maps to MIDI status nibble `0x?0`, channel 15 to `0x?F`.
+
+Sent by TX whenever the queue has been silent for `HEARTBEAT_PERIOD_MS`
+(default 10 ms).  Three uses at the receiver:
+
+1. **Watchdog feeding** — any heartbeat arrival kicks the watchdog,
+   same as before.
+2. **Stuck-note failsafe** — if the mask reports a channel as silent
+   (bit clear) but the receiver's [`PressedNotes`] still has notes
+   pressed for that channel, the receiver emits CC 123 (All Notes
+   Off) for the stuck channel and clears its local state.  Recovers
+   from the rare case where K=3 retransmits + time-spread NoteOff
+   copies all fail to deliver a NoteOff (correlated burst
+   interference).  The receiver requires the mask to be stable across
+   ≥2 consecutive heartbeats before acting, to guard against
+   single-bit flips in a heartbeat body.
+3. **Coarse link health** — counting heartbeats vs MIDI events gives
+   the bench's stats logger its loss-rate denominator.
+
+Backwards compatibility: a receiver sees a 0-byte heartbeat body
+(legacy v1 implementations or malformed packets) treats the mask as
+"no info" and skips the failsafe path entirely — the watchdog still
+works.
+
+[`ChannelNoteCounts`]: ../../core/link/src/state.rs
+[`PressedNotes`]: ../../core/link/src/state.rs
 
 ### `body` (variable length)
 
