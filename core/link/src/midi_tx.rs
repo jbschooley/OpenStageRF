@@ -63,21 +63,25 @@ pub const DEFAULT_CREDITS: u8 = 3;
 /// 4 leaves headroom for short System-Common messages.
 pub const MAX_MSG_BYTES: usize = 4;
 
-/// Time-spread NoteOff retransmits.  In addition to the K=3 immediate
-/// retransmit through the main entry (default credit-based round-robin
-/// delivery in ~3 ms), each NoteOff push also queues a single extra
-/// copy at each of these offsets.  This protects against bursty RF
-/// interference up to ~30 ms long taking out all three immediate
-/// copies — the +30 ms or +60 ms delayed copy survives.  Both delayed
-/// copies share the original NoteOff's `event_seq` so the receiver's
-/// replay window dedups them; the sink fires NoteOff exactly once.
+/// Time-spread retransmit offsets for note-state messages (NoteOn,
+/// NoteOff, NoteOn vel=0).  In addition to the K=3 immediate retransmit
+/// through the main entry (default credit-based round-robin delivery in
+/// ~3 ms), each note-state push also queues a single extra copy at each
+/// of these offsets.  This protects against bursty RF interference up
+/// to ~30 ms long taking out all three immediate copies — the +30 ms
+/// or +60 ms delayed copy survives.  All copies share the original
+/// event's `event_seq`, so the receiver's replay window dedups them;
+/// the sink sees each logical event exactly once.
 ///
-/// Cancellation: a subsequent NoteOn for the same (channel, note) runs
-/// `dedup_for_incoming`, which scans the queue for any NoteOff matching
-/// that note and removes it — including the delayed copies.  So a
-/// rapid release-then-restrike doesn't fire stray NoteOffs after the
-/// new NoteOn.
-pub const NOTE_OFF_DELAYED_RETRANSMITS_MS: &[u32] = &[30, 60];
+/// Cancellation: `dedup_for_incoming` scans the *entire queue*
+/// (eligible AND ineligible entries) when a new note-state event is
+/// pushed.  A NoteOff cancels pending NoteOns (main + delayed copies);
+/// a NoteOn cancels pending NoteOffs.  Single-antenna RX always
+/// receives wire packets in send order, so a delayed NoteOn copy can
+/// never arrive at RX *after* a NoteOff for the same note — either
+/// dedup removed it before it left the queue, or it was on the wire
+/// before the NoteOff was pushed.
+pub const NOTE_DELAYED_RETRANSMITS_MS: &[u32] = &[30, 60];
 
 /// Discriminates queue entry kinds.  Pop_packet only batches entries of
 /// the same kind (channel-voice events never bundle with SysEx fragments).
@@ -169,8 +173,8 @@ impl MidiTxQueue {
     /// silently ignored.
     ///
     /// `now` is the current `embassy_time::Instant`, used to schedule
-    /// the time-spread NoteOff retransmit copies (see
-    /// [`NOTE_OFF_DELAYED_RETRANSMITS_MS`]).
+    /// the time-spread retransmit copies for note-state messages (see
+    /// [`NOTE_DELAYED_RETRANSMITS_MS`]).
     pub fn push_channel_voice(&mut self, midi: &[u8], now: Instant) -> bool {
         if midi.is_empty() || midi.len() > MAX_MSG_BYTES {
             return false;
@@ -207,18 +211,28 @@ impl MidiTxQueue {
             })
             .is_ok();
 
-        // For NoteOff specifically (status nibble 0x80), queue extra
-        // delayed copies that fire later in time.  This protects against
-        // bursty interference taking out all 3 immediate retransmits.
-        // All delayed copies share the SAME `event_seq` as the main
-        // entry — the receiver's replay window dedups them, so the sink
-        // still fires NoteOff exactly once.
+        // For note-state messages (NoteOff 0x8X, NoteOn 0x9X — both
+        // proper "vel > 0" attacks AND vel=0 pseudo-NoteOffs), queue
+        // extra delayed copies that fire later in time.  Protects
+        // against bursty interference taking out all 3 immediate
+        // retransmits.  All copies share the same `event_seq` so the
+        // receiver's replay window dedups them and the sink fires each
+        // logical event exactly once.
+        //
+        // For NoteOn: a subsequent NoteOff for the same (channel, note)
+        // runs `dedup_for_incoming` and removes the still-queued
+        // delayed NoteOn copies before they hit the wire.  Single-
+        // antenna RX always processes packets in send order, so a
+        // delayed NoteOn copy can never arrive after a NoteOff for the
+        // same note — eliminating the "ghost re-trigger" hazard.
         //
         // If the queue is full when adding a delayed copy, we silently
         // skip it — the main K=3 still ships and is the primary
         // delivery guarantee.
-        if main_ok && status & 0xF0 == 0x80 {
-            for &delay_ms in NOTE_OFF_DELAYED_RETRANSMITS_MS {
+        let is_note_event =
+            (status & 0xF0 == 0x80) || (status & 0xF0 == 0x90);
+        if main_ok && is_note_event {
+            for &delay_ms in NOTE_DELAYED_RETRANSMITS_MS {
                 let due = now + Duration::from_millis(delay_ms as u64);
                 let _ = self.insert_by_priority(Entry {
                     priority,
@@ -277,7 +291,7 @@ impl MidiTxQueue {
     ///
     /// `now` is the current `embassy_time::Instant`; entries with a
     /// future `next_eligible` are skipped (they wait their turn — see
-    /// [`NOTE_OFF_DELAYED_RETRANSMITS_MS`]).
+    /// [`NOTE_DELAYED_RETRANSMITS_MS`]).
     ///
     /// Body format:
     /// * `ChannelVoice`: `[event_seq:2][midi:1..3] [event_seq:2][midi:1..3] ...`
@@ -512,27 +526,43 @@ mod tests {
         assert!(q.push_channel_voice(&[0x90, 60, 100], T0));
         assert!(q.push_channel_voice(&[0x90, 64, 100], T0));
         assert!(q.push_channel_voice(&[0x90, 67, 100], T0));
+        // Each NoteOn push creates main(K=3) + d_30(K=1) + d_60(K=1) =
+        // 3 entries.  3 NoteOns = 9 queued entries.  At T_FAR_FUTURE
+        // every entry is eligible, so:
+        //   Pop 1: all 9 entries batch into one packet (9 events).
+        //          main → K=2, delayed → K=0 (drained).
+        //   Pop 2: 3 main entries (K=2) → K=1.
+        //   Pop 3: 3 main entries (K=1) → K=0.
         let packets = drain(&mut q);
-        // Drained means K=3 retransmits — three packets, each with all
-        // three notes (same event_seqs across copies).
         assert_eq!(packets.len(), 3);
-        for (kind, body) in &packets {
-            assert_eq!(*kind, QueueKind::ChannelVoice);
-            let events = decode_cv(body);
-            assert_eq!(events.len(), 3);
-            assert_eq!(events[0].1, vec![0x90, 60, 100]);
-            assert_eq!(events[1].1, vec![0x90, 64, 100]);
-            assert_eq!(events[2].1, vec![0x90, 67, 100]);
-        }
-        // Each event keeps its event_seq across retransmits.
         let p0 = decode_cv(&packets[0].1);
         let p1 = decode_cv(&packets[1].1);
-        assert_eq!(p0[0].0, p1[0].0); // C's seq same
-        assert_eq!(p0[1].0, p1[1].0); // E's seq same
-        assert_eq!(p0[2].0, p1[2].0); // G's seq same
-        // Different events have distinct event_seqs.
-        assert_ne!(p0[0].0, p0[1].0);
-        assert_ne!(p0[1].0, p0[2].0);
+        let p2 = decode_cv(&packets[2].1);
+        assert_eq!(p0.len(), 9, "first packet bundles main + delayed copies");
+        assert_eq!(p1.len(), 3, "second packet is K=2 main retransmit");
+        assert_eq!(p2.len(), 3, "third packet is K=1 main retransmit");
+        // Verify the chord notes appear in p1 (and p2) in input order.
+        assert_eq!(p1[0].1, vec![0x90, 60, 100]);
+        assert_eq!(p1[1].1, vec![0x90, 64, 100]);
+        assert_eq!(p1[2].1, vec![0x90, 67, 100]);
+        // p1 and p2 share event_seqs (K=2 and K=1 of the same logical events).
+        assert_eq!(p1[0].0, p2[0].0);
+        assert_eq!(p1[1].0, p2[1].0);
+        assert_eq!(p1[2].0, p2[2].0);
+        // p0 has 3 distinct event_seqs (one per push), each appearing
+        // 3 times (main + d_30 + d_60).
+        let mut seqs: std::vec::Vec<u16> = p0.iter().map(|(s, _)| *s).collect();
+        seqs.sort();
+        let unique: std::vec::Vec<u16> = {
+            let mut u = seqs.clone();
+            u.dedup();
+            u
+        };
+        assert_eq!(unique.len(), 3, "3 distinct event_seqs in batched packet");
+        // p1's main-retransmit seqs should be the same 3 distinct values.
+        let mut p1_seqs: std::vec::Vec<u16> = p1.iter().map(|(s, _)| *s).collect();
+        p1_seqs.sort();
+        assert_eq!(p1_seqs, unique);
     }
 
     #[test]
@@ -702,17 +732,27 @@ mod tests {
     #[test]
     fn note_on_not_deduped_against_other_note_on() {
         // Re-strike: same note pressed twice without intervening NoteOff.
+        // Each push creates 3 entries (main K=3 + 2 delayed K=1) sharing
+        // the push's event_seq, so 2 pushes = 6 entries with 2 distinct
+        // event_seqs.  At T_FAR_FUTURE the first pop batches all 6
+        // entries' bytes, so the first packet has 6 NoteOn(60) events
+        // total.
         let mut q = MidiTxQueue::new();
         q.push_channel_voice(&[0x90, 60, 100], T0);
         q.push_channel_voice(&[0x90, 60, 100], T0);
         let packets = drain(&mut q);
-        // Both events present in each packet.
         let events = decode_cv(&packets[0].1);
         let on_count = events
             .iter()
             .filter(|(_, m)| m == &vec![0x90, 60, 100])
             .count();
-        assert_eq!(on_count, 2);
+        assert_eq!(on_count, 6, "both pushes' main + 2 delayed copies = 6");
+        // The events should carry exactly 2 distinct event_seqs (one per
+        // push), since main and delayed copies share their push's seq.
+        let mut seqs: std::vec::Vec<u16> = events.iter().map(|(s, _)| *s).collect();
+        seqs.sort();
+        seqs.dedup();
+        assert_eq!(seqs.len(), 2);
     }
 
     #[test]
@@ -907,17 +947,19 @@ mod tests {
 
         // Drain main K=3 (the NoteOff packets that already went out).
         let _ = drain_at(&mut q, T0);
-        assert_eq!(q.len(), 2, "delayed copies still pending");
+        assert_eq!(q.len(), 2, "delayed NoteOff copies still pending");
 
-        // Restrike before the delayed NoteOffs fire.
+        // Restrike before the delayed NoteOffs fire.  This NoteOn
+        // cancels the pending delayed NoteOffs and itself adds 3
+        // entries (main K=3 + 2 delayed copies).
         q.push_channel_voice(&[0x90, 60, 100], T0); // NoteOn C
         assert_eq!(
             q.len(),
-            1,
-            "delayed NoteOffs should be cancelled, only NoteOn left"
+            3,
+            "pending delayed NoteOffs cancelled; new NoteOn adds 3 entries"
         );
 
-        // Drain everything at far future — only the NoteOn copies fire.
+        // Drain everything at far future — no stale NoteOffs survive.
         let packets = drain_at(&mut q, T_FAR_FUTURE);
         for (_, body) in &packets {
             for (_, midi) in decode_cv(body) {
@@ -933,15 +975,20 @@ mod tests {
     #[test]
     fn note_on_for_different_note_doesnt_cancel_delayed_note_off() {
         // NoteOff C queues delayed copies.  NoteOn for E (different
-        // note) must NOT cancel them — they're for note 60.
+        // note) must NOT cancel them — they're for a different note.
         let mut q = MidiTxQueue::new();
         q.push_channel_voice(&[0x80, 60, 0], T0); // NoteOff C
         let _ = drain_at(&mut q, T0); // main K=3
         assert_eq!(q.len(), 2, "delayed NoteOff C copies still pending");
 
-        q.push_channel_voice(&[0x90, 64, 100], T0); // NoteOn E (different note)
-        // NoteOn E shouldn't touch NoteOff C delayed copies.
-        assert_eq!(q.len(), 3, "1 NoteOn E + 2 delayed NoteOff C");
+        // NoteOn E adds main + 2 delayed = 3 entries; doesn't touch
+        // the pending NoteOff C copies (different note).
+        q.push_channel_voice(&[0x90, 64, 100], T0);
+        assert_eq!(
+            q.len(),
+            5,
+            "2 delayed NoteOff C + 3 NoteOn E entries (main + 2 delayed)"
+        );
 
         // The delayed NoteOff C copies still fire at their times.
         let packets = drain_at(&mut q, T_FAR_FUTURE);
@@ -1037,5 +1084,109 @@ mod tests {
             Some(t) => assert_eq!(t, T0 + Duration::from_millis(60)),
             None => panic!("expected Some(deadline) for +60 ms copy"),
         }
+    }
+
+    // ── NoteOn time-spread retransmits ───────────────────────────────────
+
+    #[test]
+    fn note_on_pushes_main_plus_delayed_copies() {
+        let mut q = MidiTxQueue::new();
+        q.push_channel_voice(&[0x90, 60, 100], T0);
+        // 1 main entry + 2 delayed copies = 3 entries.
+        assert_eq!(q.len(), 3);
+    }
+
+    #[test]
+    fn delayed_note_on_copies_dont_pop_before_their_time() {
+        let mut q = MidiTxQueue::new();
+        q.push_channel_voice(&[0x90, 60, 100], T0);
+        // At T0, only the main entry's K=3 retransmits are eligible.
+        let packets = drain_at(&mut q, T0);
+        assert_eq!(packets.len(), 3, "expected K=3 main retransmits at T0");
+        assert_eq!(q.len(), 2, "delayed copies stay queued");
+    }
+
+    #[test]
+    fn delayed_note_on_copies_fire_at_deadline() {
+        let mut q = MidiTxQueue::new();
+        q.push_channel_voice(&[0x90, 60, 100], T0);
+        let _ = drain_at(&mut q, T0); // main K=3
+        assert_eq!(q.len(), 2);
+
+        let t30 = T0 + Duration::from_millis(30);
+        let pkts30 = drain_at(&mut q, t30);
+        assert_eq!(pkts30.len(), 1, "+30 ms delayed NoteOn fires");
+        assert_eq!(q.len(), 1);
+
+        let t60 = T0 + Duration::from_millis(60);
+        let pkts60 = drain_at(&mut q, t60);
+        assert_eq!(pkts60.len(), 1, "+60 ms delayed NoteOn fires");
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn delayed_note_on_copies_share_event_seq_with_main() {
+        let mut q = MidiTxQueue::new();
+        q.push_channel_voice(&[0x90, 60, 100], T0);
+
+        let mut buf = [0u8; 64];
+        let pkt = q.pop_packet(T0, &mut buf).unwrap();
+        let main_seq = decode_cv(&buf[..pkt.body_len])[0].0;
+
+        // Drain the rest of main at T0.
+        let _ = drain_at(&mut q, T0);
+
+        // +30 ms delayed copy — same event_seq as main.
+        let t30 = T0 + Duration::from_millis(30);
+        let pkt30 = q.pop_packet(t30, &mut buf).unwrap();
+        let events_30 = decode_cv(&buf[..pkt30.body_len]);
+        assert_eq!(events_30.len(), 1);
+        assert_eq!(events_30[0].0, main_seq, "+30 ms NoteOn shares event_seq");
+        assert_eq!(events_30[0].1, vec![0x90, 60, 100]);
+    }
+
+    #[test]
+    fn note_off_cancels_pending_delayed_note_on_copies() {
+        // The crucial dedup case: after the K=3 main NoteOn copies have
+        // gone out, the +30 ms / +60 ms copies are still queued.  A
+        // subsequent NoteOff for the same note must remove them so they
+        // can never reach the wire after the NoteOff has been sent.
+        let mut q = MidiTxQueue::new();
+        q.push_channel_voice(&[0x90, 60, 100], T0); // NoteOn C
+        let _ = drain_at(&mut q, T0); // main K=3
+        assert_eq!(q.len(), 2, "2 delayed NoteOn copies pending");
+
+        // NoteOff arrives before delayed NoteOn copies fire.
+        q.push_channel_voice(&[0x80, 60, 0], T0);
+        // 2 delayed NoteOns removed, then NoteOff adds main + 2 delayed
+        // = 3 entries.
+        assert_eq!(q.len(), 3, "delayed NoteOns cancelled; NoteOff added");
+
+        // Drain everything — no stale NoteOns survive.
+        let packets = drain_at(&mut q, T_FAR_FUTURE);
+        for (_, body) in &packets {
+            for (_, midi) in decode_cv(body) {
+                assert_ne!(
+                    midi,
+                    vec![0x90, 60, 100],
+                    "stale delayed NoteOn survived NoteOff cancellation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pseudo_note_off_also_gets_delayed_copies() {
+        // NoteOn with velocity 0 is the MIDI 1.0 alias for NoteOff.
+        // The queue treats it as a note-state event and adds delayed
+        // copies the same as a 0x80 NoteOff.
+        let mut q = MidiTxQueue::new();
+        q.push_channel_voice(&[0x90, 60, 0], T0); // pseudo-NoteOff
+        assert_eq!(q.len(), 3, "pseudo-NoteOff also gets delayed copies");
+
+        let _ = drain_at(&mut q, T0); // main K=3
+        let t60 = T0 + Duration::from_millis(60);
+        let _ = drain_at(&mut q, t60);
+        assert!(q.is_empty(), "all copies fired by +60 ms");
     }
 }

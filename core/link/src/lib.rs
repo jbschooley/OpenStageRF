@@ -186,6 +186,32 @@ pub enum RxEvent<'a> {
 /// for the watchdog interval, the *next* packet triggers a full session
 /// reset regardless of `boot_counter` — this catches restarts whose
 /// random `boot_counter` happens to collide with the previous session's.
+///
+/// # Wire-order assumption
+///
+/// `process()` assumes the caller delivers wire packets in **send
+/// order** (lower `packet_seq` first).  Single-antenna setups satisfy
+/// this trivially because the wire is serial and air propagation is
+/// effectively instantaneous over our distances.
+///
+/// **For independent-demod diversity** (two SX1262s feeding a shared
+/// queue), the merge layer must preserve send order — either by
+/// processing packets strictly in `packet_seq` order, or by ensuring
+/// per-antenna demod-to-merge latency is uniform.
+///
+/// If send order is violated, the worst case is a **truncated note**,
+/// not a stuck one: the heartbeat-state failsafe (see
+/// [`PressedNotes::missing_clear`]) silences any note that the
+/// receiver thinks is pressed when TX's heartbeat says the channel is
+/// silent.  Recovery happens within ~20 ms (two stable heartbeats),
+/// during which the synth plays the misordered note for that brief
+/// window.  Audible as a click or short blip but not as a stuck drone.
+///
+/// To eliminate the truncated-note artifact for diversity setups, wrap
+/// `process()` in a 30 ms reorder buffer that sorts events by
+/// `event_seq` before delivering to the sink.  Trades 30 ms latency
+/// for strict ordering.  Not implemented today — single antenna is the
+/// supported deployment.
 pub struct LinkReceiver {
     expected_key_fp: KeyFp,
     boot_session: Option<u16>,
