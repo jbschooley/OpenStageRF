@@ -63,25 +63,41 @@ pub const DEFAULT_CREDITS: u8 = 3;
 /// 4 leaves headroom for short System-Common messages.
 pub const MAX_MSG_BYTES: usize = 4;
 
-/// Time-spread retransmit offsets for note-state messages (NoteOn,
-/// NoteOff, NoteOn vel=0).  In addition to the K=3 immediate retransmit
-/// through the main entry (default credit-based round-robin delivery in
-/// ~3 ms), each note-state push also queues a single extra copy at each
-/// of these offsets.  This protects against bursty RF interference up
-/// to ~30 ms long taking out all three immediate copies — the +30 ms
-/// or +60 ms delayed copy survives.  All copies share the original
-/// event's `event_seq`, so the receiver's replay window dedups them;
-/// the sink sees each logical event exactly once.
+/// Time-spread retransmit offsets for channel-voice messages.  In
+/// addition to the K=3 immediate retransmit through the main entry
+/// (default credit-based round-robin delivery in ~3 ms), each push
+/// also queues a single extra copy at each of these offsets.  This
+/// protects against bursty RF interference up to ~30 ms long taking
+/// out all three immediate copies — the +30 ms or +60 ms delayed copy
+/// survives.  All copies share the original event's `event_seq`, so
+/// the receiver's replay window dedups them; the sink sees each
+/// logical event exactly once.
+///
+/// Applies to **all** channel-voice messages (NoteOn/Off, PolyAT, CC,
+/// PC, Channel Pressure, Pitch Bend) — not just note-state.  Real-time
+/// messages (status ≥ 0xF8) are excluded: they're frequent and
+/// miss-tolerant, and adding 2× retransmits would block channel-voice
+/// traffic.
 ///
 /// Cancellation: `dedup_for_incoming` scans the *entire queue*
-/// (eligible AND ineligible entries) when a new note-state event is
-/// pushed.  A NoteOff cancels pending NoteOns (main + delayed copies);
-/// a NoteOn cancels pending NoteOffs.  Single-antenna RX always
-/// receives wire packets in send order, so a delayed NoteOn copy can
-/// never arrive at RX *after* a NoteOff for the same note — either
-/// dedup removed it before it left the queue, or it was on the wire
-/// before the NoteOff was pushed.
-pub const NOTE_DELAYED_RETRANSMITS_MS: &[u32] = &[30, 60];
+/// (eligible AND ineligible entries) when a new event is pushed.
+/// Status-aware dedup removes superseded entries and their delayed
+/// copies before they hit the wire:
+/// * NoteOff cancels pending NoteOns for the same (ch, note); NoteOn
+///   cancels pending NoteOffs.
+/// * A new CC#X (ch, ctrl) cancels pending older CC#X on same channel.
+/// * A new PC / CP / PB cancels older same-status on same channel.
+///
+/// For continuous controllers (mod wheel sweeps, pitch bend), this
+/// means delayed copies of intermediate values are cancelled by newer
+/// pushes — wire bandwidth in steady sweeps stays at K=3.  Only the
+/// resting/final value's delayed copies survive to fire.
+///
+/// Single-antenna RX always receives wire packets in send order, so a
+/// delayed copy can never arrive at RX *after* a superseding event for
+/// the same key — either dedup removed it before it left the queue, or
+/// it was on the wire before the superseder was pushed.
+pub const DELAYED_RETRANSMITS_MS: &[u32] = &[30, 60];
 
 /// Discriminates queue entry kinds.  Pop_packet only batches entries of
 /// the same kind (channel-voice events never bundle with SysEx fragments).
@@ -173,8 +189,8 @@ impl MidiTxQueue {
     /// silently ignored.
     ///
     /// `now` is the current `embassy_time::Instant`, used to schedule
-    /// the time-spread retransmit copies for note-state messages (see
-    /// [`NOTE_DELAYED_RETRANSMITS_MS`]).
+    /// the time-spread retransmit copies (see
+    /// [`DELAYED_RETRANSMITS_MS`]).
     pub fn push_channel_voice(&mut self, midi: &[u8], now: Instant) -> bool {
         if midi.is_empty() || midi.len() > MAX_MSG_BYTES {
             return false;
@@ -211,28 +227,30 @@ impl MidiTxQueue {
             })
             .is_ok();
 
-        // For note-state messages (NoteOff 0x8X, NoteOn 0x9X — both
-        // proper "vel > 0" attacks AND vel=0 pseudo-NoteOffs), queue
-        // extra delayed copies that fire later in time.  Protects
-        // against bursty interference taking out all 3 immediate
-        // retransmits.  All copies share the same `event_seq` so the
-        // receiver's replay window dedups them and the sink fires each
-        // logical event exactly once.
+        // For all channel-voice messages, queue extra delayed copies
+        // that fire later in time.  Protects against bursty
+        // interference taking out all 3 immediate retransmits.  All
+        // copies share the same `event_seq` so the receiver's replay
+        // window dedups them and the sink fires each logical event
+        // exactly once.
         //
-        // For NoteOn: a subsequent NoteOff for the same (channel, note)
-        // runs `dedup_for_incoming` and removes the still-queued
-        // delayed NoteOn copies before they hit the wire.  Single-
-        // antenna RX always processes packets in send order, so a
-        // delayed NoteOn copy can never arrive after a NoteOff for the
-        // same note — eliminating the "ghost re-trigger" hazard.
+        // Status-aware dedup (`dedup_for_incoming`) cancels delayed
+        // copies of superseded events before they hit the wire — a
+        // newer NoteOff wipes pending NoteOns, a newer CC#X wipes
+        // older CC#X on same channel, etc.  Single-antenna RX
+        // processes packets in send order, so a delayed copy can
+        // never arrive after a superseder for the same key.
+        //
+        // For continuous controllers (mod wheel sweeps, pitch bend)
+        // the rapid succession of pushes cancels intermediate delayed
+        // copies — only the resting/final value's delayed copies
+        // survive to fire, keeping steady-sweep wire bandwidth at K=3.
         //
         // If the queue is full when adding a delayed copy, we silently
         // skip it — the main K=3 still ships and is the primary
         // delivery guarantee.
-        let is_note_event =
-            (status & 0xF0 == 0x80) || (status & 0xF0 == 0x90);
-        if main_ok && is_note_event {
-            for &delay_ms in NOTE_DELAYED_RETRANSMITS_MS {
+        if main_ok {
+            for &delay_ms in DELAYED_RETRANSMITS_MS {
                 let due = now + Duration::from_millis(delay_ms as u64);
                 let _ = self.insert_by_priority(Entry {
                     priority,
@@ -291,7 +309,7 @@ impl MidiTxQueue {
     ///
     /// `now` is the current `embassy_time::Instant`; entries with a
     /// future `next_eligible` are skipped (they wait their turn — see
-    /// [`NOTE_DELAYED_RETRANSMITS_MS`]).
+    /// [`DELAYED_RETRANSMITS_MS`]).
     ///
     /// Body format:
     /// * `ChannelVoice`: `[event_seq:2][midi:1..3] [event_seq:2][midi:1..3] ...`
@@ -762,7 +780,13 @@ mod tests {
         q.push_channel_voice(&[0xB1, 7, 90], T0); // ch 1
         let packets = drain(&mut q);
         let events = decode_cv(&packets[0].1);
-        assert_eq!(events.len(), 2);
+        // Each push gets main + 2 delayed copies sharing one event_seq;
+        // dedup is per-channel so neither push cancels the other.
+        assert_eq!(events.len(), 6, "2 pushes × 3 entries each = 6");
+        let mut seqs: std::vec::Vec<u16> = events.iter().map(|(s, _)| *s).collect();
+        seqs.sort();
+        seqs.dedup();
+        assert_eq!(seqs.len(), 2, "distinct event_seqs preserved");
     }
 
     // ── Real-time messages don't get deduped ─────────────────────────────
