@@ -24,8 +24,6 @@
 
 pub mod synthetic;
 
-use core::task::Poll;
-use embassy_futures::poll_once;
 use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Instant, Timer};
 use embedded_hal::digital::StatefulOutputPin;
@@ -44,7 +42,13 @@ use osrf_radio_sx126x::{
 const RF_FREQUENCY_HZ: u32 = 915_000_000;
 const RF_BITRATE_BPS: u32 = 300_000;
 const RF_DEVIATION_HZ: u32 = 50_000;
-const RF_TX_POWER_DBM: i8 = 14;
+// Maximum TX power on the SX1262 is +22 dBm (HP PA mode).  At stage
+// distances (>1 m) path loss eats most of the link-budget headroom, so
+// we run flat-out for maximum range and interference robustness.  At
+// ~6 in benchtop with this power the RX front end is mildly saturated
+// (~−1 dBm at the antenna), causing ~3–6 % loss and occasional 200 ms
+// demod lockups; for benchtop testing drop to −9 dBm temporarily.
+const RF_TX_POWER_DBM: i8 = 22;
 const RF_PREAMBLE_BITS: u16 = 16;
 const RF_PAYLOAD_MAX: u8 = 64;
 const RF_SYNC_WORD: [u8; 4] = [0xC1, 0x94, 0xC1, 0x94];
@@ -61,10 +65,21 @@ pub const HEARTBEAT_MS: u64 = 10;
 
 pub trait MidiSource {
     type Error;
-    /// Wait for the next MIDI message and write its bytes into `buf`.
-    /// Returns the number of bytes written.  May resolve only after an
-    /// arbitrarily long delay.
-    async fn next_message(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error>;
+    /// Synchronously try to read the next MIDI message.  Returns
+    /// `Ok(Some(n))` if an event is ready *right now*, `Ok(None)` if
+    /// no event is ready (e.g., scheduled-event source's deadline
+    /// hasn't passed, UART buffer is empty, etc.).
+    ///
+    /// Implementations MUST NOT call into `embassy_time::Timer` here —
+    /// this is invoked from `poll_once`-equivalent contexts where the
+    /// waker may not support timers.
+    fn try_next(&mut self, buf: &mut [u8]) -> Result<Option<usize>, Self::Error>;
+
+    /// Wait until `try_next` would return `Ok(Some(_))`.  May resolve
+    /// immediately if an event is already ready, or after a timer if
+    /// the next event's deadline is in the future.  Called only inside
+    /// `select` where the waker supports `embassy_time::Timer`.
+    async fn wait_ready(&mut self);
 }
 
 pub trait MidiSink {
@@ -151,12 +166,13 @@ where
     let mut overflow_count: u32 = 0;
 
     loop {
-        // 1. Drain any source events into the queue (non-blocking).  Each
-        //    push applies MIDI status-aware dedup and assigns a fresh
-        //    event_seq.
+        // 1. Drain any source events into the queue (non-blocking).
+        //    `try_next` is sync and safe to call repeatedly; each event
+        //    that's "due" right now goes into the queue with status-aware
+        //    dedup + a fresh event_seq.
         loop {
-            match poll_once(source.next_message(&mut midi_buf)) {
-                Poll::Ready(Ok(n)) => {
+            match source.try_next(&mut midi_buf) {
+                Ok(Some(n)) => {
                     if !queue.push_channel_voice(&midi_buf[..n]) {
                         overflow_count = overflow_count.wrapping_add(1);
                         defmt::error!(
@@ -166,8 +182,8 @@ where
                     }
                     tx_count = tx_count.wrapping_add(1);
                 }
-                Poll::Ready(Err(_)) => break,
-                Poll::Pending => break,
+                Ok(None) => break,
+                Err(_) => break,
             }
         }
 
@@ -194,32 +210,16 @@ where
             continue;
         }
 
-        // 3. Queue empty — wait for either a new source event or the
-        //    heartbeat deadline.
-        match select(source.next_message(&mut midi_buf), hb.wait()).await {
-            Either::First(Ok(n)) => {
-                if !queue.push_channel_voice(&midi_buf[..n]) {
-                    overflow_count = overflow_count.wrapping_add(1);
-                    defmt::error!(
-                        "link_bench TX: queue overflow! dropping (overflows={})",
-                        overflow_count
-                    );
-                }
-                tx_count = tx_count.wrapping_add(1);
+        // 3. Queue empty — wait for source-ready OR heartbeat deadline.
+        //    `wait_ready` may use `embassy_time::Timer` internally; that's
+        //    safe inside `select` because the executor's waker is real.
+        match select(source.wait_ready(), hb.wait()).await {
+            Either::First(()) => {
+                // Source has an event ready; loop to drain.
                 continue;
             }
-            Either::First(Err(_)) => {
-                defmt::warn!("link_bench TX: source error; sending heartbeat");
-            }
             Either::Second(()) => {
-                // After heartbeat win, micro-poll source to catch races.
-                if let Poll::Ready(Ok(n)) = poll_once(source.next_message(&mut midi_buf)) {
-                    if !queue.push_channel_voice(&midi_buf[..n]) {
-                        overflow_count = overflow_count.wrapping_add(1);
-                    }
-                    tx_count = tx_count.wrapping_add(1);
-                    continue;
-                }
+                // Heartbeat fired — fall through to send one.
             }
         }
 
@@ -308,6 +308,12 @@ where
     let stats_interval = Duration::from_secs(5);
     let mut prev_midi: u32 = 0;
     let mut prev_hb: u32 = 0;
+    let mut prev_accepted: u32 = 0;
+    // None until RX sees its first packet.  Initialised to whatever
+    // packet_seq TX is at when we first hear it, so the first window's
+    // loss isn't skewed by the boot-up gap (TX may have already been
+    // running for many seconds before RX powered on).
+    let mut prev_packet_seq: Option<u32> = None;
     let mut prev_dropped: u32 = 0;
     let mut prev_crc: u32 = 0;
     let mut link_up = false;
@@ -412,32 +418,52 @@ where
             }
         }
 
-        // Periodic stats — useful for diagnosing whether link is dropping
-        // due to interference (low success rate) vs. a firmware bug.
+        // Periodic stats.  The denominator is "packets TX actually
+        // transmitted in this window" derived from `packet_seq`
+        // advancement (each TX increments it by 1, including K=3
+        // retransmits).  That's the only honest "expected" count — it
+        // accounts for whether the scenario was bursty (PB/Mod sweeps,
+        // K=3 chord copies) or sparse (silent window with heartbeats
+        // every 10 ms).  Loss is then real RF loss, not a counting
+        // artifact.
+        //
+        // On a session reset (boot_counter change or huge packet_seq
+        // backward jump), the new packet_seq starts low — we clamp the
+        // diff to zero in that window so loss reads 0 % rather than a
+        // garbage "negative".
         let now = Instant::now();
         if now.duration_since(last_stats_log) >= stats_interval {
             let d_midi = accepted_midi.wrapping_sub(prev_midi);
             let d_hb = accepted_heartbeats.wrapping_sub(prev_hb);
+            let d_accepted = accepted.wrapping_sub(prev_accepted);
             let d_dropped = dropped.wrapping_sub(prev_dropped);
             let d_crc = crc_mismatch.wrapping_sub(prev_crc);
-            let elapsed_ms = now.duration_since(last_stats_log).as_millis() as u32;
-            let expected_hb: u32 = elapsed_ms / (HEARTBEAT_MS as u32);
-            let loss_x10 = if expected_hb > 0 {
-                let received = d_midi + d_hb;
-                let lost = expected_hb.saturating_sub(received);
-                (lost * 1000) / expected_hb
-            } else {
-                0
+            let cur_packet_seq = receiver.last_packet_seq();
+            let (tx_count, loss_x10) = match (prev_packet_seq, cur_packet_seq) {
+                (Some(prev), Some(cur)) => {
+                    let n = cur.saturating_sub(prev);
+                    let l = if n > 0 {
+                        n.saturating_sub(d_accepted) * 1000 / n
+                    } else {
+                        0
+                    };
+                    (n, l)
+                }
+                // First-ever observation, or session-reset between
+                // windows — show 0/0 rather than a skewed first number.
+                _ => (0, 0),
             };
             defmt::info!(
-                "RX last5s: midi={} hb={}/{} loss={}.{}% drop={} crc_err={} | total: midi={} hb={} sysex={} drop={} crc_err={}",
-                d_midi,
-                d_hb,
-                expected_hb,
+                "RX last5s: pkts={}/{} loss={}.{}% midi_ev={} hb={} drop={} crc_err={} | total: pkts={} midi_ev={} hb={} sysex={} drop={} crc_err={}",
+                d_accepted,
+                tx_count,
                 loss_x10 / 10,
                 loss_x10 % 10,
+                d_midi,
+                d_hb,
                 d_dropped,
                 d_crc,
+                accepted,
                 accepted_midi,
                 accepted_heartbeats,
                 accepted_sysex,
@@ -446,9 +472,13 @@ where
             );
             prev_midi = accepted_midi;
             prev_hb = accepted_heartbeats;
+            prev_accepted = accepted;
+            prev_packet_seq = cur_packet_seq;
             prev_dropped = dropped;
             prev_crc = crc_mismatch;
             last_stats_log = now;
+            // Note: prev_packet_seq is now Some() once we've seen any
+            // packet; the next window will compute real loss.
         }
     }
 }
