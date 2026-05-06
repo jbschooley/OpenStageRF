@@ -90,9 +90,18 @@ impl MidiSource for ChordHoldSource {
 /// 5. **Quick stabs** — four staccato chords (50 ms hold each).
 /// 6. **Pitch wheel** — full sweep up to max, down to min, back to centre.
 /// 7. **Mod wheel** — full sweep on CC 1.
+/// 8. **Mixer automation** — concurrent CC#7 / CC#10 / CC#64 tweens on
+///    channels 0–2.  Exercises the "all CCs get delayed copies" path.
+/// 9. **Patch walk** — sequence of `[Bank MSB][Bank LSB][PC]` triads
+///    cycling through several patches on ch 0 and ch 9.  Exercises
+///    latched-state reliability for the stuck-on-wrong-patch failure.
+/// 10. **Aftertouch sweep** — held chord with Channel Pressure (0xDn)
+///    sweeps and per-note Poly Aftertouch (0xAn) sweeps.  Exercises
+///    both pressure paths and their dedup.
 ///
-/// Between scenarios there's a ~1.5 s pause so log output is easy to
-/// read.  After the last scenario, it loops back to the first.
+/// Between scenarios there's a 200 ms pause so the link runs essentially
+/// continuously during walk-around tests.  After the last scenario, it
+/// loops back to the first.
 ///
 /// Each call to `next_message` waits until the next event's deadline
 /// (using `embassy_time::Timer`) before returning bytes — so the
@@ -116,6 +125,9 @@ enum ScenarioId {
     QuickStabs,
     PitchWheel,
     ModWheel,
+    MixerAutomation,
+    PatchWalk,
+    AftertouchSweep,
 }
 
 impl ScenarioId {
@@ -127,7 +139,10 @@ impl ScenarioId {
             Self::KeySmash => Self::QuickStabs,
             Self::QuickStabs => Self::PitchWheel,
             Self::PitchWheel => Self::ModWheel,
-            Self::ModWheel => Self::Scale,
+            Self::ModWheel => Self::MixerAutomation,
+            Self::MixerAutomation => Self::PatchWalk,
+            Self::PatchWalk => Self::AftertouchSweep,
+            Self::AftertouchSweep => Self::Scale,
         }
     }
 }
@@ -138,6 +153,9 @@ enum SynthEvent {
     NoteOff { ch: u8, note: u8 },
     PitchBend { ch: u8, value: u16 },
     ControlChange { ch: u8, ctrl: u8, value: u8 },
+    ProgramChange { ch: u8, program: u8 },
+    ChannelPressure { ch: u8, value: u8 },
+    PolyAftertouch { ch: u8, note: u8, value: u8 },
 }
 
 impl SynthEvent {
@@ -167,6 +185,22 @@ impl SynthEvent {
                 buf[2] = value & 0x7F;
                 3
             }
+            Self::ProgramChange { ch, program } => {
+                buf[0] = 0xC0 | (ch & 0x0F);
+                buf[1] = program & 0x7F;
+                2
+            }
+            Self::ChannelPressure { ch, value } => {
+                buf[0] = 0xD0 | (ch & 0x0F);
+                buf[1] = value & 0x7F;
+                2
+            }
+            Self::PolyAftertouch { ch, note, value } => {
+                buf[0] = 0xA0 | (ch & 0x0F);
+                buf[1] = note & 0x7F;
+                buf[2] = value & 0x7F;
+                3
+            }
         }
     }
 }
@@ -192,18 +226,23 @@ impl ScenarioSource {
             ScenarioId::QuickStabs => quick_stab_event(self.step),
             ScenarioId::PitchWheel => pitch_wheel_event(self.step),
             ScenarioId::ModWheel => mod_wheel_event(self.step),
+            ScenarioId::MixerAutomation => mixer_automation_event(self.step),
+            ScenarioId::PatchWalk => patch_walk_event(self.step),
+            ScenarioId::AftertouchSweep => aftertouch_sweep_event(self.step),
         }
     }
 
     /// Advance to the next step, rolling over to the next scenario when
-    /// the current one runs out.  Inserts a 1.5 s gap between scenarios.
+    /// the current one runs out.  Inserts a short 200 ms gap between
+    /// scenarios so the link runs essentially continuously during walk
+    /// tests but transitions remain visible in the log.
     fn advance(&mut self) {
         self.step += 1;
         if self.current().is_none() {
             self.scenario = self.scenario.next();
             self.step = 0;
             self.announced = false;
-            self.next_due = Some(Instant::now() + Duration::from_millis(1500));
+            self.next_due = Some(Instant::now() + Duration::from_millis(200));
         }
     }
 }
@@ -445,6 +484,167 @@ fn mod_wheel_event(step: usize) -> Option<(SynthEvent, u32)> {
         127u8.saturating_sub((s as u32 * 127 / HALF as u32) as u8)
     };
     Some((SynthEvent::ControlChange { ch: 0, ctrl: 1, value }, 5))
+}
+
+/// Concurrent mixer automation: tweens CC#7 (volume) and CC#10 (pan) on
+/// channels 0–2, with CC#64 (sustain) toggling on ch 0.  Each "frame"
+/// emits 7 events (3 vol + 3 pan + occasional sustain) at ~30 ms cadence.
+/// Tests the new "all CCs get delayed copies" path with concurrent sweeps
+/// across channels and controllers — the steady-state wire bandwidth
+/// should stay close to K=3 because dedup_for_incoming cancels stale
+/// pending values per (ch, cc#).
+fn mixer_automation_event(step: usize) -> Option<(SynthEvent, u32)> {
+    const FRAMES: usize = 32; // ~32 frames × ~210 ms ≈ 6.7 s
+    const EVENTS_PER_FRAME: usize = 7;
+    if step >= FRAMES * EVENTS_PER_FRAME {
+        return None;
+    }
+    let frame = step / EVENTS_PER_FRAME;
+    let local = step % EVENTS_PER_FRAME;
+    // Phase the three channel tweens so they don't all peak together.
+    // Volume = triangle wave, Pan = sine-ish via simple folding.
+    let triangle = |t: usize, period: usize| -> u8 {
+        let p = (t * 2) % period;
+        let half = period / 2;
+        if p < half {
+            (p as u32 * 127 / half as u32) as u8
+        } else {
+            let q = p - half;
+            127u8.saturating_sub((q as u32 * 127 / half as u32) as u8)
+        }
+    };
+    let vol = |ch: u8| triangle(frame + ch as usize * 4, FRAMES);
+    let pan = |ch: u8| triangle(frame + ch as usize * 4 + 8, FRAMES);
+
+    // Inter-event delay within a frame is short (5 ms); the last event
+    // of the frame holds for ~180 ms before the next frame begins.
+    let last_in_frame = local == EVENTS_PER_FRAME - 1;
+    let delay = if last_in_frame { 180 } else { 5 };
+    let event = match local {
+        0 => SynthEvent::ControlChange { ch: 0, ctrl: 7, value: vol(0) },
+        1 => SynthEvent::ControlChange { ch: 1, ctrl: 7, value: vol(1) },
+        2 => SynthEvent::ControlChange { ch: 2, ctrl: 7, value: vol(2) },
+        3 => SynthEvent::ControlChange { ch: 0, ctrl: 10, value: pan(0) },
+        4 => SynthEvent::ControlChange { ch: 1, ctrl: 10, value: pan(1) },
+        5 => SynthEvent::ControlChange { ch: 2, ctrl: 10, value: pan(2) },
+        // Sustain pedal on ch 0: press for the first half, release the
+        // second.  Tests that CC#64 latched-state survives the link.
+        6 => {
+            let value: u8 = if frame < FRAMES / 2 { 127 } else { 0 };
+            SynthEvent::ControlChange { ch: 0, ctrl: 64, value }
+        }
+        _ => unreachable!(),
+    };
+    Some((event, delay))
+}
+
+/// Patch walk: cycle through several patches on ch 0 and ch 9, sending
+/// `[Bank MSB][Bank LSB][PC][NoteOn..NoteOff]` for each.  The note plays
+/// briefly so the patch change is audible end-to-end if any synth is
+/// hooked up.  This is the "stuck on wrong patch" failure mode the
+/// delayed-copy retransmits are meant to defend against — every PC and
+/// CC#0/CC#32 here gets the full main-K=3 + 2× delayed-copy reliability.
+fn patch_walk_event(step: usize) -> Option<(SynthEvent, u32)> {
+    // (channel, bank_msb, bank_lsb, program, note)
+    const PATCHES: &[(u8, u8, u8, u8, u8)] = &[
+        (0, 0, 0, 0, 60),    // ch 0, GM Acoustic Grand
+        (0, 0, 0, 32, 60),   // ch 0, GM Acoustic Bass
+        (0, 0, 0, 56, 67),   // ch 0, GM Trumpet
+        (0, 121, 0, 73, 72), // ch 0, MSB-only bank (GM2 Pan Flute, fictional)
+        (9, 0, 0, 0, 36),    // ch 9 (drums), kit 0, kick
+        (9, 0, 0, 16, 38),   // ch 9, power kit, snare
+    ];
+    const STEPS_PER_PATCH: usize = 5; // MSB, LSB, PC, NoteOn, NoteOff
+    if step >= PATCHES.len() * STEPS_PER_PATCH {
+        return None;
+    }
+    let (ch, msb, lsb, program, note) = PATCHES[step / STEPS_PER_PATCH];
+    let local = step % STEPS_PER_PATCH;
+    match local {
+        0 => Some((SynthEvent::ControlChange { ch, ctrl: 0, value: msb }, 3)),
+        1 => Some((SynthEvent::ControlChange { ch, ctrl: 32, value: lsb }, 3)),
+        2 => Some((SynthEvent::ProgramChange { ch, program }, 50)),
+        3 => Some((SynthEvent::NoteOn { ch, note, vel: 100 }, 250)),
+        // Hold each patch's test note for 250 ms; gap 250 ms before
+        // moving to the next patch.
+        4 => Some((SynthEvent::NoteOff { ch, note }, 250)),
+        _ => unreachable!(),
+    }
+}
+
+/// Aftertouch sweep: press a 3-note chord on ch 0, then sweep Channel
+/// Pressure (0xDn) up and down across the held chord, then sweep Poly
+/// Aftertouch (0xAn) on each note in turn, then release the chord.
+/// Tests both pressure paths and their dedup:
+/// * CP cancels by channel only — repeated CP values should dedup
+///   pending stale copies the same way pitch bend does.
+/// * PolyAT cancels by (ch, note) — per-note sweeps on different notes
+///   should not interfere.
+fn aftertouch_sweep_event(step: usize) -> Option<(SynthEvent, u32)> {
+    const CHORD: &[u8] = &[60, 64, 67]; // C major triad on ch 0
+    const CP_STEPS: usize = 32; // 16 up + 16 down
+    const PAT_STEPS_PER_NOTE: usize = 16; // 8 up + 8 down per note
+    const PAT_TOTAL: usize = PAT_STEPS_PER_NOTE * 3;
+    const PRESS: usize = 3;
+    const RELEASE: usize = 3;
+    const TOTAL: usize = PRESS + CP_STEPS + PAT_TOTAL + RELEASE;
+    if step >= TOTAL {
+        return None;
+    }
+
+    // Phase 1: NoteOn the chord, last NoteOn holds 50 ms before CP starts.
+    if step < PRESS {
+        let last = step == PRESS - 1;
+        let delay = if last { 50 } else { 3 };
+        return Some((
+            SynthEvent::NoteOn { ch: 0, note: CHORD[step], vel: 100 },
+            delay,
+        ));
+    }
+
+    // Phase 2: Channel Pressure sweep 0 → 127 → 0 across ch 0.
+    let after_press = step - PRESS;
+    if after_press < CP_STEPS {
+        let half = CP_STEPS / 2;
+        let value: u8 = if after_press < half {
+            ((after_press + 1) as u32 * 127 / half as u32) as u8
+        } else {
+            let s = after_press - half;
+            127u8.saturating_sub((s as u32 * 127 / half as u32) as u8)
+        };
+        let last = after_press == CP_STEPS - 1;
+        let delay = if last { 30 } else { 8 };
+        return Some((SynthEvent::ChannelPressure { ch: 0, value }, delay));
+    }
+
+    // Phase 3: PolyAftertouch — sweep 0 → 127 → 0 on each chord note in turn.
+    let after_cp = after_press - CP_STEPS;
+    if after_cp < PAT_TOTAL {
+        let note_idx = after_cp / PAT_STEPS_PER_NOTE;
+        let local = after_cp % PAT_STEPS_PER_NOTE;
+        let half = PAT_STEPS_PER_NOTE / 2;
+        let value: u8 = if local < half {
+            ((local + 1) as u32 * 127 / half as u32) as u8
+        } else {
+            let s = local - half;
+            127u8.saturating_sub((s as u32 * 127 / half as u32) as u8)
+        };
+        let last_in_note = local == PAT_STEPS_PER_NOTE - 1;
+        let delay = if last_in_note { 30 } else { 8 };
+        return Some((
+            SynthEvent::PolyAftertouch { ch: 0, note: CHORD[note_idx], value },
+            delay,
+        ));
+    }
+
+    // Phase 4: NoteOff the chord, last NoteOff holds 200 ms before scenario ends.
+    let after_pat = after_cp - PAT_TOTAL;
+    let last = after_pat == RELEASE - 1;
+    let delay = if last { 200 } else { 3 };
+    Some((
+        SynthEvent::NoteOff { ch: 0, note: CHORD[after_pat] },
+        delay,
+    ))
 }
 
 // ── Synthetic sink: defmt logger ────────────────────────────────────────────

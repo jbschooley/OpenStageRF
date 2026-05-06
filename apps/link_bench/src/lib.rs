@@ -392,14 +392,22 @@ where
     // Updated on every accepted ChannelVoice; checked on each
     // Heartbeat carrying an active-channel mask.
     let mut rx_state = PressedNotes::new();
-    // Confirmation counter: only act on a heartbeat mask after seeing
-    // it match for ≥ STABLE_HEARTBEATS consecutive heartbeats.  Guards
-    // against single-bit flips in a single heartbeat body.
-    let mut last_heartbeat_mask: Option<u16> = None;
-    let mut stable_heartbeat_count: u32 = 0;
-    /// Heartbeats need to agree this many times before we trust the
-    /// mask and act.  At HEARTBEAT_MS=10 default, this is ~20 ms.
-    const STABLE_HEARTBEATS: u32 = 2;
+    // Per-channel "divergence first observed" timestamp.  When a
+    // heartbeat mask says ch X is silent but RX still has notes
+    // pressed in ch X, we record `now`.  The divergence must persist
+    // for at least `STUCK_NOTE_MIN_DIVERGENCE_MS` before we fire
+    // recovery — this protects against the legitimate race where TX
+    // updates its mask the instant a NoteOff is *pushed* but the
+    // NoteOff packet (or its main K=3 / +30 / +60 ms delayed copies)
+    // hasn't reached RX yet.  The +60 ms delayed copy is the latest a
+    // legitimate NoteOff can arrive, so the threshold must comfortably
+    // exceed it.  When the divergence clears (mask now reflects RX's
+    // pressed state, or RX cleared the channel) the timestamp resets.
+    let mut divergence_since: [Option<Instant>; 16] = [None; 16];
+    /// Minimum continuous divergence before stuck-note recovery fires.
+    /// Must exceed the +60 ms delayed-copy ceiling with slack for
+    /// heartbeat-cadence jitter; 100 ms gives 40 ms of head-room.
+    const STUCK_NOTE_MIN_DIVERGENCE_MS: u64 = 100;
     // Counter of stuck-channel recoveries fired (diagnostic).
     let mut stuck_recoveries: u32 = 0;
 
@@ -444,69 +452,75 @@ where
                 });
 
                 // Stuck-note recovery: if this packet was a heartbeat
-                // carrying a mask AND the mask has been stable for
-                // STABLE_HEARTBEATS consecutive heartbeats, look for
-                // channels where TX says silent but RX has notes
-                // pressed.  For each stuck note, send a SELECTIVE
-                // NoteOff (status 0x80, vel 0) — NOT a blanket CC 123
-                // (All Notes Off).  Selective NoteOffs only release
-                // the notes RX believes are still down; they don't
-                // touch concurrent release-phase notes from earlier
-                // properly-delivered NoteOffs, so the synth's release
-                // tails on unrelated notes aren't cut.  The receiver's
-                // PressedNotes bitmap tells us exactly which notes to
-                // release per channel.
+                // carrying a mask, check each channel where TX says
+                // silent but RX has notes pressed.  Only fire recovery
+                // for channels where that divergence has persisted
+                // continuously for ≥ `STUCK_NOTE_MIN_DIVERGENCE_MS` —
+                // shorter divergences are almost certainly the
+                // legitimate race between a NoteOff being pushed (TX
+                // mask flips to 0) and that NoteOff actually reaching
+                // RX (up to +60 ms via delayed-copy retransmits).
+                //
+                // For each stuck channel, send SELECTIVE NoteOffs
+                // (status 0x80, vel 0) for the notes RX believes are
+                // still down — NOT a blanket CC 123.  This preserves
+                // release tails on unrelated notes while still
+                // clearing the genuinely-stuck ones.
                 if let Some(mask_opt) = heartbeat_mask {
                     match mask_opt {
                         Some(mask) => {
-                            if Some(mask) == last_heartbeat_mask {
-                                stable_heartbeat_count =
-                                    stable_heartbeat_count.saturating_add(1);
-                            } else {
-                                last_heartbeat_mask = Some(mask);
-                                stable_heartbeat_count = 1;
-                            }
-                            if stable_heartbeat_count >= STABLE_HEARTBEATS {
-                                let needed = rx_state.missing_clear(mask);
-                                if needed != 0 {
-                                    for ch in 0..16u8 {
-                                        if needed & (1 << ch) == 0 {
-                                            continue;
-                                        }
-                                        let pressed = rx_state.pressed_on(ch);
-                                        let mut count = 0u32;
-                                        for note in 0..128u8 {
-                                            if pressed & (1u128 << note) != 0 {
-                                                let mut noteoff: heapless::Vec<u8, 8> =
-                                                    heapless::Vec::new();
-                                                let _ = noteoff.extend_from_slice(&[
-                                                    0x80 | ch,
-                                                    note,
-                                                    0,
-                                                ]);
-                                                let _ = events
-                                                    .push(BufferedEvent::Midi(noteoff));
-                                                count += 1;
-                                            }
-                                        }
-                                        rx_state.clear_channel(ch);
-                                        stuck_recoveries =
-                                            stuck_recoveries.wrapping_add(1);
-                                        defmt::warn!(
-                                            "RX stuck-note recovery: ch {} → {} selective NoteOff(s) (total recoveries={})",
-                                            ch,
-                                            count,
-                                            stuck_recoveries
-                                        );
+                            let needed = rx_state.missing_clear(mask);
+                            for ch in 0..16u8 {
+                                let bit = 1u16 << ch;
+                                if needed & bit == 0 {
+                                    // No divergence on this channel —
+                                    // reset its timer.
+                                    divergence_since[ch as usize] = None;
+                                    continue;
+                                }
+                                // Divergence present.  Start the timer
+                                // if this is the first observation.
+                                let started = divergence_since[ch as usize]
+                                    .get_or_insert(now);
+                                if now.duration_since(*started)
+                                    < Duration::from_millis(STUCK_NOTE_MIN_DIVERGENCE_MS)
+                                {
+                                    continue;
+                                }
+                                // Persisted long enough — recover.
+                                let pressed = rx_state.pressed_on(ch);
+                                let mut count = 0u32;
+                                for note in 0..128u8 {
+                                    if pressed & (1u128 << note) != 0 {
+                                        let mut noteoff: heapless::Vec<u8, 8> =
+                                            heapless::Vec::new();
+                                        let _ = noteoff.extend_from_slice(&[
+                                            0x80 | ch,
+                                            note,
+                                            0,
+                                        ]);
+                                        let _ = events
+                                            .push(BufferedEvent::Midi(noteoff));
+                                        count += 1;
                                     }
                                 }
+                                rx_state.clear_channel(ch);
+                                divergence_since[ch as usize] = None;
+                                stuck_recoveries =
+                                    stuck_recoveries.wrapping_add(1);
+                                defmt::warn!(
+                                    "RX stuck-note recovery: ch {} → {} selective NoteOff(s) (total recoveries={})",
+                                    ch,
+                                    count,
+                                    stuck_recoveries
+                                );
                             }
                         }
                         None => {
-                            // Legacy 0-byte heartbeat — reset confirmation
-                            // tracking so we don't half-trust an old state.
-                            last_heartbeat_mask = None;
-                            stable_heartbeat_count = 0;
+                            // Legacy 0-byte heartbeat — reset all
+                            // divergence timers so a stale mask
+                            // doesn't pollute recovery.
+                            divergence_since = [None; 16];
                         }
                     }
                 }
@@ -571,12 +585,12 @@ where
                     }
                     receiver.mark_link_down();
                     // Watchdog all-notes-off clears local pressed-notes
-                    // state; also reset the heartbeat-mask confirmation
-                    // counter so a stale mask doesn't pollute recovery
-                    // when the link comes back.
+                    // state; also reset the per-channel divergence
+                    // timers so a stale mask from before the link drop
+                    // doesn't pollute recovery when the link comes
+                    // back.
                     rx_state.reset();
-                    last_heartbeat_mask = None;
-                    stable_heartbeat_count = 0;
+                    divergence_since = [None; 16];
                     let _ = led.toggle();
                 }
                 wd.kick();
