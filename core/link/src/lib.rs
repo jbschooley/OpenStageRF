@@ -22,12 +22,14 @@ pub use proto::{
 };
 
 pub mod midi_tx;
+pub mod state;
 pub mod sysex;
 
 pub use midi_tx::{
     MidiTxQueue, PoppedPacket, QueueKind, DEFAULT_CREDITS, QUEUE_CAPACITY,
     REALTIME_PRIORITY, REGULAR_PRIORITY, SYSEX_PRIORITY,
 };
+pub use state::{ChannelNoteCounts, PressedNotes};
 pub use sysex::{
     SysExOutcome, SysExReassembler, MAX_CONCURRENT_SYSEX, MAX_FRAGS_PER_SYSEX, MAX_SYSEX_BYTES,
 };
@@ -159,7 +161,15 @@ impl From<proto::DecodeError> for RxError {
 pub enum RxEvent<'a> {
     /// Heartbeat packet — no MIDI to deliver, watchdog already kicked
     /// implicitly by accepting the packet.
-    Heartbeat,
+    ///
+    /// The optional u16 is the TX-reported active-channel mask: bit
+    /// `i` set ⇔ channel `i` has at least one note pressed at the TX
+    /// (see [`ChannelNoteCounts`]).  `None` means the packet had no
+    /// state info (legacy 0-byte heartbeat or malformed body).  Used
+    /// by the stuck-note recovery path: when TX says a channel is
+    /// silent but RX still has notes pressed, the caller fires CC 123
+    /// (All Notes Off) for that channel.
+    Heartbeat(Option<u16>),
     /// A single channel-voice MIDI message that survived event-level
     /// dedup.  Bytes are the raw MIDI message (1–3 bytes including
     /// status byte).
@@ -284,7 +294,16 @@ impl LinkReceiver {
         // 6. Dispatch by event_type.
         match hdr.event_type {
             EventType::Heartbeat => {
-                on_event(RxEvent::Heartbeat);
+                // Heartbeat body carries an optional 2-byte active-channel
+                // mask (big-endian).  Empty body or any other length is
+                // treated as "no info" so we don't fire spurious stuck-
+                // note recovery on malformed or legacy packets.
+                let mask = if body.len() == 2 {
+                    Some(u16::from_be_bytes([body[0], body[1]]))
+                } else {
+                    None
+                };
+                on_event(RxEvent::Heartbeat(mask));
                 Ok(Ok(()))
             }
             EventType::ChannelVoice => {
@@ -730,15 +749,38 @@ mod tests {
         let mut s = LinkSender::no_crypto(0);
         let mut r = LinkReceiver::no_crypto();
         let mut buf = [0u8; 64];
+        // Empty heartbeat body — receiver should report mask=None.
         let n = s.encode(EventType::Heartbeat, &[], &mut buf).unwrap();
         let mut saw = false;
         r.process(&buf[..n], now(), |ev| {
-            if matches!(ev, RxEvent::Heartbeat) {
+            if let RxEvent::Heartbeat(mask) = ev {
+                assert_eq!(mask, None, "empty body should produce None mask");
                 saw = true;
             }
         })
         .unwrap()
         .unwrap();
         assert!(saw);
+    }
+
+    #[test]
+    fn receiver_decodes_heartbeat_active_mask() {
+        let mut s = LinkSender::no_crypto(0);
+        let mut r = LinkReceiver::no_crypto();
+        let mut buf = [0u8; 64];
+        // Heartbeat body = 2-byte big-endian active-channel mask.  Bit 0
+        // and bit 5 set → channels 0 and 5 are active.
+        let mask: u16 = 0b0000_0000_0010_0001;
+        let body = mask.to_be_bytes();
+        let n = s.encode(EventType::Heartbeat, &body, &mut buf).unwrap();
+        let mut decoded: Option<u16> = None;
+        r.process(&buf[..n], now(), |ev| {
+            if let RxEvent::Heartbeat(m) = ev {
+                decoded = m;
+            }
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(decoded, Some(mask));
     }
 }

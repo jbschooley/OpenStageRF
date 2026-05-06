@@ -30,8 +30,8 @@ use embedded_hal::digital::StatefulOutputPin;
 use embedded_hal_async::{digital::Wait, spi::SpiDevice};
 
 use osrf_link::{
-    EventType, HeartbeatTimer, LinkReceiver, LinkSender, MidiTxQueue, PoppedPacket, QueueKind,
-    RxDrop, RxEvent, WatchdogTimer, MAX_BODY_LEN,
+    ChannelNoteCounts, EventType, HeartbeatTimer, LinkReceiver, LinkSender, MidiTxQueue,
+    PoppedPacket, PressedNotes, QueueKind, RxDrop, RxEvent, WatchdogTimer, MAX_BODY_LEN,
 };
 use osrf_radio_sx126x::{
     GfskBandwidth, GfskPulseShape, RadioError, RfSwitchControl, Sx1262Radio,
@@ -212,6 +212,10 @@ where
     let mut sender = LinkSender::no_crypto(boot_counter);
     let mut hb = HeartbeatTimer::new(Duration::from_millis(config.heartbeat_ms));
     let mut queue = MidiTxQueue::new();
+    // Per-channel pressed-note counts for the heartbeat active-channel
+    // mask.  Updated on every successful push_channel_voice; encoded
+    // into the body of every heartbeat sent below.
+    let mut tx_state = ChannelNoteCounts::new();
     let mut midi_buf = [0u8; 4];
     let mut body_buf = [0u8; MAX_BODY_LEN];
     let mut wire_buf = [0u8; RF_PAYLOAD_MAX as usize];
@@ -230,7 +234,12 @@ where
         loop {
             match source.try_next(&mut midi_buf) {
                 Ok(Some(n)) => {
-                    if !queue.push_channel_voice(&midi_buf[..n], now) {
+                    let msg = &midi_buf[..n];
+                    if queue.push_channel_voice(msg, now) {
+                        // Track the note-count change so the next
+                        // heartbeat carries an accurate active mask.
+                        tx_state.observe(msg);
+                    } else {
                         overflow_count = overflow_count.wrapping_add(1);
                         defmt::error!(
                             "link_bench TX: queue overflow! dropping (overflows={})",
@@ -279,8 +288,12 @@ where
             }
         }
 
-        // Send heartbeat (single copy — next one is ≤ heartbeat_ms away).
-        match sender.encode(EventType::Heartbeat, &[], &mut wire_buf) {
+        // Send heartbeat (single copy — next one is ≤ heartbeat_ms
+        // away).  The body is a 2-byte big-endian active-channel mask
+        // — the receiver uses it to detect channels with stuck notes
+        // and fire CC 123 (All Notes Off) for any that need recovery.
+        let mask_body = tx_state.active_mask().to_be_bytes();
+        match sender.encode(EventType::Heartbeat, &mask_body, &mut wire_buf) {
             Ok(wire_n) => {
                 if let Err(_) = radio.tx(&wire_buf[..wire_n]).await {
                     defmt::error!("link_bench TX: radio.tx() failed");
@@ -375,6 +388,20 @@ where
     let mut prev_crc: u32 = 0;
     let mut link_up = false;
     let mut events: heapless::Vec<BufferedEvent, 32> = heapless::Vec::new();
+    // Local pressed-notes tracker for the heartbeat-state failsafe.
+    // Updated on every accepted ChannelVoice; checked on each
+    // Heartbeat carrying an active-channel mask.
+    let mut rx_state = PressedNotes::new();
+    // Confirmation counter: only act on a heartbeat mask after seeing
+    // it match for ≥ STABLE_HEARTBEATS consecutive heartbeats.  Guards
+    // against single-bit flips in a single heartbeat body.
+    let mut last_heartbeat_mask: Option<u16> = None;
+    let mut stable_heartbeat_count: u32 = 0;
+    /// Heartbeats need to agree this many times before we trust the
+    /// mask and act.  At HEARTBEAT_MS=10 default, this is ~20 ms.
+    const STABLE_HEARTBEATS: u32 = 2;
+    // Counter of stuck-channel recoveries fired (diagnostic).
+    let mut stuck_recoveries: u32 = 0;
 
     loop {
         events.clear();
@@ -389,13 +416,19 @@ where
 
                 let n = pkt.len.min(radio_buf.len());
                 let now = Instant::now();
+                // Snapshot what we may need outside the closure.
+                let mut heartbeat_mask: Option<Option<u16>> = None;
                 let result = receiver.process(&radio_buf[..n], now, |ev| {
                     match ev {
-                        RxEvent::Heartbeat => {
+                        RxEvent::Heartbeat(mask) => {
                             accepted_heartbeats = accepted_heartbeats.wrapping_add(1);
+                            heartbeat_mask = Some(mask);
                         }
                         RxEvent::ChannelVoice(midi) => {
                             accepted_midi = accepted_midi.wrapping_add(1);
+                            // Track local pressed-notes state so we can
+                            // detect divergence from TX's heartbeat mask.
+                            rx_state.observe(midi);
                             let mut v: heapless::Vec<u8, 8> = heapless::Vec::new();
                             let _ = v.extend_from_slice(midi);
                             let _ = events.push(BufferedEvent::Midi(v));
@@ -409,6 +442,74 @@ where
                         }
                     }
                 });
+
+                // Stuck-note recovery: if this packet was a heartbeat
+                // carrying a mask AND the mask has been stable for
+                // STABLE_HEARTBEATS consecutive heartbeats, look for
+                // channels where TX says silent but RX has notes
+                // pressed.  For each stuck note, send a SELECTIVE
+                // NoteOff (status 0x80, vel 0) — NOT a blanket CC 123
+                // (All Notes Off).  Selective NoteOffs only release
+                // the notes RX believes are still down; they don't
+                // touch concurrent release-phase notes from earlier
+                // properly-delivered NoteOffs, so the synth's release
+                // tails on unrelated notes aren't cut.  The receiver's
+                // PressedNotes bitmap tells us exactly which notes to
+                // release per channel.
+                if let Some(mask_opt) = heartbeat_mask {
+                    match mask_opt {
+                        Some(mask) => {
+                            if Some(mask) == last_heartbeat_mask {
+                                stable_heartbeat_count =
+                                    stable_heartbeat_count.saturating_add(1);
+                            } else {
+                                last_heartbeat_mask = Some(mask);
+                                stable_heartbeat_count = 1;
+                            }
+                            if stable_heartbeat_count >= STABLE_HEARTBEATS {
+                                let needed = rx_state.missing_clear(mask);
+                                if needed != 0 {
+                                    for ch in 0..16u8 {
+                                        if needed & (1 << ch) == 0 {
+                                            continue;
+                                        }
+                                        let pressed = rx_state.pressed_on(ch);
+                                        let mut count = 0u32;
+                                        for note in 0..128u8 {
+                                            if pressed & (1u128 << note) != 0 {
+                                                let mut noteoff: heapless::Vec<u8, 8> =
+                                                    heapless::Vec::new();
+                                                let _ = noteoff.extend_from_slice(&[
+                                                    0x80 | ch,
+                                                    note,
+                                                    0,
+                                                ]);
+                                                let _ = events
+                                                    .push(BufferedEvent::Midi(noteoff));
+                                                count += 1;
+                                            }
+                                        }
+                                        rx_state.clear_channel(ch);
+                                        stuck_recoveries =
+                                            stuck_recoveries.wrapping_add(1);
+                                        defmt::warn!(
+                                            "RX stuck-note recovery: ch {} → {} selective NoteOff(s) (total recoveries={})",
+                                            ch,
+                                            count,
+                                            stuck_recoveries
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            // Legacy 0-byte heartbeat — reset confirmation
+                            // tracking so we don't half-trust an old state.
+                            last_heartbeat_mask = None;
+                            stable_heartbeat_count = 0;
+                        }
+                    }
+                }
                 match result {
                     Ok(Ok(())) => {
                         accepted = accepted.wrapping_add(1);
@@ -469,6 +570,13 @@ where
                         defmt::error!("sink all_notes_off failed");
                     }
                     receiver.mark_link_down();
+                    // Watchdog all-notes-off clears local pressed-notes
+                    // state; also reset the heartbeat-mask confirmation
+                    // counter so a stale mask doesn't pollute recovery
+                    // when the link comes back.
+                    rx_state.reset();
+                    last_heartbeat_mask = None;
+                    stable_heartbeat_count = 0;
                     let _ = led.toggle();
                 }
                 wd.kick();
