@@ -2,26 +2,31 @@
 #![no_std]
 #![no_main]
 
-//! Milestone 4 link-layer bench, TX side, T114 deployment.
+//! Link-layer bench, TX side, T114 deployment.
 //!
 //! Wires the T114 board's `radio0` + `status_led` into
-//! `osrf_app_link_bench::run_tx`, with the synthetic [`ChordHoldSource`]:
-//! sends NoteOn for C, E, G at startup, then idles forever (heartbeats
-//! fill the gap so the receiver's watchdog stays fed).
+//! `osrf_app_link_bench::run_tx`, with the synthetic [`ScenarioSource`]:
+//! cycles through a battery of realistic MIDI scenarios (scale, chord
+//! progression, glissando, key smash, quick stabs, pitch wheel, mod
+//! wheel) so the link layer is exercised across the priority,
+//! batching, dedup, cancellation, and high-rate-CC paths.
 //!
-//! For the M4 exit-criterion test:
+//! For an end-to-end test:
 //!   1. Power on RX board (`profiles/t114_link_rx`).
-//!   2. Power on this TX board.  RX should log three "MIDI OUT" lines.
-//!   3. Pull power on this TX board.  Within 200 ms, RX should log
-//!      `LINK LOST` and `MIDI OUT: ALL_NOTES_OFF`.
+//!   2. Power on this TX board.  RX should log MIDI events as each
+//!      scenario plays out.
+//!   3. Pull power on this TX board mid-scenario.  Within 200 ms RX
+//!      should log `LINK LOST` and `MIDI OUT: ALL_NOTES_OFF`.
+//!   4. Repower TX.  RX should pick up the next scenario without
+//!      issue (session-reset path verified).
 //!
-//! When the MIDI FeatherWing arrives (Milestone 3 hardware), swap the
-//! `ChordHoldSource` import for a `BufferedUarteSource` (or whatever we
-//! end up calling the UART-backed source in `osrf_app_link_bench`) — no
-//! changes to `run_tx` itself.
+//! When the MIDI FeatherWing arrives, swap the `ScenarioSource` import
+//! for a `BufferedUarteSource` (or whatever we end up calling the
+//! UART-backed source in `osrf_app_link_bench`) — no changes to
+//! `run_tx` itself.
 
 use embassy_executor::Spawner;
-use osrf_app_link_bench::{run_tx, synthetic::ChordHoldSource};
+use osrf_app_link_bench::{run_tx, synthetic::ScenarioSource};
 use osrf_board_t114 as board;
 
 use defmt_rtt as _;
@@ -48,7 +53,7 @@ async fn main(_spawner: Spawner) {
     let boot_counter = read_random_u16();
     defmt::info!("boot_counter = {} (random per-boot)", boot_counter);
 
-    let mut source = ChordHoldSource::new();
+    let mut source = ScenarioSource::new();
     run_tx(&mut r.radio0, &mut r.status_led, &mut source, boot_counter).await
 }
 

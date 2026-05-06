@@ -217,6 +217,15 @@ impl LinkReceiver {
         self.boot_session
     }
 
+    /// Highest `packet_seq` accepted from the current session, or `None`
+    /// if no packet has been processed yet.  Useful for stats: the
+    /// difference between two snapshots gives the number of packets TX
+    /// actually transmitted in that window (since `packet_seq`
+    /// increments per wire transmission, including retransmits).
+    pub fn last_packet_seq(&self) -> Option<u32> {
+        self.packet_replay.high()
+    }
+
     /// Decode + dedup `wire`, calling `on_event` for each observable
     /// event that survives all checks (heartbeat, individual
     /// channel-voice messages, complete SysEx).  Returns `Ok(())` if
@@ -407,16 +416,21 @@ impl HeartbeatTimer {
     }
 
     /// Note that the app just sent something (heartbeat or otherwise).
-    /// Advances the next-due deadline by exactly `interval` from the
-    /// previous one, giving a fixed-rate cadence regardless of how long
-    /// each `tx()` takes.  If we've fallen behind, snap forward.
+    /// The next heartbeat deadline is reset to `interval` from now, so
+    /// a heartbeat fires only after `interval` of silence following any
+    /// transmission.
+    ///
+    /// We deliberately do NOT advance from the previous deadline — that
+    /// approach (intended to give a fixed-rate cadence) interacts badly
+    /// with K=3 retransmit bursts.  Each `note_send` call would push
+    /// the deadline `interval` further out, while wall clock barely
+    /// advances.  After ~100 ms of bursting at 200 events/sec, the
+    /// deadline is seconds in the future; when the burst ends, the RX
+    /// watchdog (200 ms) trips before any heartbeat actually goes on
+    /// air.  Anchoring to `now + interval` caps how far the deadline
+    /// can get ahead and keeps the receiver fed.
     pub fn note_send(&mut self) {
-        let now = Instant::now();
-        let mut due = self.next_due + self.interval;
-        while due < now {
-            due += self.interval;
-        }
-        self.next_due = due;
+        self.next_due = Instant::now() + self.interval;
     }
 
     pub fn interval(&self) -> Duration {
