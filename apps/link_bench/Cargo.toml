@@ -3,17 +3,12 @@ name        = "osrf-app-link-bench"
 version     = "0.1.0"
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
-description = "Milestone 4 — board-agnostic link-layer bench: LinkSender + LinkReceiver + Heartbeat + Watchdog over the SX1262 radio.  Synthetic MIDI source / sink for hardware verification before M3's MIDI FeatherWing is wired."
+description = "Milestone 4 link-layer bench: synthetic MIDI source/sink driving the shared osrf-link-runtime over the SX1262 radio.  Production firmware (osrf-app-midi-node) shares the runtime but plugs in real DIN MIDI I/O instead."
 
 [dependencies]
-osrf-link          = { path = "../../core/link", features = ["defmt"] }
-osrf-radio-sx126x  = { workspace = true, features = ["defmt"] }
-embedded-hal       = { workspace = true }
-embedded-hal-async = { workspace = true }
-embassy-time       = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
-embassy-futures    = "0.1"
-heapless           = { workspace = true }
-defmt              = { workspace = true }
+osrf-link-runtime = { workspace = true }
+embassy-time      = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
+defmt             = { workspace = true }
 
 [lib]
 test    = false

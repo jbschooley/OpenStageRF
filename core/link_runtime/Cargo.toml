@@ -1,0 +1,21 @@
+[package]
+name        = "osrf-link-runtime"
+version     = "0.1.0"
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "Board-agnostic link-layer node runtime: TX / RX async loops over osrf-link + osrf-radio-sx126x, generic over MidiSource / MidiSink.  Used by both osrf-app-link-bench (synthetic source) and osrf-app-midi-node (real DIN MIDI I/O)."
+
+[dependencies]
+osrf-link          = { path = "../link", features = ["defmt"] }
+osrf-radio-sx126x  = { workspace = true, features = ["defmt"] }
+embedded-hal       = { workspace = true }
+embedded-hal-async = { workspace = true }
+embassy-time       = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-futures    = "0.1"
+heapless           = { workspace = true }
+defmt              = { workspace = true }
+
+[lib]
+test    = false
+doctest = false
+bench   = false

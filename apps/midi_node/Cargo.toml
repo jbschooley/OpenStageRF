@@ -1,42 +1,17 @@
 [package]
-name    = "osrf-app-midi-node"
-version = "0.1.0"
-edition = "2021"
-license = "AGPL-3.0-or-later"
-
-# STM32 platform variant.  When T114/nRF hardware arrives, add a sibling
-# `apps/midi_node_nrf/` crate — embassy-stm32 and embassy-nrf can't coexist
-# in one Cargo.toml because both link the same native `embassy-time-queue`
-# library.
-
-[features]
-# ── Board base ────────────────────────────────────────────────────────────────
-dx_lr30     = ["dep:osrf-board-dx-lr30"]
-dx_lr30_hsi = ["dx_lr30", "osrf-board-dx-lr30/hsi"]
-
-# ── Profiles ──────────────────────────────────────────────────────────────────
-# Each profile feature pulls its profile crate + the board base.  Pass exactly
-# one to xtask.  Adding a profile: workspace dep + optional dep below + feature
-# entry + cfg-gated re-export in src/profile.rs.
-dx_lr30_tx_basic     = ["dx_lr30", "dep:osrf-profile-dx-lr30-tx-basic"]
-dx_lr30_rx_basic     = ["dx_lr30", "dep:osrf-profile-dx-lr30-rx-basic"]
-dx_lr30_rx_diversity = ["dx_lr30", "dep:osrf-profile-dx-lr30-rx-diversity"]
+name        = "osrf-app-midi-node"
+version     = "0.1.0"
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "Milestone 4 integration: real DIN MIDI over the wireless link layer.  Wraps osrf-link-runtime with UART-backed MidiSource (parses keyboard MIDI in via osrf-midi-din) and MidiSink (writes events out to a synth's MIDI in)."
 
 [dependencies]
-osrf-board-dx-lr30                = { workspace = true, optional = true }
-osrf-profile-dx-lr30-tx-basic     = { workspace = true, optional = true }
-osrf-profile-dx-lr30-rx-basic     = { workspace = true, optional = true }
-osrf-profile-dx-lr30-rx-diversity = { workspace = true, optional = true }
-
-cortex-m    = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
-cortex-m-rt = "0.7"
-defmt       = "1.0"
-defmt-rtt   = "1.1"
-panic-probe = { version = "1.0", features = ["print-defmt"] }
-
-embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
-embassy-stm32    = { version = "0.6",  features = ["stm32f103c8", "time-driver-any", "defmt"] }
-embassy-time     = { version = "0.5",  features = ["defmt", "defmt-timestamp-uptime"] }
+osrf-link-runtime  = { workspace = true }
+osrf-midi-din      = { workspace = true, features = ["defmt"] }
+embedded-io-async  = { version = "0.7" }
+embassy-time       = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
+heapless           = { workspace = true }
+defmt              = { workspace = true }
 
 [lib]
 test    = false

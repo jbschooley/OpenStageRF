@@ -9,6 +9,7 @@ members = [
     "boards/dx_lr30",
     "boards/t114",
     "core/link",
+    "core/link_runtime",
     "crypto",
     "drivers/midi/din",
     "drivers/radio/sx126x",
@@ -25,6 +26,8 @@ members = [
     "profiles/t114_blink",
     "profiles/t114_link_rx",
     "profiles/t114_link_tx",
+    "profiles/t114_midi_node_rx",
+    "profiles/t114_midi_node_tx",
     "profiles/t114_midi_rx",
     "profiles/t114_midi_tx",
     "profiles/t114_radio_rx",
@@ -46,6 +49,7 @@ default-members = [
     "apps/ui_bench",
     "boards/dx_lr30",
     "core/link",
+    "core/link_runtime",
     "crypto",
     "drivers/midi/din",
     "drivers/radio/sx126x",
@@ -67,8 +71,10 @@ resolver = "2"
 osrf-app-blink                    = { path = "apps/blink" }
 osrf-app-link-bench               = { path = "apps/link_bench" }
 osrf-app-midi-bench               = { path = "apps/midi_bench" }
+osrf-app-midi-node                = { path = "apps/midi_node" }
 osrf-app-radio-bench              = { path = "apps/radio_bench" }
 osrf-app-ui-bench                 = { path = "apps/ui_bench" }
+osrf-link-runtime                 = { path = "core/link_runtime" }
 osrf-board-dx-lr30                = { path = "boards/dx_lr30" }
 osrf-board-t114                   = { path = "boards/t114" }
 osrf-midi-din                     = { path = "drivers/midi/din" }
@@ -87,6 +93,8 @@ osrf-profile-t114-link-tx         = { path = "profiles/t114_link_tx" }
 osrf-profile-t114-link-rx         = { path = "profiles/t114_link_rx" }
 osrf-profile-t114-midi-tx         = { path = "profiles/t114_midi_tx" }
 osrf-profile-t114-midi-rx         = { path = "profiles/t114_midi_rx" }
+osrf-profile-t114-midi-node-tx    = { path = "profiles/t114_midi_node_tx" }
+osrf-profile-t114-midi-node-rx    = { path = "profiles/t114_midi_node_rx" }
 osrf-profile-t114-radio-tx        = { path = "profiles/t114_radio_tx" }
 osrf-profile-t114-radio-rx        = { path = "profiles/t114_radio_rx" }
 osrf-profile-t114-tx-basic        = { path = "profiles/t114_tx_basic" }
