@@ -20,7 +20,6 @@ osrf-app-ui-bench = { workspace = true }
 
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
 embassy-time     = { version = "0.5" }
-embassy-nrf      = { version = "0.10", features = ["nrf52840", "time-driver-rtc1", "gpiote", "nfc-pins-as-gpio"] }
 
 cortex-m    = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7"
@@ -29,11 +28,7 @@ defmt-rtt   = "1.1"
 panic-probe = { version = "1.0", features = ["print-defmt"] }
 log         = { version = "0.4", optional = true }
 
-# To impl FlushAsync for the foreign mipidsi::Display type and forward
-# DrawTarget through the newtype wrapper.
-mipidsi                = "0.10"
-embedded-hal-bus       = { workspace = true }
-embedded-hal           = { workspace = true }
+# To impl FlushAsync for the board's St7789Display newtype.
 embedded-graphics-core = "0.4"
 
 [[bin]]

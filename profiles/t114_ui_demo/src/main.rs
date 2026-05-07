@@ -4,23 +4,19 @@
 
 //! UI bench demo — T114.
 //!
-//! ⚠ CURRENTLY DOES NOT BUILD ⚠
+//! Drives the built-in 1.14″ ST7789 TFT through `osrf-app-ui-bench`.
+//! Display is initialised by `display.init().await`, backlight is
+//! pulled LOW (active-low on this panel), then `ui_bench::run` paints
+//! "OpenStageRF" + a 1 Hz tick counter forever.
 //!
-//! `osrf_board_t114::Resources::display` was removed because
-//! `mipidsi::Builder::init()` hangs on this hardware (root cause unknown;
-//! SX1262 SPI, raw TWISPI1 SPI write, and `embassy_time::Delay::delay_ms`
-//! all verified working in isolation via the stepwise diagnostic in
-//! `t114_blink`).  Reviving this profile requires either fixing the
-//! mipidsi hand-off or replacing the ST7789 init with a hand-rolled
-//! command sequence.  See git history of `boards/t114/src/lib.rs` for
-//! the original init code.
+//! See `boards/t114/src/{lib.rs,display.rs}` for the v2.1 display
+//! bring-up notes — including the nRF52840 SPIM-on-SCK quirk that
+//! required a manual `PIN_CNF.INPUT=Connect` poke after `Spim::new`.
 
 use defmt_rtt as _;
 use embassy_executor::Spawner;
-use embassy_nrf::gpio::{Level, Output, OutputDrive};
-use embedded_graphics_core::draw_target::DrawTarget;
-use embedded_graphics_core::geometry::Dimensions;
 use embedded_graphics_core::pixelcolor::Rgb565;
+use embedded_graphics_core::prelude::*;
 use embedded_graphics_core::primitives::Rectangle;
 use embedded_graphics_core::Pixel;
 use osrf_board_t114 as board;
@@ -28,19 +24,20 @@ use panic_probe as _;
 
 use osrf_app_ui_bench::FlushAsync;
 
-// Newtype wrapper for the foreign `mipidsi::Display` — needed to satisfy
-// the orphan rule (FlushAsync is foreign-via-app, mipidsi::Display is
-// foreign-via-board).  Drawing forwards directly; flush is a no-op
-// because mipidsi writes to the panel immediately.
-struct St7789Display(board::Display);
+// Newtype wrapper so we can implement the foreign `FlushAsync` trait
+// (defined in osrf-app-ui-bench) for the foreign `St7789Display`
+// (defined in osrf-board-t114).  Drawing forwards directly; flush is
+// a no-op since the hand-rolled driver writes pixels to the panel
+// immediately (no RAM-side framebuffer to push).
+struct DemoDisplay(board::Display);
 
-impl Dimensions for St7789Display {
+impl Dimensions for DemoDisplay {
     fn bounding_box(&self) -> Rectangle {
         self.0.bounding_box()
     }
 }
 
-impl DrawTarget for St7789Display {
+impl DrawTarget for DemoDisplay {
     type Color = Rgb565;
     type Error = <board::Display as DrawTarget>::Error;
     fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
@@ -63,45 +60,33 @@ impl DrawTarget for St7789Display {
     }
 }
 
-impl FlushAsync for St7789Display {
+impl FlushAsync for DemoDisplay {
     type Error = core::convert::Infallible;
     async fn flush(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
 }
 
+#[cortex_m_rt::pre_init]
+unsafe fn pre_init() {
+    board::bootloader_handoff();
+}
+
 #[embassy_executor::main]
-async fn main(spawner: Spawner) {
-    #[cfg(feature = "usb-log")]
-    let r = {
-        let (r, usbd) = board::resources_and_usbd_with(board::clocks::usb_config());
-        board::usb_log::spawn(&spawner, usbd);
-        embassy_time::Timer::after_millis(500).await;
-        r
-    };
-    #[cfg(not(feature = "usb-log"))]
-    let r = {
-        let _ = &spawner;
-        board::resources()
-    };
+async fn main(_spawner: Spawner) {
+    let mut r = board::resources();
+    defmt::info!("UI demo (T114): initialising ST7789");
 
-    defmt::info!("UI demo (T114): display already initialised; turning backlight on");
-    #[cfg(feature = "usb-log")]
-    log::info!("UI demo (T114): turning backlight on");
+    r.display.init().await;
 
-    // The board crate currently leaks the backlight pin in its LOW state
-    // for first bring-up (no garbage flash on init).  Re-claim P0_15 here
-    // and drive it HIGH so the panel is visible.
-    //
-    // SAFETY: P0_15 was leaked (forgotten) by the board crate after being
-    // initialised LOW; this `steal()` re-claims the same pin.  This is a
-    // first-bring-up shortcut — proper fix is a `set_backlight(bool)` API
-    // on board::Resources.
-    let bl_peri = unsafe { embassy_nrf::peripherals::P0_15::steal() };
-    let bl = Output::new(bl_peri, Level::High, OutputDrive::Standard);
-    core::mem::forget(bl);
+    // Clear to black BEFORE turning the backlight on so the user
+    // doesn't see junk pixels at boot.
+    let mut wrapped = DemoDisplay(r.display);
+    let _ = wrapped.clear(Rgb565::BLACK);
 
-    let mut wrapped = St7789Display(r.display);
+    // Backlight on (active LOW on this panel).
+    r.display_backlight.set_low();
+
     if let Err(e) = osrf_app_ui_bench::run(&mut wrapped).await {
         defmt::error!("ui_bench exited: {:?}", defmt::Debug2Format(&e));
     }
