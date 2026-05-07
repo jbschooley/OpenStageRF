@@ -177,10 +177,10 @@ Replaced with hand-rolled raw SPI command layer in `drivers/radio/sx126x/src/lib
 - [x] DX-LR30 board crate exposes `Resources::midi_uart` as `BufferedUart<'static>` over USART3 PB10/PB11.  **DMA conflict resolution**: USART3's hardwired DMA channels (DMA1_CH2/CH3) collide with SPI1's allocation for the SX1262, so the MIDI UART runs interrupt-driven via `BufferedUart` — at 31250 baud the per-byte interrupt is trivial.
 - [x] T114 board crate exposes `Resources::midi_uart` as `BufferedUarte<'static>` over UARTE1 P0_09/P0_10 (consumes TIMER1 + PPI_CH0/CH1 + PPI_GROUP0 for the buffered driver's idle-detect machinery).  Plain `Uarte` only implements `embedded_io_async::Write`, not `Read`, so `BufferedUarte` is the right choice anyway.
 - [x] Profile binaries: `dx_lr30_midi_{rx,tx}`, `t114_midi_{rx,tx}` (the latter pair gated with optional `usb-log` feature mirroring the radio bench profiles).
-- [ ] Bench test on TX side: connect keyboard MIDI OUT to FeatherWing → DX-LR30; play notes; log parsed events via RTT.
-- [ ] Bench test on RX side: synthesize a stream of `MidiEvent::NoteOn`/`NoteOff` in firmware, push out FeatherWing UART, verify on a synth.
+- [x] Bench test on TX side: keyboard MIDI OUT → FeatherWing IN → T114 P0_09; parsed events stream through RTT log via `t114_midi_rx` profile binary.  Validated end-to-end on T114 + Adafruit MIDI FeatherWing.
+- [x] Bench test on RX side: T114 P0_10 → FeatherWing TX → DIN OUT → synth MIDI IN; arpeggio plays cleanly via `t114_midi_tx` profile binary.
 
-**Exit criteria:** keyboard-played MIDI parses to correct events including pitch bend, sustain, real-time clock; firmware-generated MIDI plays back on a synth without artifacts.
+**Exit criteria:** keyboard-played MIDI parses to correct events including pitch bend, sustain, real-time clock; firmware-generated MIDI plays back on a synth without artifacts.  **Met on T114 + Adafruit MIDI FeatherWing.**  DX-LR30 deployment deferred.
 
 ### Milestone 4 — on-air protocol v1 + link layer (5–7 days)
 
@@ -204,11 +204,12 @@ Replaced with hand-rolled raw SPI command layer in `drivers/radio/sx126x/src/lib
   - `HeartbeatTimer::{new, note_send, wait}` — transmitter-side, default 20 ms (10× safety margin against the 200 ms RX watchdog).  Composed with the inbound MIDI source via `select`; any send (MIDI event or heartbeat) defers the next heartbeat.
   - Timer types use `embassy_time::{Instant, Duration, Timer::at}` directly; deadline-based design means kicks before the future resolves are guaranteed to delay (no staleness window).
   - Behaviour validated end-to-end on hardware (Phase 4); host-side mock-time tests deferred since the deadline math is trivial and the await behavior is what actually matters for link liveness.
-- [ ] `osrf-app-midi-node` TX role: read MIDI from FeatherWing → `LinkSender` → radio
-- [ ] `osrf-app-midi-node` RX role: radio → `LinkReceiver` → on `LinkLost`, send all-notes-off; on event, write to FeatherWing UART
-- [ ] Tests in mock-radio harness: dedup correctness, replay rejection, watchdog firing, heartbeat timing.
+- [x] `osrf-app-midi-node` TX role: `UartMidiSource` reads MIDI from FeatherWing IN via `BufferedUarte`, parses via `osrf_midi_din::MidiParser`, re-encodes complete channel-voice events as wire bytes, drives `LinkSender` → radio.  Lives in `apps/midi_node/src/uart.rs`.  Profile binary: `osrf-profile-t114-midi-node-tx`.
+- [x] `osrf-app-midi-node` RX role: radio → `LinkReceiver` → on `LinkLost`, `UartMidiSink::all_notes_off` writes 16 × CC#123 (48 bytes) to the FeatherWing UART; on event, `write_message` writes the 1–3 wire bytes verbatim.  Profile binary: `osrf-profile-t114-midi-node-rx`.
+- [x] **Shared runtime extracted**: `core/link_runtime/` (`osrf-link-runtime`) owns `LinkConfig`, `MidiSource`/`MidiSink` traits, `configure_radio`, `run_tx`, `run_rx`.  Both `osrf-app-link-bench` (synthetic source) and `osrf-app-midi-node` (UART source/sink) consume it; refactor preserves the existing `LinkBenchConfig` name as a type alias for backward compat with existing link-bench profile binaries.
+- [ ] Tests in mock-radio harness: dedup correctness, replay rejection, watchdog firing, heartbeat timing.  Deferred — behaviour validated end-to-end on hardware via rx5–rx12 link-bench runs and the new midi-node smoke test below.
 
-**Exit criteria:** TX and RX boards transmit MIDI events end-to-end. Power off TX while a chord is held → RX receives all-notes-off within 250 ms.
+**Exit criteria:** TX and RX boards transmit MIDI events end-to-end. Power off TX while a chord is held → RX receives all-notes-off within 250 ms.  **Met on T114 + Adafruit MIDI FeatherWing.**  Held chord cuts within 200 ms of TX power loss; link recovers immediately on TX repower.
 
 ### Milestone 5 — end-to-end live test + latency measurement (2–3 days)
 

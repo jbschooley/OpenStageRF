@@ -1,0 +1,27 @@
+[package]
+name        = "osrf-profile-t114-midi-node-tx"
+version     = "0.1.0"
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "Milestone 4 MIDI node TX — T114 deployment of osrf-app-midi-node.  Reads keyboard MIDI in via FeatherWing DIN IN, transmits over the wireless link layer."
+
+[package.metadata.osrf]
+board = "t114"
+
+[dependencies]
+osrf-board-t114    = { workspace = true, features = ["defmt"] }
+osrf-app-midi-node = { workspace = true }
+
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+
+cortex-m    = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7"
+defmt       = "1.0"
+defmt-rtt   = "1.1"
+panic-probe = { version = "1.0", features = ["print-defmt"] }
+
+[[bin]]
+name  = "midi_node_tx"
+path  = "src/main.rs"
+test  = false
+bench = false
