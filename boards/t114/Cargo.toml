@@ -40,10 +40,13 @@ embassy-executor   = { version = "0.10", optional = true, features = ["platform-
 osrf-radio-sx126x  = { workspace = true }
 
 # ── Display: ST7789 240×135 colour TFT on TWISPI1 (SPI mode) ────────────────
-# mipidsi 0.10 ships its own SpiInterface (mipidsi::interface::SpiInterface);
-# no separate display-interface-spi dep needed.  The Display struct
-# implements `embedded_graphics_core::DrawTarget<Color = Rgb565>` directly.
-mipidsi            = "0.10"
+# Hand-rolled driver in `src/display.rs` — replaces the prior mipidsi
+# path which hung during init on this hardware.  We just need the
+# embedded-graphics-core trait surface to implement `DrawTarget` for
+# the panel; `heapless` is for a fixed-size row buffer in the
+# `fill_contiguous` path.
+embedded-graphics-core = "0.4"
+heapless               = { workspace = true }
 
 # ── usb-log feature deps ─────────────────────────────────────────────────────
 # embassy-usb-driver is already pulled in transitively by embassy-nrf 0.10

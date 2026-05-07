@@ -21,9 +21,9 @@ use embassy_nrf::{bind_interrupts, buffered_uarte, peripherals, spim};
 pub use embassy_nrf;
 pub use embedded_hal;
 pub use embedded_hal_bus;
-pub use mipidsi;
 
 pub mod clocks;
+pub mod display;
 #[cfg(feature = "usb-log")]
 pub mod usb_log;
 
@@ -33,6 +33,7 @@ pub mod usb_log;
 bind_interrupts!(pub struct Irqs {
     TWISPI0 => spim::InterruptHandler<peripherals::TWISPI0>;
     TWISPI1 => spim::InterruptHandler<peripherals::TWISPI1>;
+    SPI2    => spim::InterruptHandler<peripherals::SPI2>;
     UARTE1  => buffered_uarte::InterruptHandler<peripherals::UARTE1>;
 });
 
@@ -72,18 +73,8 @@ pub mod dual_spi_diff_bus_radio1 {
 // route.  Profiles that try to import it get a clear "unresolved import"
 // compile error.
 
-// ── Built-in 1.14" ST7789 TFT (TWISPI1 in SPI mode) ──────────────────────────
-pub mod display {
-    use embassy_nrf::peripherals;
-    pub type Spi       = peripherals::TWISPI1;
-    pub type Sck       = peripherals::P1_08;
-    pub type Mosi      = peripherals::P1_09;
-    pub type Cs        = peripherals::P0_11;
-    pub type Dc        = peripherals::P0_12;  // data/command select
-    pub type Reset     = peripherals::P0_02;
-    pub type Backlight = peripherals::P0_15;
-    pub type PwrCtrl   = peripherals::P0_03;  // VTFT_CTRL — gates display power
-}
+// Built-in 1.14" ST7789 TFT (TWISPI1 in SPI mode) — driver and pin
+// type aliases live in `src/display.rs`.
 
 // ── MIDI UART (UARTE1) ───────────────────────────────────────────────────────
 // P0_09 / P0_10 are exposed on the P1 header as a general-purpose UART.
@@ -116,11 +107,18 @@ pub mod button_user {
 // a custom `joystick` module in the profile crate.
 pub mod joystick {
     use embassy_nrf::peripherals;
-    pub type Up     = peripherals::P0_08;
-    pub type Down   = peripherals::P0_00;
-    pub type Left   = peripherals::P0_01;
-    pub type Right  = peripherals::P1_11;
-    pub type Center = peripherals::P1_04; // formerly GPS_PPS — GPS unused
+    // Pinout for the integrated MIDI-RX + diversity + display deployment.
+    // Up/Down/Left/Right cluster on free P1 header pins (top row);
+    // Center sits on the lower row.  All five are interrupt-capable
+    // GPIOs, none collide with `dual_spi_diff_bus_radio1` (which
+    // claims P0_28..P0_31 + P1_13/P1_15 + P0_05) or with the display
+    // (which uses P0_02/P0_03/P0_11/P0_12/P0_15/P1_08/P1_09) or with
+    // MIDI UART (P0_09/P0_10).
+    pub type Up     = peripherals::P1_14;
+    pub type Right  = peripherals::P1_12;
+    pub type Left   = peripherals::P0_07;
+    pub type Down   = peripherals::P0_08;
+    pub type Center = peripherals::P0_13;
 }
 
 // ── Status LED (green, active-high) ──────────────────────────────────────────
@@ -273,30 +271,16 @@ pub type Radio0 = osrf_radio_sx126x::Sx1262Radio<
     osrf_radio_sx126x::Dio2RfSwitch,
 >;
 
-/// Built-in 1.14" ST7789 TFT (240×135) on TWISPI1, MODE_3 @ 8 MHz.
+/// Built-in 1.14" ST7789 TFT (240×135) on TWISPI1 @ 8 MHz.
 ///
-/// The display is fully initialised by the time `resources()` returns:
-/// VTFT_CTRL has been raised, the panel reset pulse has been issued, and
-/// `mipidsi::Builder::init` has run the ST7789 power-on command sequence.
-/// Drawing operations are immediate (no flush needed) and blocking on the
-/// SPI bus.  Implements `embedded_graphics::DrawTarget<Color = Rgb565>`.
-///
-/// `Backlight` (P0_15) is left LOW for first bring-up; UI code must enable
-/// it explicitly.  `VEXT_ENABLE` (P0_21) is also left LOW — that rail
-/// powers external sensors; the TFT is on its own VTFT_CTRL gate.
-pub type Display = mipidsi::Display<
-    mipidsi::interface::SpiInterface<
-        'static,
-        embedded_hal_bus::spi::ExclusiveDevice<
-            embassy_nrf::spim::Spim<'static>,
-            embassy_nrf::gpio::Output<'static>,
-            embassy_time::Delay,
-        >,
-        embassy_nrf::gpio::Output<'static>,
-    >,
-    mipidsi::models::ST7789,
-    embassy_nrf::gpio::Output<'static>,
->;
+/// Hand-rolled driver in [`display::St7789Display`].  The init sequence
+/// (hardware reset → SWRESET → SLPOUT → COLMOD → MADCTL → INVON →
+/// NORON → DISPON) runs inside [`Resources::display`] before
+/// `resources()` returns, so the panel is ready for `draw_*` calls
+/// immediately.  Backlight (P0_15) is enabled at the end of init, after
+/// a clear-to-black, so users don't see junk pixels during power-on.
+/// Implements `embedded_graphics_core::DrawTarget<Color = Rgb565>`.
+pub type Display = display::St7789Display;
 
 /// MIDI UART (UARTE1) configured at 31250 baud 8N1.  Implements
 /// `embedded_io_async::Read` and `embedded_io_async::Write` directly so
@@ -325,14 +309,24 @@ pub struct Resources {
     /// DIN MIDI UART on UARTE1 (P0_09 RX, P0_10 TX) at 31250 baud 8N1.
     pub midi_uart: MidiUart,
 
-    // The ST7789 TFT (`Display` type) is intentionally NOT initialised by
-    // `resources()`.  `mipidsi::Builder::init()` hangs on this hardware
-    // for reasons not yet root-caused — every other path through
-    // build_resources (SX1262 SPI, UARTE1, raw SPI write, 120 ms
-    // `embassy_time::Delay::delay_ms`) verified working in isolation.
-    // Display init is deferred to a future `init_display()` helper that
-    // the UI smoke-test profile will exercise once we debug the mipidsi
-    // hand-off.  See the t114_blink stepwise diagnostic history.
+    /// Built-in 1.14″ ST7789 TFT, **constructed but not yet initialised**.
+    /// VTFT_CTRL (the panel's power gate, P0_03) is raised inside
+    /// `build_resources`, but the controller's command sequence
+    /// (SWRESET → SLPOUT → COLMOD → MADCTL → INVON → NORON → DISPON)
+    /// uses millisecond-scale `Timer::after` delays and therefore can't
+    /// run from sync code.  The first `await`-context user must call
+    /// `display.init().await` before any drawing.  This matches the
+    /// `radio0.init().await` pattern.
+    pub display: Display,
+
+    /// TFT backlight enable on P0_15.  **Active LOW** — drive low to
+    /// turn the backlight on, high to turn it off.  Verified against
+    /// the Meshtastic T114 variant.h: `#define TFT_BACKLIGHT_ON LOW`.
+    /// Owned separately from [`Display`] so apps can clear-to-
+    /// background **before** turning the backlight on (avoids
+    /// flashing junk pixels at boot).  Initialised HIGH (off) by
+    /// `build_resources`; pull it low after your first frame paints.
+    pub display_backlight: embassy_nrf::gpio::Output<'static>,
 
     /// Single WS2812 RGB LED on P0_14, parked Low.  WS2812 inputs are
     /// edge-sensitive — a floating P0_14 picks up noise and the LED
@@ -457,14 +451,92 @@ fn build_resources(
         unsafe { &mut *core::ptr::addr_of_mut!(MIDI_TX_BUF) },
     );
 
-    // ── Display: deferred ───────────────────────────────────────────────────
-    // ST7789 init via mipidsi::Builder::init hangs on this hardware (cause
-    // not yet root-caused; SPI write and embassy_time delays both verified
-    // working in isolation).  The display, backlight, and pwr_ctrl pins
-    // (P0_02, P0_03, P0_11, P0_12, P0_15, P1_08, P1_09, P1_11) along with
-    // TWISPI1 stay unowned in `embassy_nrf::Peripherals` and will be
-    // claimed by a future `init_display()` helper once the hand-off is
-    // debugged in the smoke-test profile.
+    // ── Display: ST7789 240×135 TFT on TWISPI1 ──────────────────────────────
+    // Pin assignments per Heltec's official Heltec_nRF52 BSP variant.h
+    // (HT-n5262):
+    //   SCK   = P1_08
+    //   MOSI  = P1_09
+    //   CS    = P0_11
+    //   DC    = P0_12
+    //   RESET = P0_02
+    //   VEXT_CTL  = P0_21  — gates the external 3.3 V rail that powers
+    //                        the TFT panel.  ACTIVE HIGH.
+    //   Backlight = P0_15  — TFT_LEDA_CTL.  ACTIVE LOW.
+    //
+    // Earlier comments in this file referenced a separate "VTFT_CTRL"
+    // on P0_03, but Heltec's authoritative BSP for the v2.0 hardware
+    // doesn't have such a pin — the TFT is powered through VEXT (the
+    // same rail that feeds the external sensor connector).  Empirical:
+    // driving P0_03 alone leaves the panel dark; driving P0_21 high
+    // brings it up.
+    //
+    // Hand-rolled driver in `display.rs`; replaces the prior mipidsi
+    // path which hung during init on this hardware.  Build SPIM1 in
+    // MODE_3 @ 8 MHz (ST7789 spec — clock idle high, sample rising
+    // edge), construct the driver un-initialised, and let the user
+    // call `display.init().await` from their async main.
+    //
+    // VEXT is raised here (and the pin leaked) so the panel + sensors
+    // are powered when the user calls init.  Backlight stays HIGH so
+    // the panel can be cleared before any pixels are visible (avoids
+    // junk-on-boot).
+    let mut display_spi_cfg = SpimConfig::default();
+    // 8 MHz, MODE_0 — matches what Adafruit's nRF52 BSP / the
+    // Heltec bootloader use for this panel.  ST7789 datasheet
+    // permits both MODE_0 and MODE_3; the working reference uses 0.
+    display_spi_cfg.frequency = Frequency::M8;
+    display_spi_cfg.mode = embassy_nrf::spim::MODE_0;
+    // The Heltec bootloader and Adafruit's nRF52 BSP both drive this
+    // panel from SPIM2 (= Arduino's `SPI1` object on this board).
+    // SPIM1 also works in principle, but SPIM2 matches the working
+    // reference and avoids any chance of bootloader/peripheral state
+    // confusion.
+    let display_spi = Spim::new_txonly(
+        p.SPI2,
+        Irqs,
+        p.P1_08, // SCK
+        p.P1_09, // MOSI
+        display_spi_cfg,
+    );
+
+    // ── nRF52840 SPIM-on-SCK fixup ──────────────────────────────────────
+    // The SPIM peripheral internally reads back its own SCK signal for
+    // edge timing.  If the SCK pin's GPIO input buffer is "Disconnect"
+    // (the default for an Output<>), SPIM clocks **but produces no
+    // observable output**.  Symptom on this v2.1 hardware was a
+    // perfectly-working CS / DC / MOSI but a permanently-stuck panel
+    // showing only backlight.
+    //
+    // Adafruit's nRF52 BSP sidesteps this by calling `nrf_gpio_cfg`
+    // explicitly to set SCK's INPUT bit to *Connect*; embassy-nrf's
+    // `Spim::new` does not do this — it routes PSEL but doesn't touch
+    // the per-pin `PIN_CNF.INPUT` field.  We poke it manually.
+    //
+    // PIN_CNF[8] for P1.08 is at: P1 base 0x5000_0300 + 0x700 + 4*8
+    //                            = 0x5000_0A20.
+    // Bits we set: DIR=1 (Output), INPUT=0 (Connect), PULL=0 (None),
+    //              DRIVE=3 (H0H1), SENSE=0 (Disabled).  Encoded value
+    //              = 0x301 = (3 << 8) | 1.
+    unsafe {
+        const PIN_CNF_P1_08: *mut u32 = 0x5000_0A20 as *mut u32;
+        core::ptr::write_volatile(PIN_CNF_P1_08, 0x301);
+    }
+    // CS / DC use HighDrive (H0H1) so the edges settle quickly even
+    // under the panel's input capacitance.  Standard drive (S0S1) is
+    // 2 mA per pin which can be slow on long traces.
+    let display_cs = Output::new(p.P0_11, Level::High, OutputDrive::HighDrive);
+    let display_dc = Output::new(p.P0_12, Level::Low, OutputDrive::HighDrive);
+    let display_reset = Output::new(p.P0_02, Level::High, OutputDrive::HighDrive);
+    // VEXT_CTL (P0_21) — gates the external 3.3 V rail that powers
+    // the TFT panel.  Active HIGH per Heltec BSP.  Leak the pin —
+    // we never need to manipulate it again under normal operation.
+    let vext = Output::new(p.P0_21, Level::High, OutputDrive::Standard);
+    core::mem::forget(vext);
+    let display = display::St7789Display::new(display_spi, display_cs, display_dc, display_reset);
+    // Backlight: active LOW per the panel's wiring (Meshtastic
+    // variant.h: TFT_BACKLIGHT_ON LOW).  Init HIGH so the backlight
+    // is OFF at boot — UI code drives it low after the first clear.
+    let display_backlight = Output::new(p.P0_15, Level::High, OutputDrive::Standard);
 
     // ── NeoPixel (P0_14) parked Low ─────────────────────────────────────────
     // The single WS2812 RGB LED on the T114 is edge-sensitive.  Leaving the
@@ -479,6 +551,8 @@ fn build_resources(
             status_led,
             radio0,
             midi_uart,
+            display,
+            display_backlight,
             neopixel_parked,
         },
         usbd,
