@@ -1,0 +1,21 @@
+[package]
+name        = "osrf-ui"
+version     = "0.1.0"
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "Display-agnostic UI core for OpenStageRF: settings model, screen state machine, widget tree.  Renderer lives in a separate crate so the same UI runs on monochrome OLED and colour TFT."
+
+[features]
+defmt = ["dep:defmt", "osrf-driver-input-joystick5way/defmt"]
+
+[dependencies]
+osrf-driver-input-joystick5way = { workspace = true }
+heapless                       = { workspace = true }
+embedded-graphics              = "0.8"
+embedded-graphics-core         = "0.4"
+defmt                          = { version = "1.0", optional = true }
+
+[lib]
+test    = true
+doctest = false
+bench   = false

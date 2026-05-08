@@ -234,6 +234,26 @@ pub unsafe fn bootloader_handoff() {
 
     // 7. Disable all PPI channels (CHENCLR at 0x4001_F508).
     core::ptr::write_volatile(0x4001_F508 as *mut u32, 0xFFFF_FFFF);
+
+    // 8. Disable QSPI peripheral and disconnect its PSEL routing.
+    //    The Heltec bootloader leaves QSPI enabled to talk to the
+    //    on-board MX25R1635F flash chip (per the Zephyr DTS).  QSPI
+    //    claims P1_14 (SCK), P1_15 (CSN), P1_12 (IO0), P1_13 (IO1),
+    //    P0_07 (IO2), P0_05 (IO3) by default — three of which are
+    //    used by the joystick on this deployment (P1_14 Up, P1_12
+    //    Right, P0_07 Left).  Without disabling QSPI, those pins
+    //    remain driven by the (now-idle) QSPI peripheral and don't
+    //    respond to GPIO Input claims.
+    //
+    //    PSEL.* registers on nRF52840 use bit 31 as CONNECT
+    //    (0 = connected, 1 = disconnected).  Writing `0xFFFF_FFFF`
+    //    fully disconnects the pin from QSPI.
+    let qspi_enable: *mut u32 = 0x4002_9500 as *mut u32;
+    core::ptr::write_volatile(qspi_enable, 0); // ENABLE = 0
+    for psel_offset in [0x544u32, 0x548, 0x560, 0x564, 0x568, 0x56C] {
+        let reg = (0x4002_9000 + psel_offset) as *mut u32;
+        core::ptr::write_volatile(reg, 0xFFFF_FFFF);
+    }
 }
 
 /// Raw Embassy peripheral tokens.  Use this for fine-grained hardware access

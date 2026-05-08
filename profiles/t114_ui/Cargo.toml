@@ -1,0 +1,31 @@
+[package]
+name        = "osrf-profile-t114-ui"
+version     = "0.1.0"
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "Milestone 6 UI smoke test — T114 deployment.  Drives the built-in 1.14″ ST7789 TFT plus an externally-wired 5-way joystick through osrf-ui."
+
+[package.metadata.osrf]
+board = "t114"
+
+[dependencies]
+osrf-board-t114                = { workspace = true, features = ["defmt"] }
+osrf-driver-input-joystick5way = { workspace = true, features = ["defmt"] }
+osrf-ui                        = { workspace = true, features = ["defmt"] }
+
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-time     = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-sync     = { version = "0.8" }
+embedded-graphics-core = "0.4"
+
+cortex-m    = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7"
+defmt       = "1.0"
+defmt-rtt   = "1.1"
+panic-probe = { version = "1.0", features = ["print-defmt"] }
+
+[[bin]]
+name  = "ui"
+path  = "src/main.rs"
+test  = false
+bench = false

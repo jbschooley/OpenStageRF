@@ -10,7 +10,9 @@ members = [
     "boards/t114",
     "core/link",
     "core/link_runtime",
+    "core/ui",
     "crypto",
+    "drivers/input/joystick5way",
     "drivers/midi/din",
     "drivers/radio/sx126x",
     "ports/embassy_stm32",
@@ -35,6 +37,7 @@ members = [
     "profiles/t114_rx_basic",
     "profiles/t114_rx_diversity",
     "profiles/t114_tx_basic",
+    "profiles/t114_ui",
     "profiles/t114_ui_demo",
     "protocols/midi_packet_v1",
     "xtask",
@@ -50,7 +53,9 @@ default-members = [
     "boards/dx_lr30",
     "core/link",
     "core/link_runtime",
+    "core/ui",
     "crypto",
+    "drivers/input/joystick5way",
     "drivers/midi/din",
     "drivers/radio/sx126x",
     "ports/embassy_stm32",
@@ -75,8 +80,10 @@ osrf-app-midi-node                = { path = "apps/midi_node" }
 osrf-app-radio-bench              = { path = "apps/radio_bench" }
 osrf-app-ui-bench                 = { path = "apps/ui_bench" }
 osrf-link-runtime                 = { path = "core/link_runtime" }
+osrf-ui                           = { path = "core/ui" }
 osrf-board-dx-lr30                = { path = "boards/dx_lr30" }
 osrf-board-t114                   = { path = "boards/t114" }
+osrf-driver-input-joystick5way    = { path = "drivers/input/joystick5way" }
 osrf-midi-din                     = { path = "drivers/midi/din" }
 osrf-radio-sx126x                 = { path = "drivers/radio/sx126x" }
 osrf-profile-dx-lr30-blink        = { path = "profiles/dx_lr30_blink" }
@@ -100,6 +107,7 @@ osrf-profile-t114-radio-rx        = { path = "profiles/t114_radio_rx" }
 osrf-profile-t114-tx-basic        = { path = "profiles/t114_tx_basic" }
 osrf-profile-t114-rx-basic        = { path = "profiles/t114_rx_basic" }
 osrf-profile-t114-rx-diversity    = { path = "profiles/t114_rx_diversity" }
+osrf-profile-t114-ui              = { path = "profiles/t114_ui" }
 osrf-profile-t114-ui-demo         = { path = "profiles/t114_ui_demo" }
 defmt                             = "1.0"
 embedded-hal                      = "1.0"
