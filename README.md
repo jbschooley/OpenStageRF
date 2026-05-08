@@ -4,19 +4,37 @@ Open-source firmware platform for low-latency wireless MIDI (and experimental au
 
 ## First Edition Target
 
-- **Board:** DX-LR30 (STM32F103C8T6 + SX1262, detachable radio module)
+- **Board:** Heltec T114 v2.1 (nRF52840 + SX1262, built-in 240×135 ST7789 TFT)
 - **Band:** US 902–928 MHz ISM (unlicensed)
 - **Modulation:** GFSK — chasing low latency, not LoRa range
 - **Scope:** one-way MIDI link, single radio per node, no diversity, no BLE
-- **UI (RX side, optional):** external I²C OLED + GPIO buttons
+- **UI (RX side):** built-in TFT + external 5-way joystick on header pins
 - **MIDI front end:** external DIN opto-isolator (e.g. Adafruit MIDI FeatherWing for prototype)
 - **Language / framework:** Rust + [embassy](https://embassy.dev) (async, no_std, multi-vendor via `embedded-hal`)
 
 The firmware is structured to grow into more boards, radios, and feature profiles, but the initial focus is making one rock-solid configuration before broadening.
 
+> **Platform note (2026-05):** development began on the DX-LR30 (STM32F103 + SX1262). It's still
+> a supported board crate and the schematic / pinmap is committed, but two facts moved the
+> first-edition target to T114: SWD pins (PA13/PA14) aren't broken out on the LR30-SP carrier
+> (no probe-rs flow without tack-soldering to the QFP48), and the T114 has a built-in TFT that
+> made M6 UI work practical in a way the DX-LR30 alone wouldn't have.  DX-LR30 will return as a
+> minimal-cost TX-only profile once the link, UI, and persistence stack stabilises on T114;
+> until then it's exercised through the host-side test suites.  **Other boards (TI CC1352R,
+> STM32WBA, the v2/v3 custom designs sketched in [ROADMAP.md](ROADMAP.md)) are community ports
+> unless and until the maintainer needs them — they aren't on the active path.**
+
 ## Roadmap
 
 Future stages, audio capability tiers, codec engineering plans, and deferred platforms are tracked separately in [ROADMAP.md](ROADMAP.md). The README covers v1 (current focus) and the architectural commitments that apply across all stages.
+
+## Reliability and mid-show failure modes
+
+Anything that takes either side of the link offline mid-show is a P0 failure.  The threat
+list (heapless capacity exhaustion, executor stall, panic, MCU lockup, …), the runtime
+mitigations (hardware watchdog, panic-to-flash + auto-reset, periodic invariant
+assertions), and the offline checks (4-hour soak, stack-watermark probe, no-alloc CI audit)
+all live in [docs/reliability.md](docs/reliability.md).  Implementation lands in M5 and M7.
 
 ## Architecture
 

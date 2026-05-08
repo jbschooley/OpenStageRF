@@ -5,7 +5,17 @@ The active project state, architecture, and design decisions are in [README.md](
 ## Prototype Stages
 
 ### Stage 1 — basic link (current focus, v1)
-See [First Edition Target](README.md#first-edition-target) in the README. 1× DX-LR30 TX, 1× DX-LR30 RX, one-way packetized MIDI over GFSK at ~915 MHz, no diversity, no encryption. Built on Rust + embassy via `embassy-stm32`.
+See [First Edition Target](README.md#first-edition-target) in the README.  **As of 2026-05 the
+first-edition target is the Heltec T114 (nRF52840 + SX1262) rather than the originally planned
+DX-LR30** — see the README for why.  Stage 1 deliverable: 1× T114 TX, 1× T114 RX, one-way
+packetized MIDI over GFSK at ~915 MHz, no diversity, no encryption, on-device UI with channel +
+band-plan + TX-power configuration and runtime key-store scaffolding.  Built on Rust + embassy
+via `embassy-nrf`.
+
+DX-LR30 (STM32F103) remains in the workspace as a supported board crate; it'll come back as a
+minimal-cost TX-only profile once the T114 stack is solid (link + UI + persistence).  Other
+boards (CC1352R, STM32WBA, future custom designs) are **community ports unless the maintainer
+needs them** — the active path is T114 → v2 nRF5340 board.
 
 **Driver:** `drivers/radio/sx126x` wraps the upstream `sx1262` crate (BroderickCarlin) with a thin async layer + `RfSwitchControl` trait. Two impls cover the boards we care about: `Dio2RfSwitch` (T114, internal RF switch via SX1262 DIO2) and `PinRfSwitch` (DX-LR30, external TXEN/RXEN GPIOs). See PLAN.md Milestone 2 for the API.
 
@@ -50,8 +60,12 @@ Why two boards (v2 MIDI + v3 audio) rather than one combined board: keeping v2 M
 
 ### Beyond v2
 
-- channel scan, frequency diversity, mobile configurator app
+- frequency diversity, mobile configurator app
 - audio (see *Audio capability tiers* below)
+
+(Channel-scan was originally listed here; pulled forward into Stage 1 / Milestone 6 in PLAN.md
+since it's a pure UI + thin link-runtime feature and the most useful diagnostic for venue
+coordination on the multi-band-plan UI.)
 
 Audio is deferred until the MIDI link is solid live. SX1262-class radios are bandwidth-starved for any audio target.
 

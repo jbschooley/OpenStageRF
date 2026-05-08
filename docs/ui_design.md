@@ -4,6 +4,20 @@ On-device UI for the receiver-side OpenStageRF unit. Designed against `embedded-
 
 This file specifies screen layouts, navigation flow, and implementation expectations. It is intentionally hardware-light and platform-agnostic — the same UI code runs on any board with an `embedded-graphics` `DrawTarget` plus enough input surface to navigate the menu tree.
 
+> **Implementation status (2026-05):** the UI core (`core/ui/`) and edge-wake joystick driver
+> (`drivers/input/joystick5way/`) are implemented and running on T114 via `profiles/t114_ui`.
+> The state machine matches this doc with three deviations worth noting here so this file
+> stays useful as a reference: (1) the menu is **data-driven** — `MenuNode { title, items }`
+> with `ItemAction::{Submenu, List, Value, Custom}` — instead of a fixed `Screen` enum.
+> Adding a submenu is a `static` declaration plus a parent reference, no match-arm edits.
+> (2) Backing out of any submenu uses a small **nav stack** that restores parent cursor +
+> scroll; "Center on a confirmable screen → applies + returns to **MainMenu**" (not Idle).
+> Long-press Center is the universal "back to Idle" path.  (3) The colour TFT renders a richer
+> layout than the 16×8 mono grid sketched below: `FONT_9X18` at 19 px row pitch with 5 visible
+> body rows on 240×135.  Mono-OLED rendering is `DrawTarget`-generic and will pick up the
+> simpler grid when the SSD1306 driver lands.  See `core/ui/src/lib.rs` for the canonical
+> state machine and `core/ui/src/render.rs` for the renderer.
+
 ## Hardware assumptions
 
 The UI targets two concrete display classes; designs should look correct on both.

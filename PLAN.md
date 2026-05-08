@@ -1,6 +1,30 @@
+## Platform pivot, 2026-05
+
+Stage 1 was originally written against the DX-LR30 (STM32F103 + SX1262).  Mid-M2 the target
+shifted to the **Heltec T114 (nRF52840 + SX1262)** for the first-edition firmware.  Reasons,
+from concrete to strategic:
+
+- **No SWD on the DX-LR30 carrier.** PA13/PA14 aren't broken out (verified against the LR30-SP
+  schematic); flashing works via the on-board CH340C → STM32 ROM bootloader over UART, but
+  there's no probe-rs / RTT path without tack-soldering to the QFP48.
+- **T114 has a built-in 240×135 ST7789 TFT.**  M6 (on-device UI) becomes immediately practical
+  on a single board, vs requiring an external SSD1306 + level-shifter wiring on the DX-LR30.
+- **nRF52840 unlocks Stage 3 + Stage 4 work earlier.**  Hardware AES-CCM (CCM peripheral) and
+  `nrf-softdevice`-backed BLE config can be exercised on the same board the link runs on,
+  rather than waiting for the v2 custom board.
+- **Multi-vendor portability boundary gets validated by going second-vendor immediately.**  If
+  `core/` / `protocols/` / `drivers/` build clean against `embassy-nrf` *and* `embassy-stm32`,
+  that's the test the architecture was designed for.
+
+DX-LR30 stays in the workspace as a supported board crate (Resources, MIDI UART, radio plumbing
+all work) and will return as a minimal-cost TX-only profile once the T114 stack is solid.  See
+the README for the user-facing summary; ROADMAP.md Stage 1 carries the same note.
+
 # OpenStageRF — First Prototype Plan
 
-Concrete plan to ship Stage 1 (per [ROADMAP.md](ROADMAP.md)): 1× DX-LR30 TX, 1× DX-LR30 RX, one-way packetized MIDI over GFSK at 902–928 MHz US ISM, no diversity, no encryption initially, Rust + embassy on STM32F103.
+Concrete plan to ship Stage 1 (per [ROADMAP.md](ROADMAP.md)): 1× T114 TX, 1× T114 RX, one-way
+packetized MIDI over GFSK at 902–928 MHz US ISM, no diversity, no encryption initially, Rust +
+embassy on nRF52840.  (Originally targeted DX-LR30 / STM32F103 — see *Platform pivot* above.)
 
 This file is the build playbook. Architectural commitments are in [README.md](README.md); on-air protocol is in [protocols/midi_packet_v1/SPEC.md](protocols/midi_packet_v1/SPEC.md); UI is in [docs/ui_design.md](docs/ui_design.md).
 
@@ -213,38 +237,113 @@ Replaced with hand-rolled raw SPI command layer in `drivers/radio/sx126x/src/lib
 
 ### Milestone 5 — end-to-end live test + latency measurement (2–3 days)
 
-**Goal:** measured latency, validated stage scenario.
+**Goal:** measured latency, validated stage scenario, documented ceiling on mid-show
+failure rate.
 
-- [ ] Hardware setup: keyboard → DX-LR30 TX, DX-LR30 RX → synth/computer. Battery-power TX side; USB-power RX side.
+- [ ] Hardware setup: keyboard → T114 TX, T114 RX → synth/computer. Battery-power TX side; USB-power RX side.
 - [ ] Latency measurement: trigger oscilloscope on a known MIDI byte (e.g. Note On status byte 0x90) on the input UART, capture corresponding output byte on the output UART. Measure delta. Document target (<3 ms RF transit) vs measured.
 - [ ] Range test: walk away with TX, log RSSI on RX. Document range at which CRC errors begin.
 - [ ] Stress test: play a busy MIDI sequence (60 events/sec), verify no missed/garbled events for 10 minutes.
+- [ ] **4-hour soak test** with realistic traffic (60 events/s avg, 200 events/s peaks).
+      Records `health_violations`, `LinkStats.total_accepted`, RAM high-water-mark per task
+      (pattern-fill the stack pre-init, read back post-soak).  Pass criteria: no panic, no
+      health-check violation, no `Err` from any UART/SPI op held longer than 100 ms.
+      See [docs/reliability.md](docs/reliability.md) for failure modes and what the
+      `health_check` task asserts.
+- [ ] **`health_check` task** (`core/health/`): periodic invariant assertions (heapless
+      vec capacity not persistently full, link counters monotonic, `current_menu` is a
+      known-static `MenuNode`, etc.).  Health violations bump a counter visible on About.
 - [ ] Document any anomalies: stuck notes, clock jitter, dropouts, etc.
 
-**Exit criteria:** all latency / range / stress numbers documented in `docs/v1_test_results.md`.
+**Exit criteria:** all latency / range / stress / soak numbers documented in `docs/v1_test_results.md`.
 
 ### Milestone 6 — UI on RX side (5–7 days)
 
-**Goal:** RX has a usable on-device interface for channel/power configuration.
+**Goal:** RX has a usable on-device interface for channel/power/key configuration.
 
-- [ ] `osrf-driver-display-ssd1306`: I²C OLED, basic monospace text rendering (8×8 font, 16 cols × 8 rows on 128×64 display)
-- [ ] `osrf-driver-input-joystick5way`: 5-way joystick, debounced (~20 ms), generates `JoystickEvent::{Up, Down, Left, Right, Center, LongPress(Direction)}`
-- [ ] `osrf-ui` crate with screen state machine and the screens defined in [docs/ui_design.md](docs/ui_design.md)
-- [ ] Embassy task layout: `ui_render` (low priority, 30 Hz cap), `ui_input` (medium priority, 100 Hz polling), `ui_state` (medium priority, event-driven)
+Implementation lives on T114 (built-in 240×135 ST7789 TFT + external 5-way joystick on the
+expansion header).  SSD1306 (DX-LR30 add-on) is deferred until DX-LR30 returns to the active
+path; the UI core is `DrawTarget`-generic so the same screens render on both when that lands.
 
-**Exit criteria:** all screens render, joystick navigates correctly, channel and power changes apply live (without reboot).
+- [x] **Hand-rolled ST7789 driver** in `boards/t114/src/display.rs` (mipidsi's `Builder::init()`
+      hangs on this hardware; replacement is a ~250-line driver with the nRF52840 SPIM
+      `PIN_CNF.INPUT=Connect` workaround for SCK loopback, 10 ms reset pulse, active-low
+      backlight on P0_15, `VEXT_CTL` on P0_21 active high, SPIM2 @ 8 MHz MODE_0).
+- [x] `osrf-driver-input-joystick5way`: edge-wake driver (GPIOTE, no polling) generates
+      `Press(dir)` / `LongPress(dir)`.  500 ms long-press threshold, 20 ms debounce, 100 ms
+      auto-repeat on Up / Down hold (typamatic-style scroll).  Pre-pressed-at-startup and
+      bounce-back guards.
+- [x] `osrf-ui` crate (`core/ui/`):
+  - `Settings` (band plan, channel, TX power, active key fingerprint), `LinkStatus`, `ScreenId`.
+  - State machine `UiState::handle_event` returning optional `Command::{ApplyChannel, ApplyBandPlan, ApplyTxPower, ApplySetActiveKey}`.
+  - **Data-driven menu tree:** `MenuNode { title, items: &[MenuItem] }` with `ItemAction::{Submenu, List, Value, Custom}`.  Adding a submenu is a `static FOO_MENU = ...` declaration plus a parent reference — no match-arm edits.  Top level is `MAIN_MENU`.
+  - **Nav stack** (`Vec<NavFrame, 4>` on UiState) — every Center/Right push, every Left pop.  Backing out of any submenu restores parent cursor + scroll.  `go_home()` clears the stack on long-press Center.
+  - List screens: ChannelSelect (per band plan), BandPlanSelect, KeySelect (sorted by name with synthetic "Open" row).  Active-marker `*` + cursor `>` 2-char prefix.
+  - Value-edit screen: PowerSelect (numeric edit-buffer pattern, ±9..+22 dBm).
+  - Read-only: LinkStats, About.
+  - Stateful renderer with content-level diff (no flicker on row-only changes), background-aware MonoTextStyleBuilder, FONT_9X18 at 19 px row pitch (5 visible body rows on 240×135).
+  - Multi-band plans (`band_plan.rs`): ISM 915 (24 ch @ 1 MHz, 903–926 MHz), Sennheiser-G compat (5 ch), Shure compat (4 ch), Dense 100 kHz (8 ch — single-unit fine-tuning only).
+  - Runtime KeyStore (`Vec<KeyEntry, 16>`, 24-bit fingerprint matching the on-wire `key_fp` header field, sorted-by-name view).  Profile-baked entries seeded at boot until BLE import lands.  Entry hidden from MAIN_MENU until AEAD lands (single-line gate).
+  - 27 host tests cover the state machine, menu tree, key store, and band-plan invariants.
+- [x] `profiles/t114_ui` smoke profile: brings up display + joystick, runs the state machine,
+      logs emitted commands.  Visual confirmation pass on hardware: scroll/hold-to-scroll/
+      cursor restoration on back/active marker tracking all working.
+- [ ] **Live config-update plumbing**: `Signal<LinkConfig>` in `osrf-link-runtime`; UI pushes
+      to it on `Command::Apply*`, run loop reconfigures the radio without restart.
+- [ ] **Real LinkStatus updates**: feed RSSI / loss / accepted-count from `osrf-link-runtime`'s
+      RX path into the UI's `LinkStatus` struct (currently always-zero stub).
+- [ ] **Channel scan screen** *(pulled forward from "Beyond v2" in ROADMAP.md)*: continuous
+      rescan of every channel in the active band plan, displayed as a per-channel bar graph
+      with **two values per channel — current noise floor and max-since-screen-opened**.
+      Two bars stacked or "current bar + peak tick" on top.  On entry the peak buffer resets
+      so the display tracks "what's been on this channel since I started watching."
+  - Link-runtime API: `osrf-link-runtime::scan_step(&[ChannelInfo]) -> [(idx, rssi_dbm)]`
+        (one full pass: pause RX, retune to each, sample RSSI ~10 ms, restore operating
+        channel).  The UI calls this in a loop while the Scan screen is active and merges
+        each pass into per-channel `(current, max)` pairs.
+      - UI hook: `MenuItem { label: "Scan", action: Custom(ScreenId::ScanResults) }` and
+        a `ScanResults` screen that owns the `(current, max)` table.  `Press(Left)` exits
+        and discards the table; re-entering resets max-tracking.
+      - Most useful diagnostic for venue coordination (which Senn/Shure/Dense channels are
+        quiet right now, and which look quiet on average but have intermittent hits).
+- [ ] Embassy task layout: `ui_render` (low priority, 30 Hz cap), `ui_input` (event-driven,
+      edge-wake), `ui_state` (event-driven).  Currently single-loop in `t114_ui` profile;
+      split into tasks once live config-update lands.
 
-### Milestone 7 — persistence (3–5 days)
+**Exit criteria:** all screens render, joystick navigates correctly, channel/band/power changes
+apply live (without reboot), scan reports per-channel RSSI for the active band plan.
 
-**Goal:** settings survive reboot. Boot counter increments correctly.
+### Milestone 7 — persistence + crash safety (3–5 days)
 
-- [ ] Flash partition layout per *Confirmed design decisions* above
-- [ ] `sequential-storage` integration over a defined flash region for the settings page and a separate region for the key store
-- [ ] Boot counter: read on boot, increment, write back. One flash write per boot.
-- [ ] Settings (channel, power, active key slot, ui prefs): read on boot, written when UI changes confirm
-- [ ] Key store: stub for v1 (only no-encryption mode, `key_fp=0x0000`, used); structure ready for Stage 3 encryption work
+**Goal:** settings survive reboot.  Boot counter increments correctly.  A panic or hardware
+hang reboots the unit and surfaces post-mortem info on the next boot's About screen instead
+of bricking it mid-show.
 
-**Exit criteria:** power-cycle the device, settings retained; boot counter visible in `[About]` screen and increments on each boot.
+- [ ] Flash partition layout per *Confirmed design decisions* above (settings + key store +
+      panic-record ring buffer).
+- [ ] `sequential-storage` integration over a defined flash region for the settings page and
+      a separate region for the key store.
+- [ ] Boot counter: read on boot, increment, write back.  One flash write per boot.
+- [ ] Settings (channel, power, active key slot, ui prefs): read on boot, written when UI
+      changes confirm.
+- [ ] Key store: stub for v1 (only no-encryption mode, `key_fp=0x0000`, used); structure
+      ready for Stage 3 encryption work.
+- [ ] **Hardware watchdog** (`boards/t114/src/wdt.rs`): arm WDT on boot with a generous
+      reload window; single `watchdog_feeder` task awaits a kick `Signal` that every other
+      monitored task pulses once per loop.  See [docs/reliability.md](docs/reliability.md)
+      § *Hardware watchdog*.
+- [ ] **Panic-to-flash + auto-reset** (`core/panic/`): production builds replace
+      `panic_probe` with a custom handler that captures `PanicInfo` + `RESETREAS` + git hash
+      to a flash ring buffer (8 slots) and triggers `SCB::sys_reset()`.  Boot path reads the
+      ring and surfaces "last panic at <file:line>" on About.
+- [ ] **Portability + no-alloc CI audit** (`xtask audit`): fail CI if any `core/`,
+      `drivers/`, or `protocols/` crate directly depends on an `embassy-*` HAL crate, or if
+      any non-board/profile `.rs` imports `alloc`.
+
+**Exit criteria:** power-cycle the device, settings retained; boot counter visible in
+`[About]` screen and increments on each boot; injected `panic!()` reboots within the WDT
+window and the next About screen shows the panic line; injected infinite-loop in any task
+reboots within the WDT window.
 
 ## Total estimate
 
