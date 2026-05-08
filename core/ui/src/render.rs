@@ -38,7 +38,7 @@ use embedded_graphics::{
 };
 use heapless::{String, Vec as HVec};
 
-use crate::{Widget, WidgetList, MAX_WIDGETS};
+use crate::{ScanState, Widget, WidgetList, MAX_WIDGETS, SCAN_NO_DATA};
 
 /// Glyph height + 1 px inter-row gap.
 const ROW_HEIGHT_PX: u32 = 19;
@@ -59,6 +59,22 @@ const FONT: &MonoFont = &FONT_9X18;
 /// to the bottom of the panel rather than at a numbered row."  Row
 /// numbers are u8 so this fits.
 const FOOTER_ROW: u8 = 254;
+
+/// Sentinel row index meaning "this widget paints the entire
+/// panel."  Used by [`Widget::ScanGraph`].  When this row appears
+/// in the previous frame but not the current one, the renderer
+/// clears the whole panel so leftover scan pixels don't bleed
+/// into the next screen.
+const FULLSCREEN_ROW: u8 = 253;
+
+/// Range of dBm shown by the scan-graph bars.  Anything at or
+/// below `SCAN_DBM_MIN` is a 0-px bar; anything at or above
+/// `SCAN_DBM_MAX` is a full-height bar; in between scales
+/// linearly.  Tuned for 902–928 MHz ISM where typical noise floor
+/// is around -110 dBm and a strong nearby transmitter can hit
+/// -30 dBm.
+const SCAN_DBM_MIN: i16 = -120;
+const SCAN_DBM_MAX: i16 = -30;
 
 /// Stateful renderer.  Caches the previous frame's widget list so
 /// the next [`Renderer::render`] call can do a content-level diff:
@@ -103,7 +119,12 @@ impl Renderer {
     /// subsequent calls, only repaints rows whose widget content
     /// has changed since the previous frame; unchanged rows are
     /// not touched.
-    pub fn render<D>(&mut self, widgets: &WidgetList, display: &mut D) -> Result<(), D::Error>
+    pub fn render<D>(
+        &mut self,
+        widgets: &WidgetList,
+        scan: &ScanState,
+        display: &mut D,
+    ) -> Result<(), D::Error>
     where
         D: DrawTarget,
         D::Color: From<BinaryColor>,
@@ -171,11 +192,15 @@ impl Renderer {
             // Content-level diff: if the previous frame had a
             // widget at this same row that's byte-identical to
             // the new one, skip — the panel pixels are already
-            // correct.
-            let prev_at_row = self.prev.iter().find(|w| widget_row(w) == row);
-            if let Some(prev_w) = prev_at_row {
-                if prev_w == widget {
-                    continue;
+            // correct.  ScanGraph is exempt because its data
+            // (the per-channel arrays in `scan`) lives outside
+            // the widget; we always repaint when it's present.
+            if !matches!(widget, Widget::ScanGraph { .. }) {
+                let prev_at_row = self.prev.iter().find(|w| widget_row(w) == row);
+                if let Some(prev_w) = prev_at_row {
+                    if prev_w == widget {
+                        continue;
+                    }
                 }
             }
 
@@ -278,6 +303,30 @@ impl Renderer {
                     )
                     .draw(display)?;
                 }
+
+                Widget::ScanGraph {
+                    channel_count,
+                    cursor,
+                    active,
+                    title,
+                } => {
+                    draw_scan_graph(
+                        display,
+                        bbox.size,
+                        fg,
+                        bg,
+                        bgfg_style,
+                        baseline_top,
+                        line_cols,
+                        line_x,
+                        &scan.current_dbm,
+                        &scan.peak_dbm,
+                        *channel_count,
+                        *cursor,
+                        *active,
+                        title,
+                    )?;
+                }
             }
         }
 
@@ -291,17 +340,22 @@ impl Renderer {
 /// which means a full-screen clear every time → flash.  Useful
 /// for smoke tests; production code should hold a single
 /// [`Renderer`] across renders for the no-flash incremental path.
-pub fn render<D>(widgets: &WidgetList, display: &mut D) -> Result<(), D::Error>
+pub fn render<D>(
+    widgets: &WidgetList,
+    scan: &ScanState,
+    display: &mut D,
+) -> Result<(), D::Error>
 where
     D: DrawTarget,
     D::Color: From<BinaryColor>,
 {
-    Renderer::new().render(widgets, display)
+    Renderer::new().render(widgets, scan, display)
 }
 
 /// Map a [`Widget`] to the row index it occupies, using
 /// [`FOOTER_ROW`] as a sentinel for footers (which are placed at
-/// the bottom of the panel rather than at a numbered row).
+/// the bottom of the panel rather than at a numbered row) and
+/// [`FULLSCREEN_ROW`] for widgets that paint the whole panel.
 fn widget_row(w: &Widget) -> u8 {
     match w {
         Widget::Title(_) => 0,
@@ -309,6 +363,7 @@ fn widget_row(w: &Widget) -> u8 {
         Widget::Selector { row, .. } => *row,
         Widget::Footer(_) => FOOTER_ROW,
         Widget::LinkStatus { row, .. } => *row,
+        Widget::ScanGraph { .. } => FULLSCREEN_ROW,
     }
 }
 
@@ -323,6 +378,12 @@ fn clear_row<D>(
 where
     D: DrawTarget,
 {
+    if row == FULLSCREEN_ROW {
+        // Whole-panel clear (used when leaving the Scan screen).
+        return Rectangle::new(Point::zero(), panel_size)
+            .into_styled(PrimitiveStyle::with_fill(bg))
+            .draw(display);
+    }
     let y = if row == FOOTER_ROW {
         (panel_size.height as i32) - (ROW_HEIGHT_PX as i32)
     } else {
@@ -356,6 +417,334 @@ fn pad_right_to(text: &str, cols: usize) -> String<32> {
         let _ = out.push(' ');
     }
     out
+}
+
+/// Render the entire Scan screen: title row, bars (one per
+/// channel) with a peak tick on top, two thin stripes underneath
+/// the bars (cursor stripe directly under the bar, active stripe
+/// directly below that), and a footer.  Bar width adapts to
+/// channel count — 75% of the column for ≥3 px columns (with bg
+/// gap), full column for tighter densities (spectrum-trace mode).
+#[allow(clippy::too_many_arguments)]
+fn draw_scan_graph<D>(
+    display: &mut D,
+    panel_size: Size,
+    fg: D::Color,
+    bg: D::Color,
+    bgfg_style: MonoTextStyle<'_, D::Color>,
+    baseline_top: embedded_graphics::text::TextStyle,
+    line_cols: usize,
+    line_x: i32,
+    current_dbm: &[i16],
+    peak_dbm: &[i16],
+    channel_count: u8,
+    cursor: u8,
+    active: u8,
+    title: &str,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget,
+    D::Color: From<BinaryColor>,
+{
+    let panel_w = panel_size.width as i32;
+    let panel_h = panel_size.height as i32;
+
+    // Layout: title (row 0, 19 px) + bars (variable) + cursor
+    // stripe (5 px, directly under bars) + 1 px gap + active
+    // stripe (5 px) + footer (19 px).  Total marker zone = 11 px.
+    // On 240×135 that leaves 86 px for bars (vs 76 px when the
+    // marker zone was a full 19 px row).
+    const CURSOR_STRIPE_H: i32 = 5;
+    const STRIPE_GAP_H: i32 = 1;
+    const ACTIVE_STRIPE_H: i32 = 5;
+    const MARKER_ZONE_H: i32 = CURSOR_STRIPE_H + STRIPE_GAP_H + ACTIVE_STRIPE_H;
+    let title_h = ROW_HEIGHT_PX as i32;
+    let footer_h = ROW_HEIGHT_PX as i32;
+    let bars_y0 = title_h;
+    let bars_y1 = panel_h - footer_h - MARKER_ZONE_H;
+    let bars_h = (bars_y1 - bars_y0).max(0);
+    let cursor_stripe_y = bars_y1;
+    let active_stripe_y = cursor_stripe_y + CURSOR_STRIPE_H + STRIPE_GAP_H;
+    let footer_y = panel_h - footer_h;
+
+    // No full-screen bg clear — that's what causes the panel-wide
+    // black flash on each tick.  Instead, every region (title,
+    // each column, marker row, footer) is painted so each pixel
+    // is set exactly once per frame to its final colour.  The
+    // outer renderer's content-level diff already short-circuits
+    // unchanged frames; here we just want to redraw the changed
+    // ScanGraph without the destructive clear.
+
+    // Title row: paint as a bg-aware text in *inverted* style
+    // (text colour = bg, surrounding cell = fg) over a padded
+    // string, so one paint covers the full row's pixels with no
+    // separate clear pass.  Pad to fill the row so trailing
+    // glyph cells from a longer previous title are overwritten.
+    let inverted_bg = MonoTextStyleBuilder::new()
+        .font(FONT)
+        .text_color(bg)
+        .background_color(fg)
+        .build();
+    let title_padded = pad_right_to(title, line_cols);
+    Text::with_text_style(
+        &title_padded,
+        Point::new(line_x, 1),
+        inverted_bg,
+        baseline_top,
+    )
+    .draw(display)?;
+    // Fill the 2 px left-margin + right-margin slivers the
+    // padded text doesn't cover, so the title row is fully fg
+    // edge-to-edge.
+    Rectangle::new(Point::zero(), Size::new(line_x as u32, title_h as u32))
+        .into_styled(PrimitiveStyle::with_fill(fg))
+        .draw(display)?;
+    let right_x = (line_cols as i32) * (GLYPH_WIDTH_PX as i32) + line_x;
+    if right_x < panel_w {
+        Rectangle::new(
+            Point::new(right_x, 0),
+            Size::new((panel_w - right_x) as u32, title_h as u32),
+        )
+        .into_styled(PrimitiveStyle::with_fill(fg))
+        .draw(display)?;
+    }
+
+    // Compute per-channel column geometry.  Bars stretch edge to
+    // edge; col_w shrinks as N grows.  bar_w adapts:
+    //   col_w >= 3: bar_w = 75% of col_w (visible gap between bars)
+    //   col_w  < 3: bar_w = col_w (no gap; spectrum-trace mode)
+    let n = (channel_count as i32).min(current_dbm.len() as i32);
+    if n > 0 && bars_h > 0 {
+        let usable_w = panel_w.max(0);
+        let col_w = (usable_w / n).max(1);
+        let col_left_margin = (usable_w - col_w * n) / 2;
+        let (bar_w, bar_x_offset) = if col_w >= 3 {
+            let bw = ((col_w * 3) / 4).max(1);
+            (bw, (col_w - bw) / 2)
+        } else {
+            (col_w, 0)
+        };
+
+        // Margin slivers (left of first column + right of last)
+        // get bg-filled once across the entire bars+marker zone
+        // so leftover pixels from a previous screen don't bleed
+        // in.  Single rect each, doesn't flicker.
+        let combined_h = (bars_h + MARKER_ZONE_H) as u32;
+        if col_left_margin > 0 {
+            Rectangle::new(
+                Point::new(0, bars_y0),
+                Size::new(col_left_margin as u32, combined_h),
+            )
+            .into_styled(PrimitiveStyle::with_fill(bg))
+            .draw(display)?;
+        }
+        let row_right = col_left_margin + col_w * n;
+        if row_right < panel_w {
+            Rectangle::new(
+                Point::new(row_right, bars_y0),
+                Size::new((panel_w - row_right) as u32, combined_h),
+            )
+            .into_styled(PrimitiveStyle::with_fill(bg))
+            .draw(display)?;
+        }
+
+        for i in 0..(n as usize) {
+            let cx = col_left_margin + (i as i32) * col_w;
+            let bar_x = cx + bar_x_offset;
+            let cur = current_dbm[i];
+            let peak = peak_dbm[i];
+
+            // Per-column split paint: every pixel in this column's
+            // bars region is touched exactly once with its final
+            // colour.  No bg→fg transition for any pixel, so no
+            // flash even when bar heights change every tick.
+            //
+            // Layout within column (top-to-bottom):
+            //   [bg above bar]           — col_w wide
+            //   [bg | fg bar | bg]       — bar_h tall, bar_w fg in middle
+            //
+            // After this, the peak tick paints fg over a 2 px
+            // horizontal stripe at peak height (overwrites bg
+            // already set).  Tick is small so its bg→fg transition
+            // is imperceptible.
+            let bar_h = if cur == SCAN_NO_DATA {
+                0
+            } else {
+                dbm_to_bar_height(cur, bars_h)
+            };
+            let above_h = bars_h - bar_h;
+
+            if above_h > 0 {
+                Rectangle::new(
+                    Point::new(cx, bars_y0),
+                    Size::new(col_w as u32, above_h as u32),
+                )
+                .into_styled(PrimitiveStyle::with_fill(bg))
+                .draw(display)?;
+            }
+            if bar_h > 0 {
+                // Left bg sliver inside column (if bar is narrower).
+                if bar_x_offset > 0 {
+                    Rectangle::new(
+                        Point::new(cx, bars_y1 - bar_h),
+                        Size::new(bar_x_offset as u32, bar_h as u32),
+                    )
+                    .into_styled(PrimitiveStyle::with_fill(bg))
+                    .draw(display)?;
+                }
+                // Bar itself.
+                Rectangle::new(
+                    Point::new(bar_x, bars_y1 - bar_h),
+                    Size::new(bar_w as u32, bar_h as u32),
+                )
+                .into_styled(PrimitiveStyle::with_fill(fg))
+                .draw(display)?;
+                // Right bg sliver inside column.
+                let right_sliver_x = bar_x + bar_w;
+                let right_sliver_w = col_w - bar_x_offset - bar_w;
+                if right_sliver_w > 0 {
+                    Rectangle::new(
+                        Point::new(right_sliver_x, bars_y1 - bar_h),
+                        Size::new(right_sliver_w as u32, bar_h as u32),
+                    )
+                    .into_styled(PrimitiveStyle::with_fill(bg))
+                    .draw(display)?;
+                }
+            }
+
+            if peak != SCAN_NO_DATA {
+                let peak_h = dbm_to_bar_height(peak, bars_h);
+                let peak_y = (bars_y1 - peak_h - 1).max(bars_y0);
+                Rectangle::new(
+                    Point::new(cx, peak_y),
+                    Size::new(col_w as u32, 2),
+                )
+                .into_styled(PrimitiveStyle::with_fill(fg))
+                .draw(display)?;
+            }
+        }
+
+        // Marker stripes — two thin horizontal stripes spanning
+        // the bars row, painted as 3 rects each (left bg, fg
+        // stripe at the marked column, right bg) so each pixel
+        // is set exactly once.  Cursor stripe directly under the
+        // bars; active stripe under that with a 1-px gap.
+        let cursor_x = col_left_margin + (cursor as i32) * col_w;
+        let active_x = col_left_margin + (active as i32) * col_w;
+        paint_marker_stripe(
+            display,
+            cursor_stripe_y,
+            CURSOR_STRIPE_H,
+            cursor_x,
+            col_w,
+            col_left_margin,
+            row_right,
+            cursor < (n as u8),
+            fg,
+            bg,
+        )?;
+        // Gap between stripes — bg full-width so old pixels there
+        // are wiped in one shot.
+        if STRIPE_GAP_H > 0 {
+            Rectangle::new(
+                Point::new(col_left_margin, cursor_stripe_y + CURSOR_STRIPE_H),
+                Size::new((row_right - col_left_margin) as u32, STRIPE_GAP_H as u32),
+            )
+            .into_styled(PrimitiveStyle::with_fill(bg))
+            .draw(display)?;
+        }
+        paint_marker_stripe(
+            display,
+            active_stripe_y,
+            ACTIVE_STRIPE_H,
+            active_x,
+            col_w,
+            col_left_margin,
+            row_right,
+            active < (n as u8),
+            fg,
+            bg,
+        )?;
+    }
+
+    // Footer (bg-aware text overpaints, no separate clear).
+    let footer = pad_right_to("Dn=back LR=scroll Cen=ok", line_cols);
+    Text::with_text_style(
+        &footer,
+        Point::new(line_x, footer_y),
+        bgfg_style,
+        baseline_top,
+    )
+    .draw(display)?;
+    Ok(())
+}
+
+/// Paint one marker stripe spanning the bars-row width.  The
+/// stripe is bg everywhere except the column at `mark_x..mark_x +
+/// col_w`, which is fg if `present` is true (otherwise the whole
+/// stripe is bg — used when the cursor or active index is out of
+/// the current channel range).  Three rect fills total: left bg,
+/// fg mark (if present), right bg.  Each pixel is set exactly
+/// once per frame.
+#[allow(clippy::too_many_arguments)]
+fn paint_marker_stripe<D>(
+    display: &mut D,
+    y: i32,
+    h: i32,
+    mark_x: i32,
+    col_w: i32,
+    row_left: i32,
+    row_right: i32,
+    present: bool,
+    fg: D::Color,
+    bg: D::Color,
+) -> Result<(), D::Error>
+where
+    D: DrawTarget,
+{
+    if !present {
+        Rectangle::new(
+            Point::new(row_left, y),
+            Size::new((row_right - row_left).max(0) as u32, h as u32),
+        )
+        .into_styled(PrimitiveStyle::with_fill(bg))
+        .draw(display)?;
+        return Ok(());
+    }
+    if mark_x > row_left {
+        Rectangle::new(
+            Point::new(row_left, y),
+            Size::new((mark_x - row_left) as u32, h as u32),
+        )
+        .into_styled(PrimitiveStyle::with_fill(bg))
+        .draw(display)?;
+    }
+    Rectangle::new(
+        Point::new(mark_x, y),
+        Size::new(col_w as u32, h as u32),
+    )
+    .into_styled(PrimitiveStyle::with_fill(fg))
+    .draw(display)?;
+    let after = mark_x + col_w;
+    if after < row_right {
+        Rectangle::new(
+            Point::new(after, y),
+            Size::new((row_right - after) as u32, h as u32),
+        )
+        .into_styled(PrimitiveStyle::with_fill(bg))
+        .draw(display)?;
+    }
+    Ok(())
+}
+
+/// Map a dBm value to bar height in pixels, clipping to
+/// `[SCAN_DBM_MIN, SCAN_DBM_MAX]` and scaling linearly across the
+/// available `total_h` pixels.
+fn dbm_to_bar_height(dbm: i16, total_h: i32) -> i32 {
+    let clamped = dbm.clamp(SCAN_DBM_MIN, SCAN_DBM_MAX);
+    let span = (SCAN_DBM_MAX - SCAN_DBM_MIN) as i32; // 90
+    let above_min = (clamped - SCAN_DBM_MIN) as i32; // 0..=90
+    (above_min * total_h) / span
 }
 
 /// Build a Selector row: active marker (1 char) + cursor mark (1

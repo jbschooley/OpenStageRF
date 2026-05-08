@@ -23,15 +23,20 @@
 
 use defmt_rtt as _;
 use embassy_executor::Spawner;
+use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_time::{Duration, Instant, Timer};
 use embedded_graphics_core::pixelcolor::Rgb565;
 use embedded_graphics_core::prelude::*;
 use embedded_graphics_core::primitives::Rectangle;
 use embedded_graphics_core::Pixel;
 use osrf_board_t114 as board;
 use osrf_driver_input_joystick5way::{Joystick5Way, JoystickEvent};
-use osrf_ui::{build_screen, KeyStore, LinkStatus, Renderer, Settings, UiState, WidgetList};
+use osrf_ui::{
+    build_screen, KeyStore, LinkStatus, Renderer, ScreenId, Settings, UiState, WidgetList,
+    MAX_SCAN_CHANNELS,
+};
 use panic_probe as _;
 
 use board::embassy_nrf::gpio::{Input, Pull};
@@ -145,25 +150,73 @@ async fn main(spawner: Spawner) {
     // paint over panel-RAM garbage); subsequent calls only touch
     // changed rows.
     build_screen(&state, &settings, &keys, &status, &mut widgets);
-    let _ = renderer.render(&widgets, &mut display);
+    let _ = renderer.render(&widgets, &state.scan, &mut display);
 
     defmt::info!("ui ready: screen={:?}", state.screen);
 
+    // Scan tick interval — how often we synthesize a scan pass
+    // while on the Scan screen.  300 ms is a hand-feel-good rate
+    // for the bars to update visibly without thrashing the
+    // renderer.  The real scanner (once wired) will take roughly
+    // `channels × 12 ms` per pass, so 300 ms is a generous
+    // ceiling for the 24-channel ISM 915 plan.
+    let scan_tick = Duration::from_millis(300);
+
     loop {
-        let event = EVENT_CHAN.receive().await;
-        defmt::info!("event: {:?}", event);
-        if let Some(cmd) = state.handle_event(&mut settings, &keys, event) {
-            defmt::info!("command: {:?}", cmd);
-            // TODO: forward to link runtime via config-update signal.
+        let next_tick = Timer::after(scan_tick);
+        match select(EVENT_CHAN.receive(), next_tick).await {
+            Either::First(event) => {
+                defmt::info!("event: {:?}", event);
+                if let Some(cmd) = state.handle_event(&mut settings, &keys, event) {
+                    defmt::info!("command: {:?}", cmd);
+                    // TODO: forward to link runtime via config-update signal.
+                }
+                defmt::info!(
+                    "state: screen={:?} cursor={} edit={}",
+                    state.screen,
+                    state.cursor,
+                    state.edit_mode
+                );
+            }
+            Either::Second(()) => {
+                // Periodic tick.  Only doing scan work on the
+                // Scan screen; no-op everywhere else.  When the
+                // real `RssiScanner` lands, this is where
+                // `link_runtime.scan_step(...)` gets called.
+                if state.screen == ScreenId::Scan {
+                    let mut buf = [0i16; MAX_SCAN_CHANNELS];
+                    let n = state.scan.channel_count as usize;
+                    synth_scan_pass(&mut buf[..n]);
+                    state.apply_scan_pass(&buf[..n]);
+                }
+            }
         }
-        defmt::info!(
-            "state: screen={:?} cursor={} edit={}",
-            state.screen,
-            state.cursor,
-            state.edit_mode
-        );
         build_screen(&state, &settings, &keys, &status, &mut widgets);
-        let _ = renderer.render(&widgets, &mut display);
+        let _ = renderer.render(&widgets, &state.scan, &mut display);
+    }
+}
+
+/// Stub scanner: synthesize per-channel noise floors that move
+/// over time so the Scan screen visibly updates without a real
+/// radio.  Each channel oscillates around its own baseline at a
+/// distinct phase, with one occasional spike per pass to exercise
+/// the peak-tick render path.  Replace with a real
+/// `link_runtime.scan_step(...)` call once live config-update
+/// plumbing lands.
+fn synth_scan_pass(out: &mut [i16]) {
+    let n = out.len();
+    let t = Instant::now().as_millis() as i32;
+    let spike_target = (t / 600) as usize % n.max(1);
+    for (i, slot) in out.iter_mut().enumerate() {
+        // Triangle wave per channel, period ~6 s, amplitude 12 dB.
+        let phase = ((t / 50) + (i as i32) * 30) % 240;
+        let tri = if phase < 120 { phase } else { 240 - phase }; // 0..120
+        let baseline = -100 - (i as i32 % 5); // -100..-104 dBm baseline
+        let mut dbm = baseline + (tri / 10); // ±12 dB swing
+        if spike_target == i {
+            dbm += 18;
+        }
+        *slot = dbm as i16;
     }
 }
 

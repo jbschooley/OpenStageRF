@@ -56,12 +56,14 @@ use crate::{idx_to_direction, Direction, JoystickEvent, LONG_PRESS_THRESHOLD};
 /// typical mechanical-switch bounce (5–10 ms).
 pub const DEBOUNCE_DURATION: Duration = Duration::from_millis(20);
 
-/// Auto-repeat interval for Up / Down hold.  After the long-press
-/// threshold elapses, holding Up or Down continues to fire
-/// synthetic `Press(dir)` events at this cadence so list scrolling
-/// feels like a typamatic keyboard.  Only Up and Down auto-repeat
-/// — Center / Left / Right have non-repeating semantics
-/// (confirm / back / enter) and don't benefit from rapid-fire.
+/// Auto-repeat interval for held directional events.  After the
+/// long-press threshold elapses, holding Up / Down / Left / Right
+/// continues to fire synthetic `Press(dir)` events at this
+/// cadence so list scrolling and the Scan screen's horizontal
+/// cursor feel like a typamatic keyboard.  **Center does not
+/// auto-repeat** — its long-press is the universal "go home"
+/// action and emitting periodic Press(Center) events afterwards
+/// would re-enter MainMenu repeatedly.
 pub const AUTO_REPEAT_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Internal state machine — see module docs.
@@ -173,7 +175,10 @@ where
                             // we wait silently for release.
                             let auto_repeat = matches!(
                                 idx_to_direction(idx),
-                                Direction::Up | Direction::Down
+                                Direction::Up
+                                    | Direction::Down
+                                    | Direction::Left
+                                    | Direction::Right
                             );
                             self.state = InternalState::LongPressed {
                                 idx,
