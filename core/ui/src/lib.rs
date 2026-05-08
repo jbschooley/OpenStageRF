@@ -141,8 +141,10 @@ impl Default for LinkStatus {
 pub enum ScreenId {
     /// Default screen after boot / quick-action exit.
     Idle,
-    /// Top-level menu of submenus.
-    MainMenu,
+    /// A menu of items.  *Which* menu is held in
+    /// [`UiState::current_menu`] — Menu is a generic container,
+    /// content is data-driven from a [`MenuNode`].
+    Menu,
     /// Channel selector — scrollable list of channels in the
     /// current band plan, each showing label + frequency.
     ChannelSelect,
@@ -166,7 +168,7 @@ impl ScreenId {
     pub fn label(&self) -> &'static str {
         match self {
             ScreenId::Idle => "Idle",
-            ScreenId::MainMenu => "Menu",
+            ScreenId::Menu => "Menu",
             ScreenId::ChannelSelect => "Channel",
             ScreenId::BandPlanSelect => "Band Plan",
             ScreenId::KeySelect => "Key",
@@ -177,28 +179,116 @@ impl ScreenId {
     }
 }
 
-/// Order of submenus in MainMenu — by index (cursor row).
-const MAIN_MENU_ITEMS: &[ScreenId] = &[
-    ScreenId::ChannelSelect,
-    ScreenId::BandPlanSelect,
-    ScreenId::PowerSelect,
-    ScreenId::KeySelect,
-    ScreenId::LinkStats,
-    ScreenId::About,
-];
+// ── Menu tree ───────────────────────────────────────────────────────────────
+//
+// Menus are pure data: a [`MenuNode`] is a title + a list of
+// [`MenuItem`]s, each of which carries a label and an
+// [`ItemAction`].  The state machine walks this tree generically
+// — adding a new submenu means adding a `static FOO_MENU:
+// MenuNode = ...` and a `MenuItem` referencing it from a parent,
+// no match-arm edits.
+//
+// Custom screens (Idle, LinkStats, About) sit outside the tree;
+// menus link to them via [`ItemAction::Custom(ScreenId::...)`]
+// and the per-screen `handle_*` / `build_*` functions take over
+// once entered.
+
+/// One row in a menu — a display label plus what activating it does.
+#[derive(Debug, Clone, Copy)]
+pub struct MenuItem {
+    pub label: &'static str,
+    pub action: ItemAction,
+}
+
+/// What pressing Center / Right on a menu row does.
+#[derive(Debug, Clone, Copy)]
+pub enum ItemAction {
+    /// Descend into a child menu.  The state machine pushes the
+    /// current frame and switches `current_menu` to the new node.
+    Submenu(&'static MenuNode),
+    /// Open a list-select screen of the given kind (Channel,
+    /// Band Plan, Key).
+    List(ListKind),
+    /// Open a value-edit screen of the given kind (TX Power).
+    Value(ValueKind),
+    /// Open a custom screen by ID — escape hatch for screens that
+    /// don't fit the list-or-value mould (LinkStats readout, About,
+    /// future status displays).
+    Custom(ScreenId),
+}
+
+/// A menu — a title (drawn as the screen's title bar) and a
+/// static list of items.  Submenus link here via
+/// [`ItemAction::Submenu`].
+#[derive(Debug)]
+pub struct MenuNode {
+    pub title: &'static str,
+    pub items: &'static [MenuItem],
+}
+
+/// Top-level menu, entered from Idle on Center/Right.  When
+/// adding new submenus, declare a `static FOO_MENU: MenuNode`
+/// and reference it from here (or any deeper parent) via
+/// [`ItemAction::Submenu`].
+pub static MAIN_MENU: MenuNode = MenuNode {
+    title: "Menu",
+    items: &[
+        MenuItem { label: "Channel",    action: ItemAction::List(ListKind::Channel) },
+        MenuItem { label: "Band Plan",  action: ItemAction::List(ListKind::BandPlan) },
+        MenuItem { label: "TX Power",   action: ItemAction::Value(ValueKind::TxPower) },
+        // Hidden until AEAD lands (Stage 3 in ROADMAP.md) — KeySelect
+        // and the KeyStore still exist and work, but exposing them in
+        // the UI is misleading while there's no actual encryption.
+        // MenuItem { label: "Key",        action: ItemAction::List(ListKind::Key) },
+        MenuItem { label: "Link Stats", action: ItemAction::Custom(ScreenId::LinkStats) },
+        MenuItem { label: "About",      action: ItemAction::Custom(ScreenId::About) },
+    ],
+};
 
 // ── UiState ────────────────────────────────────────────────────────────────
 
+/// Maximum navigation stack depth.  Each `enter()` pushes one
+/// [`NavFrame`]; `pop_nav()` restores the top frame.  Sized for
+/// plausible UI depth on a small device — Idle → MainMenu →
+/// submenu → sub-submenu fits in 3, leaving room.  Pushes past
+/// the limit are silently dropped (the user gets a one-frame
+/// shorter back-trail; no panic).
+pub const MAX_NAV_DEPTH: usize = 4;
+
+/// One frame on the navigation stack — captures enough to
+/// restore a parent screen exactly: which screen, which menu
+/// (if it was a Menu screen), cursor, scroll.
+#[derive(Debug, Clone, Copy)]
+pub struct NavFrame {
+    pub screen: ScreenId,
+    /// Menu pointer at the time of push.  Always present (even
+    /// for non-Menu screens it holds the most-recent menu we
+    /// were on, so popping back to a non-menu state still
+    /// leaves `current_menu` sensible).
+    pub menu: &'static MenuNode,
+    pub cursor: u8,
+    pub scroll: u8,
+}
+
 /// Active UI state.  Held statically for the lifetime of the
 /// program; `handle_event` mutates it in place.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+///
+/// Not `defmt::Format` (`heapless::Vec` doesn't impl it) and
+/// not `PartialEq` (the `&'static MenuNode` field complicates
+/// derive); callers print individual fields and never compare
+/// whole states.
+#[derive(Debug, Clone)]
 pub struct UiState {
     /// Current screen.
     pub screen: ScreenId,
+    /// Currently active menu definition.  Meaningful when
+    /// [`Self::screen`] is `ScreenId::Menu`; otherwise it's the
+    /// menu we were last on (so popping back into a menu screen
+    /// has the right context).
+    pub current_menu: &'static MenuNode,
     /// Cursor index on the current screen.  For list-based screens
-    /// (ChannelSelect, BandPlanSelect, MainMenu) this is the index
-    /// of the selected list item.  For value-edit screens
+    /// (ChannelSelect, BandPlanSelect, Menu) this is the index of
+    /// the selected list item.  For value-edit screens
     /// (PowerSelect, KeySelect) this is unused (always 0).
     pub cursor: u8,
     /// Vertical scroll offset for list-based screens.  The list
@@ -216,26 +306,23 @@ pub struct UiState {
     /// edit mode; written back on Center confirm.  Held as an `i32`
     /// so it can carry a TX-power negative range without overflow.
     pub edit_buffer: i32,
-    /// Saved MainMenu cursor position — restored when backing out
-    /// of a submenu via Left.  Without this, navigating
-    /// MainMenu → "TX Power" → Left would dump the user back at
-    /// the top of MainMenu instead of the row they were on.
-    pub saved_menu_cursor: u8,
-    /// Saved MainMenu scroll offset, paired with
-    /// [`Self::saved_menu_cursor`].
-    pub saved_menu_scroll: u8,
+    /// Parent navigation stack.  Top of stack is the immediate
+    /// parent of [`Self::screen`]; popping restores that parent
+    /// with its cursor + scroll preserved.  Empty at boot (Idle
+    /// is the root and has no parent).
+    pub nav_stack: Vec<NavFrame, MAX_NAV_DEPTH>,
 }
 
 impl Default for UiState {
     fn default() -> Self {
         Self {
             screen: ScreenId::Idle,
+            current_menu: &MAIN_MENU,
             cursor: 0,
             scroll_offset: 0,
             edit_mode: false,
             edit_buffer: 0,
-            saved_menu_cursor: 0,
-            saved_menu_scroll: 0,
+            nav_stack: Vec::new(),
         }
     }
 }
@@ -297,8 +384,8 @@ impl UiState {
 
         // Per-screen dispatch.
         match self.screen {
-            ScreenId::Idle => self.handle_idle(event),
-            ScreenId::MainMenu => self.handle_main_menu(event, settings, keys),
+            ScreenId::Idle => self.handle_idle(event, settings, keys),
+            ScreenId::Menu => self.handle_menu(event, settings, keys),
             ScreenId::ChannelSelect => self.handle_list_select(event, settings, keys, ListKind::Channel),
             ScreenId::BandPlanSelect => {
                 self.handle_list_select(event, settings, keys, ListKind::BandPlan)
@@ -311,19 +398,27 @@ impl UiState {
         }
     }
 
-    fn handle_idle(&mut self, event: JoystickEvent) -> Option<Command> {
+    fn handle_idle(
+        &mut self,
+        event: JoystickEvent,
+        _settings: &Settings,
+        _keys: &KeyStore,
+    ) -> Option<Command> {
         match event {
             JoystickEvent::Press(Direction::Center)
             | JoystickEvent::Press(Direction::Right) => {
-                self.screen = ScreenId::MainMenu;
-                self.cursor = 0;
+                self.enter_menu(&MAIN_MENU);
             }
             _ => {}
         }
         None
     }
 
-    fn handle_main_menu(
+    /// Generic menu handler — drives any [`MenuNode`] held in
+    /// `self.current_menu`.  Up / Down move the cursor (with
+    /// scroll bookkeeping); Left pops; Center / Right dispatch
+    /// the current item's [`ItemAction`].
+    fn handle_menu(
         &mut self,
         event: JoystickEvent,
         settings: &Settings,
@@ -337,19 +432,25 @@ impl UiState {
                 }
             }
             JoystickEvent::Press(Direction::Down) => {
-                let max = MAIN_MENU_ITEMS.len() as u8 - 1;
+                let max = (self.current_menu.items.len() as u8).saturating_sub(1);
                 self.cursor = (self.cursor + 1).min(max);
                 if self.cursor >= self.scroll_offset + VISIBLE_LIST_ROWS {
                     self.scroll_offset = self.cursor + 1 - VISIBLE_LIST_ROWS;
                 }
             }
             JoystickEvent::Press(Direction::Left) => {
-                self.go_home();
+                self.pop_nav();
             }
             JoystickEvent::Press(Direction::Right)
             | JoystickEvent::Press(Direction::Center) => {
-                if let Some(&target) = MAIN_MENU_ITEMS.get(self.cursor as usize) {
-                    self.enter(target, settings, keys);
+                if let Some(item) = self.current_menu.items.get(self.cursor as usize) {
+                    let action = item.action;
+                    match action {
+                        ItemAction::Submenu(node) => self.enter_menu(node),
+                        ItemAction::List(kind) => self.enter(kind.screen(), settings, keys),
+                        ItemAction::Value(kind) => self.enter(kind.screen(), settings, keys),
+                        ItemAction::Custom(s) => self.enter(s, settings, keys),
+                    }
                 }
             }
             _ => {}
@@ -381,11 +482,11 @@ impl UiState {
             JoystickEvent::Press(Direction::Center)
             | JoystickEvent::Press(Direction::Right) => {
                 let cmd = kind.commit(self.cursor, settings, keys);
-                self.go_back_to_main_menu();
+                self.pop_nav();
                 return cmd;
             }
             JoystickEvent::Press(Direction::Left) => {
-                self.go_back_to_main_menu();
+                self.pop_nav();
             }
             _ => {}
         }
@@ -427,7 +528,7 @@ impl UiState {
                     // Cancel — discard buffer, stay on screen.
                     self.edit_mode = false;
                 } else {
-                    self.go_back_to_main_menu();
+                    self.pop_nav();
                 }
             }
             _ => {}
@@ -437,7 +538,7 @@ impl UiState {
 
     fn handle_readonly(&mut self, event: JoystickEvent) -> Option<Command> {
         match event {
-            JoystickEvent::Press(Direction::Left) => self.go_back_to_main_menu(),
+            JoystickEvent::Press(Direction::Left) => self.pop_nav(),
             _ => {}
         }
         None
@@ -445,39 +546,67 @@ impl UiState {
 
     fn go_home(&mut self) {
         self.screen = ScreenId::Idle;
+        self.current_menu = &MAIN_MENU;
+        self.cursor = 0;
+        self.scroll_offset = 0;
+        self.edit_mode = false;
+        self.edit_buffer = 0;
+        self.nav_stack.clear();
+    }
+
+    /// Pop one frame off the nav stack and become that screen,
+    /// restoring its cursor + scroll + menu pointer.  If the
+    /// stack is empty (e.g. entered a screen directly without
+    /// going through `enter()`), fall back to Idle.
+    fn pop_nav(&mut self) {
+        if let Some(frame) = self.nav_stack.pop() {
+            self.screen = frame.screen;
+            self.current_menu = frame.menu;
+            self.cursor = frame.cursor;
+            self.scroll_offset = frame.scroll;
+        } else {
+            self.screen = ScreenId::Idle;
+            self.current_menu = &MAIN_MENU;
+            self.cursor = 0;
+            self.scroll_offset = 0;
+        }
+        self.edit_mode = false;
+        self.edit_buffer = 0;
+    }
+
+    /// Push current frame and switch to a child [`MenuNode`].
+    /// Used by [`ItemAction::Submenu`] dispatch and the
+    /// Idle → MainMenu transition.
+    fn enter_menu(&mut self, node: &'static MenuNode) {
+        let _ = self.nav_stack.push(NavFrame {
+            screen: self.screen,
+            menu: self.current_menu,
+            cursor: self.cursor,
+            scroll: self.scroll_offset,
+        });
+        self.screen = ScreenId::Menu;
+        self.current_menu = node;
         self.cursor = 0;
         self.scroll_offset = 0;
         self.edit_mode = false;
         self.edit_buffer = 0;
     }
 
-    fn go_back_to_main_menu(&mut self) {
-        self.screen = ScreenId::MainMenu;
-        // Restore saved cursor/scroll so backing out of a
-        // submenu lands the user back where they were.
-        self.cursor = self.saved_menu_cursor;
-        self.scroll_offset = self.saved_menu_scroll;
-        self.edit_mode = false;
-        self.edit_buffer = 0;
-    }
-
+    /// Push current frame and switch to a non-menu screen
+    /// (list-select, value-edit, or a custom screen).  For
+    /// list-based screens, positions the cursor on the
+    /// currently-active entry.
     fn enter(&mut self, screen: ScreenId, settings: &Settings, keys: &KeyStore) {
-        // Before navigating away from MainMenu, snapshot the
-        // cursor + scroll so go_back_to_main_menu can restore
-        // them.  Other screens don't need preservation — only
-        // the one we navigated FROM.
-        if self.screen == ScreenId::MainMenu {
-            self.saved_menu_cursor = self.cursor;
-            self.saved_menu_scroll = self.scroll_offset;
-        }
+        let _ = self.nav_stack.push(NavFrame {
+            screen: self.screen,
+            menu: self.current_menu,
+            cursor: self.cursor,
+            scroll: self.scroll_offset,
+        });
 
         self.screen = screen;
         self.edit_mode = false;
         self.edit_buffer = 0;
-        // For list-based screens, set cursor to the currently
-        // selected list entry so the cursor lands on the active
-        // item.  Adjust scroll_offset to make sure that item is
-        // within the visible window.
         let cursor = match screen {
             ScreenId::ChannelSelect => settings.channel,
             ScreenId::BandPlanSelect => band_plan_index(settings.band_plan) as u8,
@@ -485,10 +614,7 @@ impl UiState {
             _ => 0,
         };
         self.cursor = cursor;
-        // Scroll to keep cursor visible — if it's past the
-        // initial window, jump to a window that contains it.
         self.scroll_offset = cursor.saturating_sub(VISIBLE_LIST_ROWS - 1);
-        // Pre-fill edit_buffer for value-edit screens.
         self.edit_buffer = match screen {
             ScreenId::PowerSelect => settings.tx_power_dbm as i32,
             _ => 0,
@@ -524,15 +650,25 @@ fn band_plan_index(plan: BandPlan) -> usize {
         .unwrap_or(0)
 }
 
-/// Internal: which list a list-based screen is selecting from.
-#[derive(Clone, Copy)]
-enum ListKind {
+/// Which list a list-based screen is selecting from.  Public so
+/// menu definitions can refer to it via [`ItemAction::List`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListKind {
     Channel,
     BandPlan,
     Key,
 }
 
 impl ListKind {
+    /// The [`ScreenId`] this list opens on.
+    pub fn screen(self) -> ScreenId {
+        match self {
+            ListKind::Channel => ScreenId::ChannelSelect,
+            ListKind::BandPlan => ScreenId::BandPlanSelect,
+            ListKind::Key => ScreenId::KeySelect,
+        }
+    }
+
     fn max_index(&self, settings: &Settings, keys: &KeyStore) -> u8 {
         match self {
             ListKind::Channel => max_channel_index(settings.band_plan),
@@ -599,15 +735,23 @@ impl ListKind {
     }
 }
 
-/// Internal: which numeric setting we're editing on a value-edit
-/// screen.  Only TX power uses this pattern in v1; channel, band
-/// plan, and key slot are list-based and use [`ListKind`].
-#[derive(Clone, Copy)]
-enum ValueKind {
+/// Which numeric setting we're editing on a value-edit screen.
+/// Only TX power uses this pattern in v1; channel, band plan,
+/// and key slot are list-based and use [`ListKind`].  Public so
+/// menu definitions can refer to it via [`ItemAction::Value`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueKind {
     TxPower,
 }
 
 impl ValueKind {
+    /// The [`ScreenId`] this value-edit opens on.
+    pub fn screen(self) -> ScreenId {
+        match self {
+            ValueKind::TxPower => ScreenId::PowerSelect,
+        }
+    }
+
     fn read(&self, settings: &Settings) -> i32 {
         match self {
             ValueKind::TxPower => settings.tx_power_dbm as i32,
@@ -720,7 +864,7 @@ pub fn build_screen(
     out.clear();
     match state.screen {
         ScreenId::Idle => build_idle(settings, keys, status, out),
-        ScreenId::MainMenu => build_main_menu(state, out),
+        ScreenId::Menu => build_menu(state, out),
         ScreenId::ChannelSelect => build_channel_select(state, settings, out),
         ScreenId::BandPlanSelect => build_band_plan_select(state, settings, out),
         ScreenId::PowerSelect => build_value_select(
@@ -762,21 +906,27 @@ fn build_idle(settings: &Settings, keys: &KeyStore, status: &LinkStatus, out: &m
     out.push(Widget::Footer(s("Center: menu"))).ok();
 }
 
-fn build_main_menu(state: &UiState, out: &mut WidgetList) {
-    out.push(Widget::Title(s("Menu"))).ok();
-    let total = MAIN_MENU_ITEMS.len() as u8;
+/// Generic menu renderer — walks `state.current_menu.items`,
+/// emitting a `Selector` widget per visible row.  Same code
+/// renders the top-level menu and any future submenus.
+fn build_menu(state: &UiState, out: &mut WidgetList) {
+    let menu = state.current_menu;
+    let mut title: String<24> = String::new();
+    let _ = write!(&mut title, "{}", menu.title);
+    out.push(Widget::Title(title)).ok();
+    let total = menu.items.len() as u8;
     let start = state.scroll_offset;
     let end = (start + VISIBLE_LIST_ROWS).min(total);
     for (visible_idx, list_idx) in (start..end).enumerate() {
-        let item = MAIN_MENU_ITEMS[list_idx as usize];
+        let item = menu.items[list_idx as usize];
         let mut label: String<16> = String::new();
-        let _ = write!(&mut label, "{}", item.label());
+        let _ = write!(&mut label, "{}", item.label);
         out.push(Widget::Selector {
             row: 1 + visible_idx as u8,
             label,
             value: String::new(),
             selected: state.cursor == list_idx,
-            active: false, // MainMenu items are navigation, not state
+            active: false, // menu items are navigation, not state
             editing: false,
         })
         .ok();
@@ -1034,7 +1184,7 @@ mod tests {
         let mut state = UiState::default();
         let mut settings = Settings::default(); let keys = KeyStore::new();
         let cmd = state.handle_event(&mut settings, &keys, press(Direction::Center));
-        assert_eq!(state.screen, ScreenId::MainMenu);
+        assert_eq!(state.screen, ScreenId::Menu);
         assert_eq!(state.cursor, 0);
         assert_eq!(cmd, None);
     }
@@ -1055,8 +1205,8 @@ mod tests {
             scroll_offset: 0,
             edit_mode: false,
             edit_buffer: 0,
-            saved_menu_cursor: 0,
-            saved_menu_scroll: 0,
+            current_menu: &MAIN_MENU,
+            nav_stack: Vec::new(),
         };
         let mut settings = Settings::default(); let keys = KeyStore::new();
         state.handle_event(&mut settings, &keys, long(Direction::Center));
@@ -1066,13 +1216,13 @@ mod tests {
     #[test]
     fn main_menu_navigation() {
         let mut state = UiState {
-            screen: ScreenId::MainMenu,
+            screen: ScreenId::Menu,
             cursor: 0,
             scroll_offset: 0,
             edit_mode: false,
             edit_buffer: 0,
-            saved_menu_cursor: 0,
-            saved_menu_scroll: 0,
+            current_menu: &MAIN_MENU,
+            nav_stack: Vec::new(),
         };
         let mut settings = Settings::default(); let keys = KeyStore::new();
         state.handle_event(&mut settings, &keys, press(Direction::Down));
@@ -1090,13 +1240,13 @@ mod tests {
     #[test]
     fn main_menu_enters_submenu_on_center() {
         let mut state = UiState {
-            screen: ScreenId::MainMenu,
+            screen: ScreenId::Menu,
             cursor: 0, // ChannelSelect
             scroll_offset: 0,
             edit_mode: false,
             edit_buffer: 0,
-            saved_menu_cursor: 0,
-            saved_menu_scroll: 0,
+            current_menu: &MAIN_MENU,
+            nav_stack: Vec::new(),
         };
         let mut settings = Settings::default(); let keys = KeyStore::new();
         state.handle_event(&mut settings, &keys, press(Direction::Center));
@@ -1107,7 +1257,7 @@ mod tests {
     fn channel_select_list_navigation_and_apply() {
         // Enter ChannelSelect from MainMenu.
         let mut state = UiState {
-            screen: ScreenId::MainMenu,
+            screen: ScreenId::Menu,
             cursor: 0, // ChannelSelect (first menu item)
             ..UiState::default()
         };
@@ -1128,21 +1278,24 @@ mod tests {
         let cmd = state.handle_event(&mut settings, &keys, press(Direction::Center));
         assert_eq!(settings.channel, 2);
         assert_eq!(cmd, Some(Command::ApplyChannel(2)));
-        assert_eq!(state.screen, ScreenId::MainMenu);
+        assert_eq!(state.screen, ScreenId::Menu);
     }
 
     #[test]
     fn channel_select_left_cancels_without_applying() {
-        let mut state = UiState {
-            screen: ScreenId::ChannelSelect,
-            cursor: 1,
-            ..UiState::default()
-        };
-        let mut settings = Settings { channel: 0, ..Settings::default() }; let keys = KeyStore::new();
+        // Navigate Idle → MainMenu → ChannelSelect so the nav
+        // stack records the parent frames; otherwise pop_nav
+        // falls all the way back to Idle.
+        let mut state = UiState::default();
+        let mut settings = Settings { channel: 0, ..Settings::default() };
+        let keys = KeyStore::new();
+        state.handle_event(&mut settings, &keys, press(Direction::Center));
+        state.handle_event(&mut settings, &keys, press(Direction::Center));
+        assert_eq!(state.screen, ScreenId::ChannelSelect);
         // Move cursor, then back out.
         state.handle_event(&mut settings, &keys, press(Direction::Down));
         state.handle_event(&mut settings, &keys, press(Direction::Left));
-        assert_eq!(state.screen, ScreenId::MainMenu);
+        assert_eq!(state.screen, ScreenId::Menu);
         assert_eq!(settings.channel, 0, "channel preserved on Left");
     }
 
@@ -1167,7 +1320,7 @@ mod tests {
         // index near the top, then switch to a plan with fewer
         // channels.  channel should clamp.
         let mut state = UiState {
-            screen: ScreenId::MainMenu,
+            screen: ScreenId::Menu,
             cursor: 0,
             ..UiState::default()
         };
@@ -1211,8 +1364,8 @@ mod tests {
             scroll_offset: 0,
             edit_mode: false,
             edit_buffer: 0,
-            saved_menu_cursor: 0,
-            saved_menu_scroll: 0,
+            current_menu: &MAIN_MENU,
+            nav_stack: Vec::new(),
         };
         let mut settings = Settings { tx_power_dbm: 0, ..Settings::default() }; let keys = KeyStore::new();
         state.handle_event(&mut settings, &keys, press(Direction::Center));
@@ -1273,13 +1426,13 @@ mod tests {
     #[test]
     fn build_main_menu_has_correct_cursor_highlight() {
         let mut state = UiState {
-            screen: ScreenId::MainMenu,
+            screen: ScreenId::Menu,
             cursor: 2,
             scroll_offset: 0,
             edit_mode: false,
             edit_buffer: 0,
-            saved_menu_cursor: 0,
-            saved_menu_scroll: 0,
+            current_menu: &MAIN_MENU,
+            nav_stack: Vec::new(),
         };
         let settings = Settings::default();
         let keys = KeyStore::new();
@@ -1299,5 +1452,31 @@ mod tests {
             }
         }
         let _ = &mut state;
+    }
+
+    #[test]
+    fn back_from_submenu_restores_main_menu_cursor() {
+        // Navigate Idle → MainMenu, scroll cursor onto Link Stats,
+        // enter it, press Left.  Cursor should land back on Link
+        // Stats, not jump to 0.  (Index resolved at runtime so this
+        // tracks MAIN_MENU edits — e.g. hiding Key shifts the row.)
+        let mut state = UiState::default();
+        let mut settings = Settings::default();
+        let keys = KeyStore::new();
+        let link_stats_idx = MAIN_MENU
+            .items
+            .iter()
+            .position(|i| matches!(i.action, ItemAction::Custom(ScreenId::LinkStats)))
+            .expect("Link Stats must be in MAIN_MENU") as u8;
+        state.handle_event(&mut settings, &keys, press(Direction::Center));
+        for _ in 0..link_stats_idx {
+            state.handle_event(&mut settings, &keys, press(Direction::Down));
+        }
+        assert_eq!(state.cursor, link_stats_idx);
+        state.handle_event(&mut settings, &keys, press(Direction::Center));
+        assert_eq!(state.screen, ScreenId::LinkStats);
+        state.handle_event(&mut settings, &keys, press(Direction::Left));
+        assert_eq!(state.screen, ScreenId::Menu);
+        assert_eq!(state.cursor, link_stats_idx);
     }
 }
