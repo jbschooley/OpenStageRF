@@ -145,6 +145,10 @@ pub enum ScreenId {
     /// [`UiState::current_menu`] — Menu is a generic container,
     /// content is data-driven from a [`MenuNode`].
     Menu,
+    /// Channel scanner — bar graph of per-channel current and
+    /// peak-since-open noise floor.  Center applies the cursor's
+    /// channel as the new active channel.
+    Scan,
     /// Channel selector — scrollable list of channels in the
     /// current band plan, each showing label + frequency.
     ChannelSelect,
@@ -169,6 +173,7 @@ impl ScreenId {
         match self {
             ScreenId::Idle => "Idle",
             ScreenId::Menu => "Menu",
+            ScreenId::Scan => "Scan",
             ScreenId::ChannelSelect => "Channel",
             ScreenId::BandPlanSelect => "Band Plan",
             ScreenId::KeySelect => "Key",
@@ -234,6 +239,7 @@ pub static MAIN_MENU: MenuNode = MenuNode {
     title: "Menu",
     items: &[
         MenuItem { label: "Channel",    action: ItemAction::List(ListKind::Channel) },
+        MenuItem { label: "Scan",       action: ItemAction::Custom(ScreenId::Scan) },
         MenuItem { label: "Band Plan",  action: ItemAction::List(ListKind::BandPlan) },
         MenuItem { label: "TX Power",   action: ItemAction::Value(ValueKind::TxPower) },
         // Hidden until AEAD lands (Stage 3 in ROADMAP.md) — KeySelect
@@ -244,6 +250,59 @@ pub static MAIN_MENU: MenuNode = MenuNode {
         MenuItem { label: "About",      action: ItemAction::Custom(ScreenId::About) },
     ],
 };
+
+// ── Scan state ──────────────────────────────────────────────────────────────
+
+/// Maximum number of channels the scan screen can track at once.
+/// Sized for the Wide 200 kHz plan (131 channels) with headroom.
+/// Plans with fewer channels pad and use only the first
+/// `channel_count` slots.  Memory cost is `4 * MAX_SCAN_CHANNELS`
+/// bytes per [`ScanState`] (current + peak as `i16`).
+pub const MAX_SCAN_CHANNELS: usize = 144;
+
+/// Sentinel for "no RSSI sample yet" in [`ScanState`].  The
+/// renderer treats this as "draw nothing" for that channel.
+pub const SCAN_NO_DATA: i16 = i16::MIN;
+
+/// Per-channel scan data: current noise-floor RSSI and peak (max)
+/// observed since this scan session began.  Profile drives one
+/// pass at a time via [`UiState::apply_scan_pass`]; reset happens
+/// automatically on entering [`ScreenId::Scan`].
+#[derive(Debug, Clone)]
+pub struct ScanState {
+    /// Current noise floor in dBm per channel index in the active
+    /// band plan.  `SCAN_NO_DATA` until the first pass populates.
+    pub current_dbm: [i16; MAX_SCAN_CHANNELS],
+    /// Peak (highest) noise floor observed per channel since the
+    /// last reset.  `SCAN_NO_DATA` until populated; never decays.
+    pub peak_dbm: [i16; MAX_SCAN_CHANNELS],
+    /// Number of valid entries (entries `0..channel_count` are
+    /// meaningful; the rest are stale padding).  Set on entry.
+    pub channel_count: u8,
+}
+
+impl Default for ScanState {
+    fn default() -> Self {
+        Self {
+            current_dbm: [SCAN_NO_DATA; MAX_SCAN_CHANNELS],
+            peak_dbm: [SCAN_NO_DATA; MAX_SCAN_CHANNELS],
+            channel_count: 0,
+        }
+    }
+}
+
+impl ScanState {
+    /// Reset all per-channel data and bind the scan to a band
+    /// plan's channel count.  Called on entering the Scan screen.
+    pub fn reset(&mut self, plan: BandPlan) {
+        let n = plan.info().channels.len().min(MAX_SCAN_CHANNELS);
+        for i in 0..MAX_SCAN_CHANNELS {
+            self.current_dbm[i] = SCAN_NO_DATA;
+            self.peak_dbm[i] = SCAN_NO_DATA;
+        }
+        self.channel_count = n as u8;
+    }
+}
 
 // ── UiState ────────────────────────────────────────────────────────────────
 
@@ -311,6 +370,11 @@ pub struct UiState {
     /// with its cursor + scroll preserved.  Empty at boot (Idle
     /// is the root and has no parent).
     pub nav_stack: Vec<NavFrame, MAX_NAV_DEPTH>,
+    /// Channel-scan state.  Meaningful when [`Self::screen`] is
+    /// `ScreenId::Scan`; reset on every entry to that screen.
+    /// Updated by the profile's scan loop via
+    /// [`Self::apply_scan_pass`] after each completed pass.
+    pub scan: ScanState,
 }
 
 impl Default for UiState {
@@ -323,6 +387,7 @@ impl Default for UiState {
             edit_mode: false,
             edit_buffer: 0,
             nav_stack: Vec::new(),
+            scan: ScanState::default(),
         }
     }
 }
@@ -386,6 +451,7 @@ impl UiState {
         match self.screen {
             ScreenId::Idle => self.handle_idle(event, settings, keys),
             ScreenId::Menu => self.handle_menu(event, settings, keys),
+            ScreenId::Scan => self.handle_scan(event, settings),
             ScreenId::ChannelSelect => self.handle_list_select(event, settings, keys, ListKind::Channel),
             ScreenId::BandPlanSelect => {
                 self.handle_list_select(event, settings, keys, ListKind::BandPlan)
@@ -456,6 +522,69 @@ impl UiState {
             _ => {}
         }
         None
+    }
+
+    /// Channel-scan handler.  Joystick is reoriented for this
+    /// screen since channels are laid out horizontally:
+    ///
+    /// - **Left / Right** scroll the cursor between channels
+    ///   (auto-repeat on hold for fast traversal of the 87- and
+    ///   131-channel dense plans).
+    /// - **Down** pops back to the parent menu (Up is left as a
+    ///   no-op so users don't accidentally exit while reaching
+    ///   for the scroll keys).
+    /// - **Center** applies the cursor's channel as the new
+    ///   active channel and **stays on Scan** so the user can
+    ///   keep watching the floor or pick a different channel.
+    fn handle_scan(
+        &mut self,
+        event: JoystickEvent,
+        settings: &mut Settings,
+    ) -> Option<Command> {
+        let max_idx = self.scan.channel_count.saturating_sub(1);
+        match event {
+            JoystickEvent::Press(Direction::Left) => {
+                self.cursor = self.cursor.saturating_sub(1);
+            }
+            JoystickEvent::Press(Direction::Right) => {
+                self.cursor = (self.cursor + 1).min(max_idx);
+            }
+            JoystickEvent::Press(Direction::Center) => {
+                let new_v = self.cursor.min(max_channel_index(settings.band_plan));
+                let changed = settings.channel != new_v;
+                settings.channel = new_v;
+                return if changed {
+                    Some(Command::ApplyChannel(new_v))
+                } else {
+                    None
+                };
+            }
+            JoystickEvent::Press(Direction::Down) => {
+                self.pop_nav();
+            }
+            // Up: intentionally no-op.  Long-press Center
+            // (universal "go home") still works.
+            _ => {}
+        }
+        None
+    }
+
+    /// Update the scan table with the result of one full pass.
+    /// `rssi[i]` is the noise floor (mean dBm) for channel `i` in
+    /// the active band plan.  Peak per channel is `max(prev_peak,
+    /// rssi[i])`.  Profile calls this after every completed
+    /// scan_step.  Safe to call when not on the Scan screen
+    /// (no-op on the screen, but the data persists into the next
+    /// entry only if you don't reset — and we always reset on
+    /// entry, so this is fine).
+    pub fn apply_scan_pass(&mut self, rssi: &[i16]) {
+        let n = (rssi.len()).min(self.scan.channel_count as usize);
+        for i in 0..n {
+            self.scan.current_dbm[i] = rssi[i];
+            if rssi[i] > self.scan.peak_dbm[i] {
+                self.scan.peak_dbm[i] = rssi[i];
+            }
+        }
     }
 
     fn handle_list_select(
@@ -611,6 +740,9 @@ impl UiState {
             ScreenId::ChannelSelect => settings.channel,
             ScreenId::BandPlanSelect => band_plan_index(settings.band_plan) as u8,
             ScreenId::KeySelect => active_key_cursor(settings.active_key_fp, keys),
+            // Scan starts with the cursor on the currently-active
+            // channel — same UX as ChannelSelect.
+            ScreenId::Scan => settings.channel,
             _ => 0,
         };
         self.cursor = cursor;
@@ -619,6 +751,11 @@ impl UiState {
             ScreenId::PowerSelect => settings.tx_power_dbm as i32,
             _ => 0,
         };
+        // Scan: reset peak-since-open table on every entry so a
+        // fresh scan session always starts from no data.
+        if screen == ScreenId::Scan {
+            self.scan.reset(settings.band_plan);
+        }
     }
 }
 
@@ -847,6 +984,27 @@ pub enum Widget {
     /// Status indicator for the link.  `up=true` is "good";
     /// renderer typically draws as a coloured dot or text colour.
     LinkStatus { row: u8, up: bool, text: String<24> },
+    /// Channel-scan graph marker.  Carries only what changes per
+    /// frame at small cost; the (much larger) per-channel RSSI
+    /// arrays live in [`UiState::scan`] and are passed to the
+    /// renderer alongside the widget list — keeping them out of
+    /// the widget enum avoids ballooning the WidgetList by ~14 KB
+    /// (every slot grows to the largest variant).  Renderer
+    /// draws the entire panel for this widget.
+    ScanGraph {
+        /// Number of valid channel entries (matches
+        /// `state.scan.channel_count`).
+        channel_count: u8,
+        /// Cursor index — which channel is highlighted.
+        cursor: u8,
+        /// Active-channel index (the one `settings.channel`
+        /// currently points to).  Marker row shows the active
+        /// stripe under this column.
+        active: u8,
+        /// Pre-formatted title shown above the bars (cursor
+        /// channel label + frequency + current/peak dBm).
+        title: String<32>,
+    },
 }
 
 /// Build the widget tree for the current screen.  Clears `out`
@@ -865,6 +1023,7 @@ pub fn build_screen(
     match state.screen {
         ScreenId::Idle => build_idle(settings, keys, status, out),
         ScreenId::Menu => build_menu(state, out),
+        ScreenId::Scan => build_scan(state, settings, out),
         ScreenId::ChannelSelect => build_channel_select(state, settings, out),
         ScreenId::BandPlanSelect => build_band_plan_select(state, settings, out),
         ScreenId::PowerSelect => build_value_select(
@@ -932,6 +1091,41 @@ fn build_menu(state: &UiState, out: &mut WidgetList) {
         .ok();
     }
     out.push(Widget::Footer(s("Left: back"))).ok();
+}
+
+/// Build the Scan screen — a single [`Widget::ScanGraph`] carrying
+/// the per-channel RSSI table, cursor, active index, and a
+/// pre-formatted title line for the cursor's channel.
+fn build_scan(state: &UiState, settings: &Settings, out: &mut WidgetList) {
+    let info = settings.band_plan.info();
+    let cursor = (state.cursor as usize).min(info.channels.len().saturating_sub(1));
+    let cur_ch = info.channels[cursor];
+    let cur_rssi = state.scan.current_dbm[cursor];
+    let peak_rssi = state.scan.peak_dbm[cursor];
+
+    let mut title: String<32> = String::new();
+    // "Ch01 903.000  -85/-78"  — channel label + freq + cur/peak.
+    // SCAN_NO_DATA prints as "--".
+    let _ = write!(&mut title, "{} {} ", cur_ch.label, cur_ch.format_frequency());
+    if cur_rssi == SCAN_NO_DATA {
+        let _ = write!(&mut title, "--");
+    } else {
+        let _ = write!(&mut title, "{}", cur_rssi);
+    }
+    let _ = title.push('/');
+    if peak_rssi == SCAN_NO_DATA {
+        let _ = write!(&mut title, "--");
+    } else {
+        let _ = write!(&mut title, "{}", peak_rssi);
+    }
+
+    out.push(Widget::ScanGraph {
+        channel_count: state.scan.channel_count,
+        cursor: state.cursor,
+        active: settings.channel,
+        title,
+    })
+    .ok();
 }
 
 fn build_channel_select(
@@ -1207,6 +1401,7 @@ mod tests {
             edit_buffer: 0,
             current_menu: &MAIN_MENU,
             nav_stack: Vec::new(),
+            scan: ScanState::default(),
         };
         let mut settings = Settings::default(); let keys = KeyStore::new();
         state.handle_event(&mut settings, &keys, long(Direction::Center));
@@ -1223,6 +1418,7 @@ mod tests {
             edit_buffer: 0,
             current_menu: &MAIN_MENU,
             nav_stack: Vec::new(),
+            scan: ScanState::default(),
         };
         let mut settings = Settings::default(); let keys = KeyStore::new();
         state.handle_event(&mut settings, &keys, press(Direction::Down));
@@ -1247,6 +1443,7 @@ mod tests {
             edit_buffer: 0,
             current_menu: &MAIN_MENU,
             nav_stack: Vec::new(),
+            scan: ScanState::default(),
         };
         let mut settings = Settings::default(); let keys = KeyStore::new();
         state.handle_event(&mut settings, &keys, press(Direction::Center));
@@ -1325,13 +1522,21 @@ mod tests {
             ..UiState::default()
         };
         let mut settings = Settings {
-            band_plan: BandPlan::Dense,    // 8 channels
+            band_plan: BandPlan::DenseLo,  // 87 channels
             channel: 7,
             ..Settings::default()
         };
         let keys = KeyStore::new();
-        // Navigate to BandPlanSelect (index 1 in main menu).
-        state.handle_event(&mut settings, &keys, press(Direction::Down));
+        // Navigate to BandPlanSelect — find its row at runtime so
+        // this tracks MAIN_MENU edits (e.g. inserting Scan).
+        let band_idx = MAIN_MENU
+            .items
+            .iter()
+            .position(|i| matches!(i.action, ItemAction::List(ListKind::BandPlan)))
+            .expect("Band Plan must be in MAIN_MENU") as u8;
+        for _ in 0..band_idx {
+            state.handle_event(&mut settings, &keys, press(Direction::Down));
+        }
         state.handle_event(&mut settings, &keys, press(Direction::Center));
         assert_eq!(state.screen, ScreenId::BandPlanSelect);
         // Find Shure plan (4 channels, index 2).
@@ -1366,6 +1571,7 @@ mod tests {
             edit_buffer: 0,
             current_menu: &MAIN_MENU,
             nav_stack: Vec::new(),
+            scan: ScanState::default(),
         };
         let mut settings = Settings { tx_power_dbm: 0, ..Settings::default() }; let keys = KeyStore::new();
         state.handle_event(&mut settings, &keys, press(Direction::Center));
@@ -1433,6 +1639,7 @@ mod tests {
             edit_buffer: 0,
             current_menu: &MAIN_MENU,
             nav_stack: Vec::new(),
+            scan: ScanState::default(),
         };
         let settings = Settings::default();
         let keys = KeyStore::new();
@@ -1478,5 +1685,124 @@ mod tests {
         state.handle_event(&mut settings, &keys, press(Direction::Left));
         assert_eq!(state.screen, ScreenId::Menu);
         assert_eq!(state.cursor, link_stats_idx);
+    }
+
+    /// Helper: navigate Idle → MainMenu → Scan via the menu so
+    /// the nav stack is correctly populated.  Returns the
+    /// MainMenu row index Scan was on (so callers can verify
+    /// Down-back lands there).
+    fn enter_scan(state: &mut UiState, settings: &mut Settings, keys: &KeyStore) -> u8 {
+        let scan_idx = MAIN_MENU
+            .items
+            .iter()
+            .position(|i| matches!(i.action, ItemAction::Custom(ScreenId::Scan)))
+            .expect("Scan must be in MAIN_MENU") as u8;
+        state.handle_event(settings, keys, press(Direction::Center));
+        for _ in 0..scan_idx {
+            state.handle_event(settings, keys, press(Direction::Down));
+        }
+        state.handle_event(settings, keys, press(Direction::Center));
+        assert_eq!(state.screen, ScreenId::Scan);
+        scan_idx
+    }
+
+    #[test]
+    fn scan_apply_updates_settings_and_stays() {
+        // Enter Scan, simulate a few passes (to seed peaks),
+        // scroll cursor with Right, hit Center.  Should emit
+        // ApplyChannel with the cursor's index, settings.channel
+        // updated, user stays on Scan (Down is the way out).
+        let mut state = UiState::default();
+        let mut settings = Settings::default();
+        let keys = KeyStore::new();
+        let scan_idx = enter_scan(&mut state, &mut settings, &keys);
+        assert_eq!(state.cursor, 0);
+        assert_eq!(state.scan.channel_count, max_channel_index(BandPlan::Ism915) + 1);
+
+        let pass1: heapless::Vec<i16, MAX_SCAN_CHANNELS> =
+            (0..state.scan.channel_count).map(|_| -110i16).collect();
+        state.apply_scan_pass(&pass1);
+        let mut pass2: heapless::Vec<i16, MAX_SCAN_CHANNELS> = pass1.clone();
+        pass2[3] = -70;
+        state.apply_scan_pass(&pass2);
+        assert_eq!(state.scan.current_dbm[3], -70);
+        assert_eq!(state.scan.peak_dbm[3], -70);
+        state.apply_scan_pass(&pass1);
+        assert_eq!(state.scan.current_dbm[3], -110);
+        assert_eq!(state.scan.peak_dbm[3], -70);
+
+        // Scroll cursor right to ch5 and apply; stays on Scan.
+        for _ in 0..5 {
+            state.handle_event(&mut settings, &keys, press(Direction::Right));
+        }
+        assert_eq!(state.cursor, 5);
+        let cmd = state.handle_event(&mut settings, &keys, press(Direction::Center));
+        assert_eq!(cmd, Some(Command::ApplyChannel(5)));
+        assert_eq!(settings.channel, 5);
+        assert_eq!(state.screen, ScreenId::Scan, "stays on scan after apply");
+        assert_eq!(state.cursor, 5, "cursor stays put");
+        // Down to exit.
+        state.handle_event(&mut settings, &keys, press(Direction::Down));
+        assert_eq!(state.screen, ScreenId::Menu);
+        assert_eq!(state.cursor, scan_idx);
+    }
+
+    #[test]
+    fn scan_down_cancels_without_applying() {
+        let mut state = UiState::default();
+        let mut settings = Settings { channel: 2, ..Settings::default() };
+        let keys = KeyStore::new();
+        enter_scan(&mut state, &mut settings, &keys);
+        // Cursor on active channel (2).  Scroll right 3, then Down.
+        for _ in 0..3 {
+            state.handle_event(&mut settings, &keys, press(Direction::Right));
+        }
+        assert_eq!(state.cursor, 5);
+        let cmd = state.handle_event(&mut settings, &keys, press(Direction::Down));
+        assert!(cmd.is_none());
+        assert_eq!(settings.channel, 2, "channel preserved on Down-back");
+        assert_eq!(state.screen, ScreenId::Menu);
+    }
+
+    #[test]
+    fn scan_left_right_scroll_cursor() {
+        // Confirm Left and Right move the scan cursor (and Up
+        // does nothing).
+        let mut state = UiState::default();
+        let mut settings = Settings::default();
+        let keys = KeyStore::new();
+        enter_scan(&mut state, &mut settings, &keys);
+        for _ in 0..4 {
+            state.handle_event(&mut settings, &keys, press(Direction::Right));
+        }
+        assert_eq!(state.cursor, 4);
+        state.handle_event(&mut settings, &keys, press(Direction::Left));
+        assert_eq!(state.cursor, 3);
+        // Up is a no-op.
+        state.handle_event(&mut settings, &keys, press(Direction::Up));
+        assert_eq!(state.cursor, 3);
+        assert_eq!(state.screen, ScreenId::Scan);
+        // Left at 0 saturates.
+        for _ in 0..10 {
+            state.handle_event(&mut settings, &keys, press(Direction::Left));
+        }
+        assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn scan_resets_peak_table_on_each_entry() {
+        let mut state = UiState::default();
+        let mut settings = Settings::default();
+        let keys = KeyStore::new();
+        enter_scan(&mut state, &mut settings, &keys);
+        let pass: heapless::Vec<i16, MAX_SCAN_CHANNELS> =
+            (0..state.scan.channel_count).map(|_| -50i16).collect();
+        state.apply_scan_pass(&pass);
+        assert_eq!(state.scan.peak_dbm[0], -50);
+        // Down-back, then re-enter; peak table should be cleared.
+        state.handle_event(&mut settings, &keys, press(Direction::Down));
+        state.handle_event(&mut settings, &keys, press(Direction::Center));
+        assert_eq!(state.scan.peak_dbm[0], SCAN_NO_DATA);
+        assert_eq!(state.scan.current_dbm[0], SCAN_NO_DATA);
     }
 }
