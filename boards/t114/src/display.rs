@@ -281,6 +281,45 @@ impl St7789Display {
         self.write_command(cmd);
     }
 
+    /// Push the dirty region of a [`Framebuffer`](crate::framebuffer::Framebuffer)
+    /// to the panel via **async** SPI, row by row.  Yields the
+    /// executor during each DMA burst so other tasks (notably
+    /// `osrf_link_runtime::run_rx`) can run between bursts —
+    /// without this, a sync render of ~30 ms of SPI bursts blocks
+    /// `run_rx` long enough that the SX1262 RX FIFO overflows and
+    /// 5-12 % of inbound packets get dropped.
+    ///
+    /// The dirty bounding box is cleared on completion.  `set_window`
+    /// stays sync — its bursts are tiny (a handful of 1-5-byte
+    /// commands, ~50 µs total) and not worth the extra plumbing.
+    /// The big-data path — the per-row pixel stream — is what
+    /// matters and that's where we yield.
+    pub async fn flush(&mut self, fb: &mut crate::framebuffer::Framebuffer) {
+        use crate::framebuffer::FB_W;
+        let Some(b) = fb.dirty_box() else {
+            return;
+        };
+        self.set_window(b.x0, b.y0, b.x1, b.y1);
+        self.dc.set_high();
+        self.cs.set_low();
+
+        let span = (b.x1 - b.x0 + 1) as usize;
+        let mut row_buf = [0u8; FB_W as usize * 2];
+        let pixels = fb.pixels();
+        for y in b.y0..=b.y1 {
+            let row_start = y as usize * FB_W as usize + b.x0 as usize;
+            let row = &pixels[row_start..row_start + span];
+            for (i, raw) in row.iter().enumerate() {
+                row_buf[i * 2] = (raw >> 8) as u8;
+                row_buf[i * 2 + 1] = (raw & 0xFF) as u8;
+            }
+            let _ = self.spi.write(&row_buf[..span * 2]).await;
+        }
+
+        self.cs.set_high();
+        fb.clear_dirty();
+    }
+
     // ── Low-level helpers (sync, blocking SPI) ───────────────────────
 
     /// Write a single command byte (DC low) in its own SPI transaction.

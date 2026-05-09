@@ -24,6 +24,7 @@ pub use embedded_hal_bus;
 
 pub mod clocks;
 pub mod display;
+pub mod framebuffer;
 pub mod softdevice;
 #[cfg(feature = "usb-log")]
 pub mod usb_log;
