@@ -2,121 +2,72 @@
 
 //! SoftDevice S140 integration for the T114.
 //!
-//! The Heltec stock bootloader bundles SoftDevice S140 v6.1.1 at flash
-//! 0x1000-0x25FFF.  Our app loads at 0x26000 and runs alongside SD;
-//! enabling SD via [`enable`] starts the protocol-stack runtime that
-//! manages POWER + CLOCK transitions, sleep modes, and (eventually)
-//! BLE.  The chip's reset path becomes:
+//! ## What SD does for us
 //!
-//!   `MBR → SD → app vector table at 0x26000`
+//! Even before we use BLE (Stage 4), running the SoftDevice gives us
+//! Nordic-blessed POWER + CLOCK + sleep management.  That turned out
+//! to be unrelated to a different bug we hunted (a misidentified
+//! VTFT power-gate pin), but the SD-aware setup we built along the
+//! way is the right base posture for nRF52840 + embassy on this
+//! board: DC-DC enabled via SD's API, LF clock from the 32 kHz
+//! crystal, peripheral interrupts at SD-allowed priorities.  When
+//! Stage 4 adds advertising / pairing, expand the [`enable`]
+//! `Config` with conn / gap / gatt fields.
 //!
-//! …with SD owning interrupt forwarding for everything it claims
-//! (TIMER0, RTC0, SWI1/2, RADIO, CCM, AAR, ECB, EGU0).  Our peripheral
-//! choices stay clear of those — see `boards/t114/src/lib.rs`'s
-//! `build_resources` for what we actually use.
+//! ## Boot path with SD active
 //!
-//! ## Why we use SD even without BLE yet
+//! `MBR (0x0) → SD reset (0x1000) → app reset (0x26000) → cortex-m-rt
+//! pre_init → main → embassy_nrf::init → Softdevice::enable`.
 //!
-//! Empirically, on T114 v2.1 boards (or at least our two units), the
-//! display IC is sensitive enough to power-rail transients that direct
-//! `wfe()` sleep + manual POWER/CLOCK pokes corrupt SPIM bursts on
-//! USB-only power.  Heltec / Meshtastic firmware doesn't see this
-//! because all their chip transitions go through SD's vetted code
-//! paths (`sd_app_evt_wait`, SD-managed regulators, MPU regions).
-//! Running SD with no BLE configured costs us ~8 KB of RAM and a
-//! single always-on Embassy task — small price for a known-good
-//! hardware-management layer.
+//! Notes on order:
+//! - `bootloader_handoff()` short-circuits when the `softdevice`
+//!   feature is on (does **not** touch VTOR — SD's reset already
+//!   pointed it at SD's vector table at 0x1000, and overriding that
+//!   makes the next `sd_softdevice_enable` SVC trap to a panic
+//!   handler in the app's table).
+//! - `embassy_nrf::init()` must run **before** [`enable`] — SD claims
+//!   CLOCK and POWER on activation; embassy's init can no longer
+//!   configure those once SD owns them.
+//! - [`enable`] internally lowers our peripheral IRQ priorities so
+//!   they don't sit at SD-reserved levels (P0, P1, P4) when SD's
+//!   enable runs its priority audit.
 //!
-//! ## SoftDevice version caveat
+//! ## SoftDevice version
 //!
-//! The `nrf-softdevice` crate's official support matrix is S140 v7.x.x.
-//! Heltec's bootloader ships v6.1.1.  v6 / v7 SVC numbers are stable
-//! for the surface we touch (`sd_softdevice_enable`, clock cfg,
-//! `sd_app_evt_wait`).  If a future BLE feature we use happens to
-//! cross a renumbered SVC, it'll show up as a runtime
-//! `Result::Err(...)` from a specific call — at which point upgrading
-//! the bootloader to a v7.3.0 combo hex (Adafruit's release page) is
-//! the fix.
+//! Targets S140 v6.1.1, the version the Heltec stock bootloader
+//! ships with.  The SVC surface we use (`sd_softdevice_enable`, LF
+//! clock cfg, `sd_power_dcdc_mode_set`, `sd_app_evt_wait`) is
+//! stable enough across S140 versions that the same code works on
+//! v7.x too if a board's bootloader gets upgraded; the wider BLE
+//! API has v6/v7 ABI divergence that Stage 4 may need to handle.
+//! RAM origin in `memory_softdevice.x` is tuned for what v6.1.1
+//! actually requests (`0x200032d8`).
 
 use embassy_nrf::interrupt::{self, InterruptExt, Priority};
 use nrf_softdevice::{raw, Softdevice};
 
-/// Bump every peripheral IRQ this board uses to a SoftDevice-compatible
-/// priority (P2).  Must be called **before** [`enable`] — SD checks
-/// every enabled NVIC source on enable and panics with
-/// `SdmIncorrectInterruptConfiguration` if any of them sit at the
-/// reserved P0/P1/P4 priorities.
+/// Bring up the SoftDevice and return its handle.  Caller must spawn
+/// [`run`] right after to service SD's event loop.
 ///
-/// embassy-nrf's `time_interrupt_priority` + `gpiote_interrupt_priority`
-/// in `Config` only cover RTC1 + GPIOTE; the per-peripheral drivers
-/// (Spim, BufferedUarte, …) leave their IRQ priorities at the chip
-/// reset default (P0) when constructed.  We therefore have to
-/// override them explicitly here for every interrupt our
-/// `bind_interrupts!` block claims and that gets enabled.
-pub fn lower_app_interrupt_priorities() {
-    interrupt::TWISPI0.set_priority(Priority::P2); // SX1262 radio SPIM
-    interrupt::TWISPI1.set_priority(Priority::P2); // bound but unused; harmless
-    interrupt::SPI2.set_priority(Priority::P2);    // ST7789 display SPIM
-    interrupt::UARTE1.set_priority(Priority::P2);  // DIN MIDI UART
-}
-
-/// Bare SD activation that *only* calls `sd_softdevice_enable`
-/// (the basic chip-management SVC) and skips every BLE-related
-/// init that comes after.  Hand-rolled because:
+/// Steps performed:
+/// 1. Lower every app-side peripheral IRQ to P2 (SD-allowed).
+///    embassy-nrf's per-driver constructors leave IRQ priorities at
+///    the chip default (P0), which is SD-reserved — without this
+///    step `sd_softdevice_enable` panics with
+///    `SdmIncorrectInterruptConfiguration`.
+/// 2. Call `Softdevice::enable` with a minimal config (LF clock from
+///    the 32.768 kHz crystal, no BLE roles / connections).  The
+///    "minimal" part matters: setting any BLE config field forces a
+///    `sd_ble_cfg_set` call, which on v6.1.1 with v7-shaped structs
+///    can return `InvalidParam` and panic.
+/// 3. Enable DC-DC via SD's API (`sd_power_dcdc_mode_set`).  POWER
+///    is SD-owned so the direct-register approach embassy-nrf would
+///    use is faulted; SD's SVC is the supported path.
 ///
-/// - The current `nrf-softdevice` crate's `Softdevice::enable()`
-///   targets S140 v7.x; on the Heltec stock S140 v6.1.1, the
-///   `sd_ble_cfg_set` / `sd_ble_enable` calls hit parameter-layout
-///   divergence and lock the chip up.
-/// - We don't need BLE yet — only SD's POWER/CLOCK handling.
-///
-/// The single SVC we call (`sd_softdevice_enable`, opcode 0x10) is
-/// stable across S140 versions, so this works on both v6.1.1 and
-/// v7.3.0.  When we upgrade to v7.3.0 and want BLE, switch the
-/// caller to [`enable`] / [`run`] and the rest of the
-/// `nrf-softdevice` API.
-///
-/// **Returns** the SD-API error code (`NRF_SUCCESS = 0` on
-/// success).  Caller should panic / log on non-zero return.
-pub fn enable_chip_only() -> u32 {
-    let clock_cfg = raw::nrf_clock_lf_cfg_t {
-        source: raw::NRF_CLOCK_LF_SRC_XTAL as u8,
-        rc_ctiv: 0,
-        rc_temp_ctiv: 0,
-        accuracy: raw::NRF_CLOCK_LF_ACCURACY_20_PPM as u8,
-    };
-    unsafe { raw::sd_softdevice_enable(&clock_cfg, Some(fault_handler)) }
-}
-
-/// SoftDevice fault handler — called by SD on internal asserts /
-/// unrecoverable errors.  We log (if defmt is on) and halt; SD
-/// already considers the system unusable at this point.
-unsafe extern "C" fn fault_handler(id: u32, pc: u32, info: u32) {
-    #[cfg(feature = "defmt")]
-    defmt::error!("softdevice fault: id={=u32:#x} pc={=u32:#x} info={=u32:#x}", id, pc, info);
-    loop {
-        cortex_m::asm::wfe();
-    }
-}
-
-/// Bring up the SoftDevice with a minimal config — LF clock only,
-/// no BLE roles or connections.  Suitable for "we just want SD's
-/// chip-management" mode (Stage 1-3 of OpenStageRF).  When Stage 4
-/// adds BLE config / pairing, expand `Config` with `conn_gap`
-/// (`conn_count >= 1`), `gap_role_count` (`periph_role_count >= 1`
-/// for advertising), and the GATT-server attr-table size.
-///
-/// LF clock config: 32.768 kHz crystal (LFXO), ±20 ppm — matches what
-/// `clocks::default_config()` configures for embassy-time.
-///
-/// **Why no BLE config fields** — every BLE config field set to
-/// `Some(...)` triggers a corresponding `sd_ble_cfg_set` call inside
-/// `Softdevice::enable()`, and SD rejects e.g. `conn_count: 0` as
-/// `InvalidParam` (you can't allocate "zero connections worth of
-/// state").  The minimal valid config to SD is "just clock", which
-/// makes `sd_ble_enable()` use SD's internal defaults — exactly
-/// what we want for the no-BLE stage.
+/// **Must be called after `embassy_nrf::init()`** — see module docs.
 pub fn enable() -> &'static mut Softdevice {
+    lower_app_interrupt_priorities();
+
     let config = nrf_softdevice::Config {
         clock: Some(raw::nrf_clock_lf_cfg_t {
             source: raw::NRF_CLOCK_LF_SRC_XTAL as u8,
@@ -128,13 +79,6 @@ pub fn enable() -> &'static mut Softdevice {
     };
     let sd = Softdevice::enable(&config);
 
-    // Enable the internal DC-DC regulator via SD's API (POWER is
-    // SD-owned, so direct register access faults; this is the
-    // SD-blessed equivalent of `c.dcdc.reg1 = true` we'd use without
-    // SD).  Reduces current draw on the 3.3 V rail by ~10-15 mA at
-    // peak — same optimisation Bluefruit/Heltec/Meshtastic firmware
-    // applies right after SD enable.  Hardware requirement is the
-    // LC filter on the DCC/DEC pins, populated on T114 v2.1.
     let ret = unsafe {
         raw::sd_power_dcdc_mode_set(raw::NRF_POWER_DCDC_MODES_NRF_POWER_DCDC_ENABLE as u8)
     };
@@ -146,11 +90,20 @@ pub fn enable() -> &'static mut Softdevice {
     sd
 }
 
-/// SD event-loop task.  Spawn this once after [`enable`] so SD can
-/// process its internal events.  Without a runner, SD is enabled but
-/// won't service its own state machine — fine for very short test
-/// programs but never for production.
+/// SoftDevice event-loop task.  Spawn once after [`enable`].
 #[embassy_executor::task]
 pub async fn run(sd: &'static Softdevice) -> ! {
     sd.run().await
+}
+
+/// Bump every peripheral IRQ this board's `Resources` enables to
+/// priority P2 (SD-allowed).  embassy-nrf's `Config.{time,gpiote}_
+/// interrupt_priority` only cover RTC1 + GPIOTE; per-peripheral
+/// drivers (Spim, BufferedUarte) leave their IRQ priorities at the
+/// chip default (P0, SD-reserved).
+fn lower_app_interrupt_priorities() {
+    interrupt::TWISPI0.set_priority(Priority::P2); // SX1262 radio SPIM
+    interrupt::TWISPI1.set_priority(Priority::P2); // bound but unused; harmless
+    interrupt::SPI2.set_priority(Priority::P2);    // ST7789 display SPIM
+    interrupt::UARTE1.set_priority(Priority::P2);  // DIN MIDI UART
 }

@@ -24,7 +24,6 @@ pub use embedded_hal_bus;
 
 pub mod clocks;
 pub mod display;
-#[cfg(feature = "softdevice")]
 pub mod softdevice;
 #[cfg(feature = "usb-log")]
 pub mod usb_log;
@@ -141,187 +140,26 @@ pub mod vext_power {
     pub type Pin = peripherals::P0_21;
 }
 
-/// Address of the user-application slot in flash, matching `memory.x`'s
-/// `FLASH ORIGIN`.  T114 layout with S140 v7.3.0 puts SD at 0x1000-0x26FFF,
-/// so the app vector table lands at `MBR_SIZE + SD_FLASH_SIZE_v7_3_0 =
-/// 0x1000 + 0x26000 = 0x27000`.  Used by both the linker and the runtime
-/// VTOR write in [`bootloader_handoff()`] — keeping them in lockstep is
-/// what makes a one-line move (e.g. for a future SD version with a
-/// different size) tractable.
-pub const FLASH_ORIGIN: u32 = 0x0002_7000;
-
-/// Relocate `SCB->VTOR` to the start of our flash slot, and stop the
-/// peripherals the Heltec bootloader leaves running on its way out.
+/// No-op pre-init shim.  Kept as a public stable entry point so
+/// existing profile binaries can call `board::bootloader_handoff()`
+/// from their `#[pre_init]` blocks without rewriting; with the
+/// SoftDevice always enabled, SD's reset handler runs before our
+/// pre_init and has already configured VTOR + interrupt forwarding
+/// + POWER/CLOCK ownership.  There is nothing useful for us to do
+/// here — touching the peripherals SD just configured (or
+/// overriding the VTOR SD set) would break SD's setup and lock up
+/// `sd_softdevice_enable`.
 ///
-/// **Must be called from `#[cortex_m_rt::pre_init]`** in every binary that
-/// targets this board, before any interrupt is allowed to fire and before
-/// `embassy_nrf::init()` runs.
-///
-/// What this fixes (one bug per item, all observed empirically on the
-/// `ht-n5262 0.9.0` bootloader hand-off):
-/// 1. **VTOR**: bootloader leaves it pointing at its own vector table at
-///    0xF4000 (no SoftDevice on this unit, so the SD-aware
-///    `sd_softdevice_vector_table_base_set` path doesn't run).
-///    cortex-m-rt's reset shim does not relocate VTOR for us.
-/// 2. **GPIOTE / PPI / TIMERs**: bootloader uses these to drive its LED
-///    blink during DFU.  It does not tear them down before jumping to the
-///    app, and embassy-nrf's `init()` does not preemptively reset them, so
-///    leftover GPIOTE channels keep yanking the LED pin even after the app
-///    configures it as a regular GPIO output.
-/// 3. **RTC1**: embassy's `time-driver-rtc1` assumes RTC1 starts in reset
-///    state.  When the bootloader has left RTC1 running, `Timer::after`
-///    awaits never fire and the executor hangs at the first `.await`.
-/// 4. **NVIC**: bootloader leaves USBD (and possibly others) enabled in
-///    NVIC.  Once embassy unmasks PRIMASK to dispatch the executor, those
-///    stray interrupts fire through cortex-m-rt's `DefaultHandler`, which
-///    is an infinite loop — symptom is the executor freezing at its first
-///    `.await` (e.g. `Timer::after_millis`).
+/// Profile binaries can drop their `#[pre_init]` block entirely —
+/// keeping this function around just so we don't have to rewrite
+/// every t114 main.rs in the same change as removing it.
 ///
 /// # Safety
-/// Only call from within a `#[pre_init]` function.  The peripheral pokes
-/// blow away any in-flight DMA / timer state, which is fine at boot but
-/// catastrophic if invoked mid-program.
+/// No-op, but kept `unsafe` for back-compat with the previous
+/// signature.
 #[inline(always)]
-#[allow(unreachable_code)] // when `softdevice` feature is on, the function returns early
 pub unsafe fn bootloader_handoff() {
-    // ── SoftDevice path: do nothing here ────────────────────────────────
-    // When the SoftDevice is installed in flash and being used, MBR +
-    // SD's reset handler ran before our pre_init.  They've already:
-    //   - set VTOR to SD's vector table at 0x1000 (so SD's SVC
-    //     dispatcher receives `sd_softdevice_enable` and friends)
-    //   - configured POWER + CLOCK + interrupt routing trampolines
-    //   - claimed RTC0 + TIMER0 + RADIO + EGU0 + SWI1/2 + CCM/AAR/ECB
-    //
-    // Anything we do here that touches VTOR or those peripherals
-    // breaks SD's setup.  In particular, writing VTOR=FLASH_ORIGIN
-    // (correct for SD-less boots) makes the SVC vector point at
-    // cortex-m-rt's default panicking handler, so the next
-    // `sd_softdevice_enable` SVC traps into nowhere — symptom is
-    // the chip hanging mid-`Softdevice::enable()` with no return.
-    // SD reads the app's vector-table address from a known-fixed
-    // location at SD-enable time; we don't have to tell it.
-    #[cfg(feature = "softdevice")]
-    return;
-
-    // ── SD-less path: full bootloader-handoff cleanup ───────────────────
-    // The bootloader's UF2 flow leaves several peripherals running and
-    // VTOR pointing at MBR.  Without SD intercepting interrupts, we
-    // need to relocate VTOR ourselves and clean the slate.
-
-    // VTOR relocation.
-    (*cortex_m::peripheral::SCB::PTR).vtor.write(FLASH_ORIGIN);
-
-    // 1. Disable + clear-pending every NVIC source the bootloader may have
-    //    armed.  ICER/ICPR are 8 × u32 at 0xE000_E180 / 0xE000_E280; writing
-    //    1s to a bit clears it.  We deliberately do NOT touch PRIMASK —
-    //    cortex-m-rt and embassy don't restore it, and a stray PRIMASK = 1
-    //    here would deadlock the executor.  With every NVIC source
-    //    disabled, no interrupt can fire regardless of PRIMASK state.
-    let icer: *mut u32 = 0xE000_E180 as *mut u32;
-    let icpr: *mut u32 = 0xE000_E280 as *mut u32;
-    for i in 0..8 {
-        core::ptr::write_volatile(icer.add(i), 0xFFFF_FFFF);
-        core::ptr::write_volatile(icpr.add(i), 0xFFFF_FFFF);
-    }
-
-    // 2. VTOR.
-    (*cortex_m::peripheral::SCB::PTR).vtor.write(FLASH_ORIGIN);
-
-    // 3. Fully reset all RTCs.  Just stopping isn't enough — embassy's
-    //    time driver init does not preemptively clear INTENSET / EVTENSET,
-    //    so leftover bits from the bootloader can either fire stray
-    //    events into a not-yet-bound handler or mask the COMPARE the
-    //    driver actually wants.  Symptom: first `.await` never resolves.
-    //    Order: stop → disable all interrupts → disable all events → clear counter.
-    for &base in &[0x4000_B000u32, 0x4001_1000, 0x4002_4000] {
-        core::ptr::write_volatile((base + 0x004) as *mut u32, 1); // TASKS_STOP
-        core::ptr::write_volatile((base + 0x308) as *mut u32, 0xFFFF_FFFF); // INTENCLR
-        core::ptr::write_volatile((base + 0x348) as *mut u32, 0xFFFF_FFFF); // EVTENCLR
-        core::ptr::write_volatile((base + 0x008) as *mut u32, 1); // TASKS_CLEAR
-    }
-
-    // 4. Reset LFCLK to a known-stopped state.  The bootloader leaves
-    //    LFCLK running on whatever source it chose (often LFRC for the
-    //    DFU timeout timer).  embassy-nrf's `init()` will reconfigure and
-    //    restart it; clearing it here avoids any "already running on the
-    //    wrong source" ambiguity.  CLOCK base 0x4000_0000.
-    core::ptr::write_volatile(0x4000_000C as *mut u32, 1); // TASKS_LFCLKSTOP
-    core::ptr::write_volatile(0x4000_0308 as *mut u32, 0xFFFF_FFFF); // INTENCLR (clock events)
-
-    // 5. Stop all TIMERs (TASKS_STOP at +0x004, TASKS_SHUTDOWN at +0x00C).
-    for &base in &[
-        0x4000_8000u32, // TIMER0
-        0x4000_9000,    // TIMER1
-        0x4000_A000,    // TIMER2
-        0x4001_A000,    // TIMER3
-        0x4001_B000,    // TIMER4
-    ] {
-        core::ptr::write_volatile((base + 0x004) as *mut u32, 1);
-        core::ptr::write_volatile((base + 0x00C) as *mut u32, 1);
-    }
-
-    // 6. Clear all 8 GPIOTE channel configs (CONFIG[0..7] at 0x4000_6510).
-    let gpiote_config: *mut u32 = 0x4000_6510 as *mut u32;
-    for i in 0..8 {
-        core::ptr::write_volatile(gpiote_config.add(i), 0);
-    }
-
-    // 7. Disable all PPI channels (CHENCLR at 0x4001_F508).
-    core::ptr::write_volatile(0x4001_F508 as *mut u32, 0xFFFF_FFFF);
-
-    // 8. Disable QSPI peripheral and disconnect its PSEL routing.
-    //    The Heltec bootloader leaves QSPI enabled to talk to the
-    //    on-board MX25R1635F flash chip (per the Zephyr DTS).  QSPI
-    //    claims P1_14 (SCK), P1_15 (CSN), P1_12 (IO0), P1_13 (IO1),
-    //    P0_07 (IO2), P0_05 (IO3) by default — three of which are
-    //    used by the joystick on this deployment (P1_14 Up, P1_12
-    //    Right, P0_07 Left).  Without disabling QSPI, those pins
-    //    remain driven by the (now-idle) QSPI peripheral and don't
-    //    respond to GPIO Input claims.
-    //
-    //    PSEL.* registers on nRF52840 use bit 31 as CONNECT
-    //    (0 = connected, 1 = disconnected).  Writing `0xFFFF_FFFF`
-    //    fully disconnects the pin from QSPI.
-    let qspi_enable: *mut u32 = 0x4002_9500 as *mut u32;
-    core::ptr::write_volatile(qspi_enable, 0); // ENABLE = 0
-    for psel_offset in [0x544u32, 0x548, 0x560, 0x564, 0x568, 0x56C] {
-        let reg = (0x4002_9000 + psel_offset) as *mut u32;
-        core::ptr::write_volatile(reg, 0xFFFF_FFFF);
-    }
-
-    // 9. Constant-latency mode.  POWER.TASKS_CONSTLAT = 1 keeps
-    //    HFCLK + sub-power-domains running even when the executor
-    //    parks in `wfe()` between awaits.  Cheap insurance against
-    //    sleep-related peripheral glitches; doesn't fix the SPIM
-    //    issue addressed below but is the correct base posture.
-    core::ptr::write_volatile(0x4000_0078 as *mut u32, 1); // TASKS_CONSTLAT
-
-    // 10. Tear down all SPIM peripherals.  The Heltec bootloader
-    //     drives the display via SPIM2 (matching the Adafruit
-    //     nRF52 BSP's `SPI1` object), and on hand-off it leaves
-    //     the peripheral enabled with PSEL.SCK/MOSI/MISO bound to
-    //     the display pins.  embassy-nrf's `Spim::new` writes a
-    //     fresh config but doesn't fully reset every register
-    //     ahead of that, and on a strict-batch ST7789 LCM the
-    //     residual state survives into our first SPI burst —
-    //     symptom: display works fine when probe-rs flashes
-    //     (its halt → load → release-reset sweeps every
-    //     peripheral via SWD reset) but black on UF2 + USB power
-    //     because UF2 just jumps to the app vector table without
-    //     resetting peripherals.
-    //
-    //     For each SPIM[0..3]: ENABLE = 0, then disconnect SCK /
-    //     MOSI / MISO PSELs (write 0xFFFF_FFFF — bit 31 = CONNECT,
-    //     1 = disconnected).  CSN is only on SPIM2/SPIM3 and
-    //     embassy-nrf doesn't use hardware CS anyway, but disconnect
-    //     for completeness.
-    for &base in &[0x4000_3000u32, 0x4000_4000, 0x4002_3000, 0x4002_F000] {
-        core::ptr::write_volatile((base + 0x500) as *mut u32, 0); // ENABLE
-        core::ptr::write_volatile((base + 0x524) as *mut u32, 0xFFFF_FFFF); // PSEL.SCK
-        core::ptr::write_volatile((base + 0x528) as *mut u32, 0xFFFF_FFFF); // PSEL.MOSI
-        core::ptr::write_volatile((base + 0x52C) as *mut u32, 0xFFFF_FFFF); // PSEL.MISO
-        core::ptr::write_volatile((base + 0x540) as *mut u32, 0xFFFF_FFFF); // PSEL.CSN
-    }
+    // intentionally empty — SD owns chip setup
 }
 
 /// Raw Embassy peripheral tokens.  Use this for fine-grained hardware access
@@ -627,11 +465,14 @@ fn build_resources(
     let display =
         display::St7789Display::new(display_spi, display_cs, display_dc, display_reset, vtft);
     // VEXT (P0_21) — peripheral / GPS rail, active HIGH.  *Not* the
-    // TFT power gate (a previous comment in this file claimed it was;
-    // that was wrong — see comments above and BOOTLOADER_UPGRADE.md
-    // for the diagnostic story).  Raised here and leaked so the GPS
-    // and any external sensors stay powered; OpenStageRF doesn't use
-    // them yet but profiles that do (future) will need this on.
+    // TFT power gate (a previous comment claimed it was; that was
+    // wrong — verified against Meshtastic + MeshCore variant.h on
+    // 2026-05-09 after a bug where the display only worked with an
+    // SWD probe attached because the probe's 3.3 V wire was back-
+    // feeding the LCM rail through whatever leakage path P0_03 left
+    // open).  Raised here and leaked so the GPS and any external
+    // sensors stay powered; OpenStageRF doesn't use them yet but
+    // profiles that do (future) will need this on.
     let vext_peripheral = Output::new(p.P0_21, Level::High, OutputDrive::Standard);
     core::mem::forget(vext_peripheral);
     // Backlight: active LOW per the panel's wiring (Meshtastic

@@ -12,14 +12,6 @@ mcu    = "nrf52840"
 
 [features]
 defmt = ["dep:defmt", "embassy-nrf/defmt", "osrf-radio-sx126x/defmt"]
-# Opt-in SoftDevice integration.  When enabled, `resources()` no longer
-# tears down POWER/CLOCK in pre_init (SD owns those), `bootloader_handoff`
-# is short-circuited, and the binary must call `softdevice::enable()`
-# early to start the SD event loop.  Profiles that need BLE config or
-# the SD's hardware management (display profiles on marginal-decoupling
-# boards) opt in; pure radio/MIDI profiles stay SD-free for max
-# peripheral access.
-softdevice = ["dep:nrf-softdevice", "dep:nrf-softdevice-s140", "dep:embassy-executor"]
 # Opt-in USB-CDC `log` transport.  Brings in embassy-usb + embassy-usb-logger
 # and exposes the `usb_log::spawn()` helper.  The bin must call
 # `resources_with(clocks::usb_config())` (HFXO required for USB) before
@@ -29,7 +21,7 @@ softdevice = ["dep:nrf-softdevice", "dep:nrf-softdevice-s140", "dep:embassy-exec
 # serial port — `defmt::info!()` calls from app crates still go to RTT
 # (which is unreachable without a debug probe).  See README of the bin
 # crates for the full story.
-usb-log = ["dep:embassy-usb", "dep:embassy-usb-logger", "dep:embassy-executor", "dep:log"]
+usb-log = ["dep:embassy-usb", "dep:embassy-usb-logger", "dep:log"]
 
 [dependencies]
 defmt       = { version = "1.0", optional = true }
@@ -44,7 +36,7 @@ embedded-hal       = { workspace = true }
 embedded-hal-async = { workspace = true }
 embedded-hal-bus   = { workspace = true }
 embassy-time       = { version = "0.5" }
-embassy-executor   = { version = "0.10", optional = true, features = ["platform-cortex-m", "executor-thread"] }
+embassy-executor   = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
 osrf-radio-sx126x  = { workspace = true }
 
 # ── Display: ST7789 240×135 colour TFT on TWISPI1 (SPI mode) ────────────────
@@ -64,9 +56,11 @@ embassy-usb        = { version = "0.6", optional = true }
 embassy-usb-logger = { version = "0.6", optional = true }
 log                = { version = "0.4", optional = true }
 
-# ── softdevice feature deps ──────────────────────────────────────────────────
-nrf-softdevice      = { workspace = true, optional = true }
-nrf-softdevice-s140 = { workspace = true, optional = true }
+# ── SoftDevice (always enabled on T114 to avoid clobbering the Heltec
+# stock bootloader's bundled SD on flash, and so we don't have to
+# replicate SD's POWER/CLOCK/sleep management by hand).
+nrf-softdevice      = { workspace = true }
+nrf-softdevice-s140 = { workspace = true }
 
 [lib]
 test    = false

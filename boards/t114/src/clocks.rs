@@ -25,62 +25,42 @@
 //! use [`usb_config()`] instead of [`default_config()`] to switch HFCLK to
 //! the 32 MHz crystal that the T114 v2.0 schematic populates.
 
-use embassy_nrf::config::{Config, HfclkSource, LfclkSource};
+use embassy_nrf::config::Config;
 use embassy_nrf::interrupt::Priority;
 
-/// Default T114 clock config: LFXO (external 32.768 kHz crystal,
-/// ~±20 ppm) for LFCLK, HFINT (64 MHz internal RC) for SYSCLK.
+/// Default T114 clock config used by `embassy_nrf::init()`.
 ///
-/// **LFCLK source choice history:** an earlier revision used
-/// `ExternalXtal` and reverted to `InternalRC` after some v2.0 units
-/// produced visibly irregular timer intervals (suspected LFXO
-/// startup failure leaving the driver on a misconfigured fallback).
-/// Re-tried on v2.1 hardware — LFXO starts cleanly, time driver
-/// runs at the much tighter ±20 ppm.  Revert to `InternalRC` if a
-/// future board fails to start.
-#[allow(unreachable_code)] // when `softdevice` feature is on, the function returns early
+/// SoftDevice is always enabled on T114 binaries (see
+/// `board::softdevice`), and SD owns CLOCK + POWER once it's
+/// activated.  embassy-nrf's init must therefore *not* configure
+/// HFCLK / LFCLK / DCDC — direct writes to those registers fault
+/// under SD ownership.  We leave the clock and DCDC fields at
+/// their `Config::default()` values (HFINT, internal-RC LFCLK
+/// fallback, no DCDC); SD then configures HFCLK/LFCLK from the
+/// LF-clock-cfg passed to `Softdevice::enable()`, and DC-DC via
+/// `sd_power_dcdc_mode_set` in `softdevice::enable()`.
+///
+/// What we *do* set: peripheral interrupt priorities at P2
+/// (SD-allowed; P0/P1/P4 are reserved per the nrf-softdevice
+/// README).  embassy's defaults at P0 trigger
+/// `SdmIncorrectInterruptConfiguration` panics inside SD enable.
 pub fn default_config() -> Config {
     let mut c = Config::default();
-
-    // SoftDevice reserves interrupt priorities **P0, P1, and P4**
-    // (per nrf-softdevice README); app-allowed are P2/P3/P5+.
-    // embassy-nrf's default is P0, which hard-faults under an active
-    // SD.  P2 is the nrf-softdevice docs' recommendation for time +
-    // GPIOTE — applied unconditionally so the same config covers
-    // SD-on and SD-off builds.
     c.time_interrupt_priority = Priority::P2;
     c.gpiote_interrupt_priority = Priority::P2;
-
-    // ── SoftDevice-aware path ───────────────────────────────────────────
-    // When SD is active, CLOCK + POWER are owned by SD.  Direct writes
-    // to HFCLK/LFCLK source or DCDCEN fault — symptom is the chip
-    // hanging silently inside `embassy_nrf::init()`, the next defmt
-    // log line never appearing.  Leave both at their `Config::default()`
-    // values (`HfclkSource::Internal`, `LfclkSource::InternalRC`,
-    // `dcdc.reg1 = false`) so embassy-nrf skips those registers
-    // entirely.  SD has already configured HFCLK + LFCLK + DCDC
-    // during its enable (LF-clock source from our SD config; HFXO
-    // started on demand by SD; DCDC enabled by `nrf_softdevice` if
-    // we ever ask for it via `sd_power_dcdc_mode_set`).
-    #[cfg(feature = "softdevice")]
-    return c;
-
-    // ── SD-less path ────────────────────────────────────────────────────
-    // No SoftDevice — embassy-nrf owns the chip and we can configure
-    // crystals + DCDC directly.
-    c.hfclk_source = HfclkSource::ExternalXtal;
-    c.lfclk_source = LfclkSource::ExternalXtal;
-    c.dcdc.reg1 = true;
     c
 }
 
-/// USB-suitable clock config: same as [`default_config()`] but flips HFCLK
-/// to the on-board 32 MHz crystal (HFXO).  The nRF52840 USB peripheral
-/// internally derives its 48 MHz reference from HFCLK and won't enumerate
-/// reliably on HFINT.  Use this when initialising the chip in any profile
-/// that enables the `usb-log` feature.
+/// USB-suitable clock config.  Currently identical to
+/// [`default_config()`] — under the SoftDevice, HFCLK source is
+/// SD-owned (we can't write `HfclkSource::ExternalXtal` ourselves
+/// without faulting), so the previous "force HFXO" recipe doesn't
+/// apply.  Profiles enabling the `usb-log` feature need to call
+/// `sd_clock_hfclk_request()` *via* SD when their USB-CDC
+/// connection becomes active so SD keeps HFXO running for the
+/// 48 MHz USB derivation; that wiring isn't done yet.  Kept as a
+/// distinct alias for forward-compatibility with profile binaries
+/// that already say `clocks::usb_config()`.
 pub fn usb_config() -> Config {
-    let mut c = default_config();
-    c.hfclk_source = HfclkSource::ExternalXtal;
-    c
+    default_config()
 }

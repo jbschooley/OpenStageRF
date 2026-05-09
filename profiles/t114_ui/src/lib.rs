@@ -91,32 +91,16 @@ impl DrawTarget for DisplayTarget {
 /// binary's `#[embassy_executor::main]` after the `pre_init`
 /// bootloader hand-off.
 pub async fn run(spawner: Spawner, role: Role) -> ! {
-    defmt::info!("ui (T114, {:?}): boot reached run()", role);
+    defmt::info!("ui (T114, {:?}): bringing up SD + display + joystick", role);
 
-    // Order matters with the SoftDevice: `embassy_nrf::init()` (called
-    // inside `board::resources()`) must come **before**
-    // `Softdevice::enable()`.  SD claims CLOCK + POWER + NVIC ranges
-    // when it enables, after which embassy's init can no longer
-    // configure those peripherals — symptom is a silent hard fault
-    // mid-`embassy_nrf::init`.  This is the order the nrf-softdevice
-    // examples use for a reason.
+    // Order: `embassy_nrf::init()` (inside `board::resources()`)
+    // **must** come before `Softdevice::enable()` — SD claims CLOCK +
+    // POWER on activation; embassy can no longer configure those
+    // afterwards.  See `boards/t114/src/softdevice.rs` module docs
+    // for the full SD setup contract.
     let mut r = board::resources();
-    defmt::info!("ui: resources built");
-
-    // ── SoftDevice ──────────────────────────────────────────────────────────
-    // Bump every peripheral IRQ embassy enabled inside `resources()`
-    // to P2 before SD's enable runs its priority audit.  Without
-    // this, `sd_softdevice_enable` returns
-    // `SdmIncorrectInterruptConfiguration` because SPIMs / UARTE
-    // sit at the reset-default P0 (a SD-reserved level).
-    board::softdevice::lower_app_interrupt_priorities();
-    defmt::info!("ui: app IRQ priorities set to P2");
-
-    defmt::info!("ui: Softdevice::enable() …");
     let sd = board::softdevice::enable();
-    defmt::info!("ui: SD enable returned, spawning run task …");
     spawner.spawn(board::softdevice::run(sd).expect("alloc softdevice run task"));
-    defmt::info!("ui: SD run task spawned");
 
     // ── Display ─────────────────────────────────────────────────────────────
     r.display.init().await;
