@@ -12,6 +12,14 @@ mcu    = "nrf52840"
 
 [features]
 defmt = ["dep:defmt", "embassy-nrf/defmt", "osrf-radio-sx126x/defmt"]
+# Opt-in SoftDevice integration.  When enabled, `resources()` no longer
+# tears down POWER/CLOCK in pre_init (SD owns those), `bootloader_handoff`
+# is short-circuited, and the binary must call `softdevice::enable()`
+# early to start the SD event loop.  Profiles that need BLE config or
+# the SD's hardware management (display profiles on marginal-decoupling
+# boards) opt in; pure radio/MIDI profiles stay SD-free for max
+# peripheral access.
+softdevice = ["dep:nrf-softdevice", "dep:nrf-softdevice-s140", "dep:embassy-executor"]
 # Opt-in USB-CDC `log` transport.  Brings in embassy-usb + embassy-usb-logger
 # and exposes the `usb_log::spawn()` helper.  The bin must call
 # `resources_with(clocks::usb_config())` (HFXO required for USB) before
@@ -55,6 +63,10 @@ heapless               = { workspace = true }
 embassy-usb        = { version = "0.6", optional = true }
 embassy-usb-logger = { version = "0.6", optional = true }
 log                = { version = "0.4", optional = true }
+
+# ── softdevice feature deps ──────────────────────────────────────────────────
+nrf-softdevice      = { workspace = true, optional = true }
+nrf-softdevice-s140 = { workspace = true, optional = true }
 
 [lib]
 test    = false

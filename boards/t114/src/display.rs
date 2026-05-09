@@ -94,6 +94,25 @@ const CMD_RASET: u8 = 0x2B;
 const CMD_RAMWR: u8 = 0x2C;
 const CMD_MADCTL: u8 = 0x36;
 const CMD_COLMOD: u8 = 0x3A;
+// Power / gamma commands.  Many ST7789 LCMs come from POR with
+// safe defaults and don't need these; others ship with defaults
+// that produce a black panel until VCOM / gamma are programmed
+// explicitly.  Heltec sources LCMs from multiple suppliers within
+// the T114 v2.1 SKU, so we send the Adafruit-compatible block
+// unconditionally — harmless on the permissive panels, mandatory
+// on the strict ones.  See ST7789V datasheet §6.2 for register
+// definitions.
+const CMD_PORCTRL: u8 = 0xB2; // Porch control
+const CMD_GCTRL: u8 = 0xB7; // Gate control
+const CMD_VCOMS: u8 = 0xBB; // VCOM voltage
+const CMD_LCMCTRL: u8 = 0xC0; // LCM control
+const CMD_VDVVRHEN: u8 = 0xC2; // VDV / VRH command enable
+const CMD_VRHS: u8 = 0xC3; // VRH set
+const CMD_VDVS: u8 = 0xC4; // VDV set
+const CMD_FRCTRL2: u8 = 0xC6; // Frame rate control (normal mode)
+const CMD_PWCTRL1: u8 = 0xD0; // Power control 1
+const CMD_PVGAMCTRL: u8 = 0xE0; // Positive voltage gamma
+const CMD_NVGAMCTRL: u8 = 0xE1; // Negative voltage gamma
 
 /// 1.14″ ST7789 colour TFT.
 ///
@@ -107,6 +126,14 @@ pub struct St7789Display {
     cs: Output<'static>,
     dc: Output<'static>,
     reset: Output<'static>,
+    /// VTFT_CTRL — gates the TFT VDD rail (P0_03 on T114 v2.1).
+    /// **Active LOW**: drive LOW to enable LCM power, HIGH to disable.
+    /// Owned by the Display so `init()` can apply power, wait the
+    /// rail-warmup interval, then run the IC's reset + init
+    /// sequence.  Matches what Meshtastic / MeshCore do — see
+    /// `[meshtastic firmware] variants/nrf52840/heltec_mesh_node_t114/
+    /// variant.h` (`VTFT_CTRL = 3`, `VTFT_ON = LOW`).
+    vtft: Output<'static>,
 }
 
 impl St7789Display {
@@ -120,8 +147,9 @@ impl St7789Display {
         cs: Output<'static>,
         dc: Output<'static>,
         reset: Output<'static>,
+        vtft: Output<'static>,
     ) -> Self {
-        Self { spi, cs, dc, reset }
+        Self { spi, cs, dc, reset, vtft }
     }
 
     /// Run the ST7789 power-on sequence: hardware reset pulse →
@@ -132,6 +160,25 @@ impl St7789Display {
     pub async fn init(&mut self) {
         #[cfg(feature = "defmt")]
         defmt::info!("st7789: init begin");
+
+        // Power up the LCM rail via VTFT_CTRL (active LOW).
+        // Up until 2026-05 the board crate had this pin wrong (was
+        // driving P0_21 / VEXT, the GPS rail), which explained why
+        // the display only worked when an SWD probe's 3.3 V wire
+        // was attached: the probe back-fed the LCM rail through
+        // P0_03's leakage path.  With VTFT_CTRL driven correctly
+        // the on-board regulator alone is enough.
+        self.vtft.set_low();
+
+        // Rail warmup.  Meshtastic uses `PERIPHERAL_WARMUP_MS = 1000`
+        // (one full second) before any SPI on this exact board.
+        // 1 s is generous; the LCM's internal POR completes well
+        // before that, but reading their delays as a "what works
+        // reliably across all units" floor.  We can tune down later
+        // if it bothers us.
+        Timer::after_millis(1000).await;
+        #[cfg(feature = "defmt")]
+        defmt::info!("st7789: VTFT enabled, rail warm");
 
         // Hardware reset.  ST7789 datasheet says minimum 10 µs LOW,
         // but Meshtastic's working ST7789 driver uses **10 ms LOW**
@@ -174,6 +221,41 @@ impl St7789Display {
         // origin (0, 0) at the upper-left of the visible window once
         // X_OFFSET / Y_OFFSET are applied.
         self.write_command_data(CMD_MADCTL, &[0x60]);
+
+        // Power / gamma block — Adafruit-compatible defaults.  Many
+        // ST7789 panels render fine with their POR power/gamma
+        // settings; some ship with defaults that produce a black
+        // panel and require explicit programming.  Heltec sources
+        // LCMs from multiple suppliers within the T114 v2.1 SKU and
+        // we've observed both kinds.  Sending this block
+        // unconditionally costs a few ms of init time and works on
+        // both populations.
+        self.write_command_data(CMD_PORCTRL, &[0x0C, 0x0C, 0x00, 0x33, 0x33]);
+        self.write_command_data(CMD_GCTRL, &[0x35]);
+        self.write_command_data(CMD_VCOMS, &[0x19]);
+        self.write_command_data(CMD_LCMCTRL, &[0x2C]);
+        self.write_command_data(CMD_VDVVRHEN, &[0x01]);
+        self.write_command_data(CMD_VRHS, &[0x12]);
+        self.write_command_data(CMD_VDVS, &[0x20]);
+        self.write_command_data(CMD_FRCTRL2, &[0x0F]);
+        self.write_command_data(CMD_PWCTRL1, &[0xA4, 0xA1]);
+        self.write_command_data(
+            CMD_PVGAMCTRL,
+            &[
+                0xD0, 0x04, 0x0D, 0x11, 0x13, 0x2B, 0x3F, 0x54, 0x4C, 0x18, 0x0D, 0x0B, 0x1F,
+                0x23,
+            ],
+        );
+        self.write_command_data(
+            CMD_NVGAMCTRL,
+            &[
+                0xD0, 0x04, 0x0C, 0x11, 0x13, 0x2C, 0x3F, 0x44, 0x51, 0x2F, 0x1F, 0x1F, 0x20,
+                0x23,
+            ],
+        );
+        Timer::after_millis(10).await;
+        #[cfg(feature = "defmt")]
+        defmt::info!("st7789: power+gamma programmed");
 
         // Display inversion ON — required for ST7789 to render normal
         // (non-inverted) colors.  Backwards from earlier ST77xx parts.

@@ -33,20 +33,25 @@
  * the app must write SCB->VTOR = 0x26000 very early in main() before any
  * interrupt can fire.  See `bare_blink.rs` for the exact incantation.
  */
-/* On this T114 unit the bootloader's `is_sd_existed()` check at 0x2004 is
- * returning FALSE — either Heltec ships some units without S140, or this
- * particular SoftDevice region got wiped.  The bootloader's runtime
- * `CODE_REGION_1_START` therefore evaluates to MBR_SIZE (0x1000) instead
- * of SD_SIZE (0x26000), and any app flashed to 0x26000 is silently
- * ignored.  Flashing at 0x1000 with the corresponding `uf2conv -b 0x1000`
- * lands the app where the bootloader actually looks for it.
+/* Standard layout (T114 + S140 v7.3.0 bootloader, upgraded 2026-05-09):
+ * MBR 0x0000-0x1000, SD v7.3.0 0x1000-0x27000, user app at 0x27000.
  *
- * Side-effect: if S140 was still partially present, our app overwrites
- * its leading words and `is_sd_existed()` will return FALSE on every
- * subsequent boot — fine, we don't use BLE.
+ * v7.3.0 is 4 KB larger than v6.1.1 — that's the only reason the app
+ * shifted from 0x26000 to 0x27000.  The MBR at 0x0000 forwards interrupts
+ * through the SoftDevice when SD is enabled; our app calls
+ * `Softdevice::enable()` early in run() so SD takes over POWER/CLOCK
+ * management and chip-level transitions.  See BOOTLOADER_UPGRADE.md for
+ * the bootloader build + flash workflow.
+ *
+ * UF2 conversion: `python3 tools/uf2conv.py app.bin -c -b 0x27000 -f 0xADA52840`
+ *
+ * (Boards still on v6.1.1 SD use FLASH ORIGIN 0x26000.  Don't mix
+ * artifacts — a v6.1.1 UF2 flashed onto a v7.3.0 bootloader fails to
+ * boot because the vector table lands at the wrong address relative to
+ * SD_FLASH_END.)
  */
 MEMORY
 {
-  FLASH : ORIGIN = 0x00001000, LENGTH = 0x000EC000
+  FLASH : ORIGIN = 0x00027000, LENGTH = 0x000C6000
   RAM   : ORIGIN = 0x20000008, LENGTH = 0x0003FFF8
 }
