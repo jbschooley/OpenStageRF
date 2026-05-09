@@ -9,13 +9,7 @@ description = "Milestone 6 UI smoke test — T114 deployment.  Drives the built-
 board = "t114"
 
 [dependencies]
-osrf-board-t114                = { workspace = true, features = ["defmt", "softdevice"] }
-
-# nrf-softdevice's `critical-section-impl` provides the global
-# critical-section impl when the SoftDevice owns interrupt forwarding.
-# `cortex-m`'s `critical-section-single-core` would collide (both
-# define `_critical_section_1_0_acquire`); leave cortex-m without the
-# feature when softdevice is on.
+osrf-board-t114                = { workspace = true, features = ["defmt"] }
 osrf-driver-input-joystick5way = { workspace = true, features = ["defmt"] }
 osrf-ui                        = { workspace = true, features = ["defmt"] }
 

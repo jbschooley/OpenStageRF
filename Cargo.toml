@@ -117,14 +117,12 @@ heapless                          = { version = "0.9", default-features = false 
 
 # nRF SoftDevice (BLE stack).  Pinned to git master because crates.io
 # 0.1.x still depends on the legacy `nrf52840-pac` and link-collides
-# with `embassy-nrf = 0.10` on `__INTERRUPTS`.  The crate's official
-# support matrix is S140 v7.x.x; we run on v6.1.1 (Heltec stock
-# bootloader's bundled SoftDevice).  v6/v7 SVC numbers are mostly
-# stable for the surface we touch (sd_softdevice_enable, clock cfg,
-# event-wait), so this is expected to work — the time bomb if any
-# is in BLE-feature code we're not yet calling.  Upgrade SD to v7.3.0
-# (Adafruit's combo bootloader hex) once that becomes practical to
-# get back on the supported matrix.
+# with `embassy-nrf = 0.10` on `__INTERRUPTS`.  The crate officially
+# targets S140 v7.x.x; on the SVC surface we touch
+# (`sd_softdevice_enable`, LF clock cfg, `sd_power_dcdc_mode_set`,
+# `sd_app_evt_wait`) it works fine against v6.1.1 too.  Stage 4 BLE
+# work may need to revisit if specific BLE SVCs cross v6/v7 ABI
+# divergence.
 nrf-softdevice                    = { git = "https://github.com/embassy-rs/nrf-softdevice", rev = "5949a5b1445cc907745c6449a35577e4544cd255", features = ["nrf52840", "s140", "ble-peripheral", "critical-section-impl", "defmt"] }
 nrf-softdevice-s140               = { git = "https://github.com/embassy-rs/nrf-softdevice", rev = "5949a5b1445cc907745c6449a35577e4544cd255" }
 

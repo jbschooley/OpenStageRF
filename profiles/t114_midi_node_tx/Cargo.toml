@@ -14,7 +14,7 @@ osrf-app-midi-node = { workspace = true }
 
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
 
-cortex-m    = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m    = { version = "0.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"
 defmt       = "1.0"
 defmt-rtt   = "1.1"
