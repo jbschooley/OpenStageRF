@@ -28,20 +28,17 @@ use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
-use embedded_graphics_core::pixelcolor::Rgb565;
-use embedded_graphics_core::prelude::*;
-use embedded_graphics_core::primitives::Rectangle;
-use embedded_graphics_core::Pixel;
 use osrf_app_midi_node::{run_rx, run_tx, LinkConfig, UartMidiSink, UartMidiSource};
-use osrf_link_runtime::LinkStatsCell;
 use osrf_board_t114 as board;
 use osrf_driver_input_joystick5way::{Joystick5Way, JoystickEvent};
+use osrf_link_runtime::LinkStatsCell;
 use osrf_ui::{
     build_screen, KeyStore, LinkStatus, Renderer, Role, ScreenId, Settings, UiState, WidgetList,
     MAX_SCAN_CHANNELS,
 };
 
 use board::embassy_nrf::gpio::{Input, Pull};
+use board::framebuffer::Framebuffer;
 
 /// Joystick pin types per `boards/t114/src/lib.rs::joystick`.
 type Joystick = Joystick5Way<
@@ -62,38 +59,15 @@ static EVENT_CHAN: Channel<CriticalSectionRawMutex, JoystickEvent, 8> = Channel:
 /// a `LinkStatus` for the Idle / Link Stats screens.
 static STATS: LinkStatsCell = LinkStatsCell::new();
 
-/// Newtype wrapper for `board::Display` so `render` (generic over
-/// `DrawTarget`) can be called without orphan-rule concerns.
-struct DisplayTarget(board::Display);
-
-impl Dimensions for DisplayTarget {
-    fn bounding_box(&self) -> Rectangle {
-        self.0.bounding_box()
-    }
-}
-
-impl DrawTarget for DisplayTarget {
-    type Color = Rgb565;
-    type Error = <board::Display as DrawTarget>::Error;
-    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
-    where
-        I: IntoIterator<Item = Pixel<Self::Color>>,
-    {
-        self.0.draw_iter(pixels)
-    }
-    fn fill_contiguous<I>(&mut self, area: &Rectangle, colors: I) -> Result<(), Self::Error>
-    where
-        I: IntoIterator<Item = Self::Color>,
-    {
-        self.0.fill_contiguous(area, colors)
-    }
-    fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
-        self.0.fill_solid(area, color)
-    }
-    fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
-        self.0.clear(color)
-    }
-}
+/// 64 KB in-RAM framebuffer the renderer paints into (sync via
+/// `DrawTarget`).  After each render we hand it to
+/// `board::Display::flush(...).await`, which streams the dirty box to
+/// the panel via async SPI — yielding the executor between DMA bursts
+/// so `run_rx` can keep up with the SX1262 RX FIFO.  Single-instance,
+/// owned by `run()`; `static mut` because `Framebuffer::new()` is
+/// `const fn` so the array goes in BSS rather than blowing the stack
+/// at startup.
+static mut FRAMEBUFFER: Framebuffer = Framebuffer::new();
 
 /// Bring up display + joystick + UI state machine for the given
 /// link [`Role`] and run the main loop forever.  Called from each
@@ -112,9 +86,12 @@ pub async fn run(spawner: Spawner, role: Role) -> ! {
     spawner.spawn(board::softdevice::run(sd).expect("alloc softdevice run task"));
 
     // ── Display ─────────────────────────────────────────────────────────────
-    r.display.init().await;
-    let mut display = DisplayTarget(r.display);
-    r.display_backlight.set_low(); // backlight on (active LOW)
+    let mut display = r.display;
+    display.init().await;
+    // SAFETY: `run()` is called exactly once per binary lifetime
+    // (from `#[embassy_executor::main]`), so this is the only place
+    // FRAMEBUFFER is borrowed.
+    let fb: &'static mut Framebuffer = unsafe { &mut *core::ptr::addr_of_mut!(FRAMEBUFFER) };
 
     // ── Joystick ────────────────────────────────────────────────────────────
     let pins = unsafe {
@@ -147,10 +124,15 @@ pub async fn run(spawner: Spawner, role: Role) -> ! {
 
     // Initial paint — `STATS` is empty so this looks like the
     // pre-runtime stub did, but every subsequent render snapshots
-    // fresh stats inside `ui_loop`.
+    // fresh stats inside `ui_loop`.  Order: paint into `fb` (sync),
+    // then flush the dirty region to the panel via async SPI, then
+    // turn the backlight on — so the user never sees the panel's
+    // power-on RAM contents.
     let initial_status = link_status_from_stats(&STATS.get());
     build_screen(&state, &settings, &keys, &initial_status, &mut widgets);
-    let _ = renderer.render(&widgets, &state.scan, &mut display);
+    let _ = renderer.render(&widgets, &state.scan, fb);
+    display.flush(fb).await;
+    r.display_backlight.set_low(); // backlight on (active LOW)
     defmt::info!("ui ready: role={:?} screen={:?}", role, state.screen);
 
     // ── Link runtime ───────────────────────────────────────────────────────
@@ -169,6 +151,7 @@ pub async fn run(spawner: Spawner, role: Role) -> ! {
             join(
                 ui_loop(
                     &mut display,
+                    fb,
                     &mut state,
                     &mut settings,
                     &keys,
@@ -191,6 +174,7 @@ pub async fn run(spawner: Spawner, role: Role) -> ! {
             join(
                 ui_loop(
                     &mut display,
+                    fb,
                     &mut state,
                     &mut settings,
                     &keys,
@@ -218,38 +202,32 @@ pub async fn run(spawner: Spawner, role: Role) -> ! {
 /// Snapshots [`STATS`] each render pass and translates it into a
 /// `LinkStatus` for the Idle / Link Stats screens.  Returns `!` —
 /// runs forever.
+///
+/// Render cadence is the scan tick (~3 Hz) on every screen.  This
+/// used to be capped at 2 Hz on idle screens because the sync display
+/// SPI blocked `run_rx` long enough to drop 5-12 % of inbound packets
+/// — but [`board::Display::flush`] is now async, so the executor
+/// yields between SPI bursts and the rate-limit hack is gone.
 async fn ui_loop(
-    display: &mut DisplayTarget,
+    display: &mut board::Display,
+    fb: &mut Framebuffer,
     state: &mut UiState,
     settings: &mut Settings,
     keys: &KeyStore,
     widgets: &mut WidgetList,
     renderer: &mut Renderer,
 ) -> ! {
-    // The display SPI is sync (`blocking_write` busy-waits during
-    // DMA), so each render blocks the executor — and `run_rx` along
-    // with it — for the duration of the SPI burst.  At ~10-30 ms
-    // per render, rendering 3× per second (scan-tick cadence) stalls
-    // the radio enough to lose 3-9% of packets to RX-FIFO overrun.
-    //
-    // Workaround until the renderer goes async: on non-Scan screens,
-    // only render in response to a UI event or once every
-    // `IDLE_RENDER_INTERVAL`.  Scan stays on the fast cadence
-    // because its bar graph needs the freshness.
-    const IDLE_RENDER_INTERVAL: Duration = Duration::from_millis(500);
     let scan_tick = Duration::from_millis(300);
-    let mut last_render = Instant::now();
 
     loop {
         let next_tick = Timer::after(scan_tick);
-        let was_event = match select(EVENT_CHAN.receive(), next_tick).await {
+        match select(EVENT_CHAN.receive(), next_tick).await {
             Either::First(event) => {
                 if let Some(cmd) = state.handle_event(settings, keys, event) {
                     defmt::info!("ui command: {:?}", cmd);
                     // TODO (M6 increment 4): push the new LinkConfig
                     // to the runtime via Signal<LinkConfig>.
                 }
-                true
             }
             Either::Second(()) => {
                 if state.screen == ScreenId::Scan {
@@ -258,19 +236,18 @@ async fn ui_loop(
                     synth_scan_pass(&mut buf[..n]);
                     state.apply_scan_pass(&buf[..n]);
                 }
-                false
             }
-        };
-
-        let now = Instant::now();
-        let on_scan = state.screen == ScreenId::Scan;
-        let stale = now.duration_since(last_render) >= IDLE_RENDER_INTERVAL;
-        if was_event || on_scan || stale {
-            let status = link_status_from_stats(&STATS.get());
-            build_screen(state, settings, keys, &status, widgets);
-            let _ = renderer.render(widgets, &state.scan, display);
-            last_render = now;
         }
+
+        // Render every iteration — the renderer's per-widget content
+        // diff makes idle frames near-free (nothing changes → empty
+        // dirty box → flush returns immediately), and the async SPI
+        // path means even a full ScanGraph repaint doesn't starve
+        // `run_rx`.
+        let status = link_status_from_stats(&STATS.get());
+        build_screen(state, settings, keys, &status, widgets);
+        let _ = renderer.render(widgets, &state.scan, fb);
+        display.flush(fb).await;
     }
 }
 
