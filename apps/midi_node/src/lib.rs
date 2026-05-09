@@ -30,6 +30,8 @@ pub mod uart;
 // Re-export the runtime's public API so profile binaries can drive
 // `run_tx` / `run_rx` and reference [`LinkConfig`] without depending
 // on `osrf-link-runtime` directly.
-pub use osrf_link_runtime::{configure_radio, run_rx, run_tx, LinkConfig, RF_PAYLOAD_MAX};
+pub use osrf_link_runtime::{
+    configure_radio, run_rx, run_tx, LinkConfig, LinkStats, LinkStatsCell, RF_PAYLOAD_MAX,
+};
 
 pub use uart::{UartMidiSink, UartMidiSource};

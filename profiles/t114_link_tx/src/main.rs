@@ -26,11 +26,13 @@
 //! `run_tx` itself.
 
 use embassy_executor::Spawner;
-use osrf_app_link_bench::{run_tx, synthetic::ScenarioSource, LinkBenchConfig};
+use osrf_app_link_bench::{run_tx, synthetic::ScenarioSource, LinkBenchConfig, LinkStatsCell};
 use osrf_board_t114 as board;
 
 use defmt_rtt as _;
 use panic_probe as _;
+
+static STATS: LinkStatsCell = LinkStatsCell::new();
 
 #[cortex_m_rt::pre_init]
 unsafe fn pre_init() {
@@ -64,6 +66,7 @@ async fn main(_spawner: Spawner) {
         &mut source,
         boot_counter,
         &config,
+        &STATS,
     )
     .await
 }

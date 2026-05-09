@@ -14,6 +14,11 @@ embassy-time       = { version = "0.5", features = ["defmt", "defmt-timestamp-up
 embassy-futures    = "0.1"
 heapless           = { workspace = true }
 defmt              = { workspace = true }
+# Cross-task shared state for `LinkStatsCell` — a `Mutex<Cell<LinkStats>>`
+# the runtime writes and consumers (UI, telemetry) read.  Critical-section
+# impl is provided by whichever profile crate links us (cortex-m on
+# bare-metal builds, nrf-softdevice on SD-aware builds).
+critical-section   = "1"
 
 [lib]
 test    = false

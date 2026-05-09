@@ -96,6 +96,18 @@ pub async fn run(sd: &'static Softdevice) -> ! {
     sd.run().await
 }
 
+/// Pull `len` random bytes from the SoftDevice's RNG via the
+/// `sd_rand_application_vector_get` SVC.  RNG is SD-reserved when SD
+/// is enabled — direct register pokes to the RNG peripheral fault —
+/// so anything that needs randomness (boot counters, nonces, …)
+/// must come through this path.  Returns the SD error code (0 on
+/// success); the caller decides whether to retry, fall back, or
+/// panic.
+pub fn rand_bytes(buf: &mut [u8]) -> u32 {
+    let len = buf.len().min(u8::MAX as usize) as u8;
+    unsafe { raw::sd_rand_application_vector_get(buf.as_mut_ptr(), len) }
+}
+
 /// Bump every peripheral IRQ this board's `Resources` enables to
 /// priority P2 (SD-allowed).  embassy-nrf's `Config.{time,gpiote}_
 /// interrupt_priority` only cover RTC1 + GPIOTE; per-peripheral

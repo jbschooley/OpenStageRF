@@ -23,6 +23,7 @@
 //!     signal into `osrf-link-runtime`).
 
 use embassy_executor::Spawner;
+use embassy_futures::join::join;
 use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -31,6 +32,8 @@ use embedded_graphics_core::pixelcolor::Rgb565;
 use embedded_graphics_core::prelude::*;
 use embedded_graphics_core::primitives::Rectangle;
 use embedded_graphics_core::Pixel;
+use osrf_app_midi_node::{run_rx, run_tx, LinkConfig, UartMidiSink, UartMidiSource};
+use osrf_link_runtime::LinkStatsCell;
 use osrf_board_t114 as board;
 use osrf_driver_input_joystick5way::{Joystick5Way, JoystickEvent};
 use osrf_ui::{
@@ -52,6 +55,12 @@ type Joystick = Joystick5Way<
 /// Input event channel — joystick task pushes, main task pops.
 /// Capacity 8: more than enough for human input rates.
 static EVENT_CHAN: Channel<CriticalSectionRawMutex, JoystickEvent, 8> = Channel::new();
+
+/// Cross-task shared link-runtime stats.  `run_rx` / `run_tx` write
+/// counters + RSSI + link-up here on every loop iteration; the UI
+/// loop snapshots the latest values each render and turns them into
+/// a `LinkStatus` for the Idle / Link Stats screens.
+static STATS: LinkStatsCell = LinkStatsCell::new();
 
 /// Newtype wrapper for `board::Display` so `render` (generic over
 /// `DrawTarget`) can be called without orphan-rule concerns.
@@ -91,7 +100,7 @@ impl DrawTarget for DisplayTarget {
 /// binary's `#[embassy_executor::main]` after the `pre_init`
 /// bootloader hand-off.
 pub async fn run(spawner: Spawner, role: Role) -> ! {
-    defmt::info!("ui (T114, {:?}): bringing up SD + display + joystick", role);
+    defmt::info!("ui (T114, {:?}): bringing up SD + display + joystick + link", role);
 
     // Order: `embassy_nrf::init()` (inside `board::resources()`)
     // **must** come before `Softdevice::enable()` — SD claims CLOCK +
@@ -129,42 +138,118 @@ pub async fn run(spawner: Spawner, role: Role) -> ! {
     // ── UI state ────────────────────────────────────────────────────────────
     let mut state = UiState::with_role(role);
     let mut settings = Settings::default();
-    // Seed the key store with placeholder entries.  AEAD isn't
-    // implemented yet (Stage 3 in ROADMAP.md), so these are name +
-    // fingerprint only.  Hidden from MAIN_MENU on both roles
-    // until AEAD lands.
+    // Placeholder keys, hidden from MAIN_MENU until AEAD lands.
     let mut keys = KeyStore::new();
     let _ = keys.add("Studio A", 0x111111);
     let _ = keys.add("Backup", 0x222222);
-    let status = LinkStatus::default(); // no link wired yet — stub
     let mut widgets: WidgetList = WidgetList::new();
     let mut renderer = Renderer::new();
 
-    build_screen(&state, &settings, &keys, &status, &mut widgets);
+    // Initial paint — `STATS` is empty so this looks like the
+    // pre-runtime stub did, but every subsequent render snapshots
+    // fresh stats inside `ui_loop`.
+    let initial_status = link_status_from_stats(&STATS.get());
+    build_screen(&state, &settings, &keys, &initial_status, &mut widgets);
     let _ = renderer.render(&widgets, &state.scan, &mut display);
     defmt::info!("ui ready: role={:?} screen={:?}", role, state.screen);
 
-    // Scan tick — how often we run a scan pass while on Scan.
-    // The real link-runtime scan_step will take ~channels × 12 ms;
-    // 300 ms is fine for the 24-channel ISM 915 plan and the
-    // synthetic stub used here.
+    // ── Link runtime ───────────────────────────────────────────────────────
+    // Fixed initial config — derived from `Settings::default()` at boot.
+    // `Command::Apply*` from the UI doesn't yet retune the radio (live
+    // reconfig is increment 4 of M6); for now `LinkConfig` matches
+    // `default_915` and stays that way for the run.
+    let config = link_config_from(&settings);
+
+    // Run the UI loop and the link runtime concurrently in this task
+    // via `embassy_futures::join`.  Both halves are infinite (`-> !`),
+    // so the join itself never resolves — exactly what we want.
+    match role {
+        Role::Rx => {
+            let mut sink = UartMidiSink::new(r.midi_uart);
+            join(
+                ui_loop(
+                    &mut display,
+                    &mut state,
+                    &mut settings,
+                    &keys,
+                    &mut widgets,
+                    &mut renderer,
+                ),
+                run_rx(&mut r.radio0, &mut r.status_led, &mut sink, &config, &STATS),
+            )
+            .await;
+        }
+        Role::Tx => {
+            // Boot counter goes into the high 16 bits of the link-layer
+            // `seq` and MUST change across resets so the receiver's
+            // replay window doesn't reject our new low-seq packets as
+            // ancient duplicates.  Pull via SD's RNG SVC — M7 will
+            // replace this with a flash-persisted counter.
+            let boot_counter = read_random_u16();
+            defmt::info!("boot_counter = {} (random per-boot)", boot_counter);
+            let mut source = UartMidiSource::new(r.midi_uart);
+            join(
+                ui_loop(
+                    &mut display,
+                    &mut state,
+                    &mut settings,
+                    &keys,
+                    &mut widgets,
+                    &mut renderer,
+                ),
+                run_tx(
+                    &mut r.radio0,
+                    &mut r.status_led,
+                    &mut source,
+                    boot_counter,
+                    &config,
+                    &STATS,
+                ),
+            )
+            .await;
+        }
+    }
+    // Both halves of `join` return `!`, so we never get here.
+    loop {}
+}
+
+/// UI event loop, factored out of `run()` so the radio runtime can
+/// run concurrently in the same task via `embassy_futures::join`.
+/// Snapshots [`STATS`] each render pass and translates it into a
+/// `LinkStatus` for the Idle / Link Stats screens.  Returns `!` —
+/// runs forever.
+async fn ui_loop(
+    display: &mut DisplayTarget,
+    state: &mut UiState,
+    settings: &mut Settings,
+    keys: &KeyStore,
+    widgets: &mut WidgetList,
+    renderer: &mut Renderer,
+) -> ! {
+    // The display SPI is sync (`blocking_write` busy-waits during
+    // DMA), so each render blocks the executor — and `run_rx` along
+    // with it — for the duration of the SPI burst.  At ~10-30 ms
+    // per render, rendering 3× per second (scan-tick cadence) stalls
+    // the radio enough to lose 3-9% of packets to RX-FIFO overrun.
+    //
+    // Workaround until the renderer goes async: on non-Scan screens,
+    // only render in response to a UI event or once every
+    // `IDLE_RENDER_INTERVAL`.  Scan stays on the fast cadence
+    // because its bar graph needs the freshness.
+    const IDLE_RENDER_INTERVAL: Duration = Duration::from_millis(500);
     let scan_tick = Duration::from_millis(300);
+    let mut last_render = Instant::now();
 
     loop {
         let next_tick = Timer::after(scan_tick);
-        match select(EVENT_CHAN.receive(), next_tick).await {
+        let was_event = match select(EVENT_CHAN.receive(), next_tick).await {
             Either::First(event) => {
-                defmt::info!("event: {:?}", event);
-                if let Some(cmd) = state.handle_event(&mut settings, &keys, event) {
-                    defmt::info!("command: {:?}", cmd);
-                    // TODO: forward to link runtime via config-update signal.
+                if let Some(cmd) = state.handle_event(settings, keys, event) {
+                    defmt::info!("ui command: {:?}", cmd);
+                    // TODO (M6 increment 4): push the new LinkConfig
+                    // to the runtime via Signal<LinkConfig>.
                 }
-                defmt::info!(
-                    "state: screen={:?} cursor={} edit={}",
-                    state.screen,
-                    state.cursor,
-                    state.edit_mode
-                );
+                true
             }
             Either::Second(()) => {
                 if state.screen == ScreenId::Scan {
@@ -173,11 +258,64 @@ pub async fn run(spawner: Spawner, role: Role) -> ! {
                     synth_scan_pass(&mut buf[..n]);
                     state.apply_scan_pass(&buf[..n]);
                 }
+                false
             }
+        };
+
+        let now = Instant::now();
+        let on_scan = state.screen == ScreenId::Scan;
+        let stale = now.duration_since(last_render) >= IDLE_RENDER_INTERVAL;
+        if was_event || on_scan || stale {
+            let status = link_status_from_stats(&STATS.get());
+            build_screen(state, settings, keys, &status, widgets);
+            let _ = renderer.render(widgets, &state.scan, display);
+            last_render = now;
         }
-        build_screen(&state, &settings, &keys, &status, &mut widgets);
-        let _ = renderer.render(&widgets, &state.scan, &mut display);
     }
+}
+
+/// Translate `osrf-link-runtime`'s `LinkStats` snapshot into the
+/// `osrf-ui` `LinkStatus` shape that the renderer expects.  Most
+/// fields map 1:1; `recent_loss_pct` is left `None` for now since
+/// the runtime doesn't currently expose a sliding-window loss
+/// percentage in the cell (it logs one to RTT but doesn't store it).
+fn link_status_from_stats(s: &osrf_link_runtime::LinkStats) -> LinkStatus {
+    LinkStatus {
+        up: s.link_up,
+        // SX1262 RSSI values comfortably fit in i8 (-120..-10 dBm
+        // range); clamp at conversion time to be safe.
+        last_rssi_dbm: s.last_rssi_dbm.map(|r| r.clamp(i8::MIN as i16, i8::MAX as i16) as i8),
+        recent_loss_pct: s.recent_loss_pct,
+        total_accepted: s.total_accepted,
+        stuck_recoveries: s.stuck_recoveries,
+    }
+}
+
+/// Build a [`LinkConfig`] from the UI's [`Settings`].  Today only
+/// `frequency_hz` and `tx_power_dbm` flow through — the rest stays at
+/// `default_915()` values.  When live reconfig lands (M6 increment 4)
+/// this is what `Command::Apply*` translates into.
+fn link_config_from(settings: &Settings) -> LinkConfig {
+    let mut c = LinkConfig::default_915();
+    c.frequency_hz = settings.current_channel().frequency_khz * 1000;
+    c.tx_power_dbm = settings.tx_power_dbm;
+    c
+}
+
+/// Pull two random bytes from SD's RNG and pack into a `u16`.  Used
+/// once at boot for the link-layer `boot_counter` (high 16 bits of
+/// the 48-bit `seq`).  Replace with a flash-persisted counter in M7.
+fn read_random_u16() -> u16 {
+    let mut bytes = [0u8; 2];
+    let ret = board::softdevice::rand_bytes(&mut bytes);
+    if ret != 0 {
+        defmt::warn!(
+            "sd_rand_application_vector_get returned {=u32}; using fallback boot_counter",
+            ret
+        );
+        return 0;
+    }
+    u16::from_be_bytes(bytes)
 }
 
 /// Stub scanner: synthesize per-channel noise floors that move

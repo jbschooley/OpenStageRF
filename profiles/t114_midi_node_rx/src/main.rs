@@ -19,8 +19,15 @@
 //!   - DIN IN jack and FeatherWing `RX` pin: leave disconnected.
 
 use embassy_executor::Spawner;
-use osrf_app_midi_node::{run_rx, LinkConfig, UartMidiSink};
+use osrf_app_midi_node::{run_rx, LinkConfig, UartMidiSink, LinkStatsCell};
 use osrf_board_t114 as board;
+
+
+/// Cross-task shared link-runtime stats.  Single producer
+/// (`run_rx` / `run_tx` in `main`); no other consumer in this
+/// profile yet — kept for symmetry with profiles that drive a
+/// UI from the same numbers.
+static STATS: LinkStatsCell = LinkStatsCell::new();
 
 use defmt_rtt as _;
 use panic_probe as _;
@@ -38,5 +45,5 @@ async fn main(_spawner: Spawner) {
     let config = LinkConfig::default_915();
     let mut sink = UartMidiSink::new(r.midi_uart);
 
-    run_rx(&mut r.radio0, &mut r.status_led, &mut sink, &config).await
+    run_rx(&mut r.radio0, &mut r.status_led, &mut sink, &config, &STATS).await
 }

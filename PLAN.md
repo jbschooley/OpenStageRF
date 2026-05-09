@@ -259,59 +259,87 @@ failure rate.
 
 ### Milestone 6 — UI on RX side (5–7 days)
 
-**Goal:** RX has a usable on-device interface for channel/power/key configuration.
+**Goal:** RX (and TX) have a usable on-device interface for channel/power/key configuration,
+running concurrently with the live MIDI link.
 
 Implementation lives on T114 (built-in 240×135 ST7789 TFT + external 5-way joystick on the
-expansion header).  SSD1306 (DX-LR30 add-on) is deferred until DX-LR30 returns to the active
-path; the UI core is `DrawTarget`-generic so the same screens render on both when that lands.
+expansion header).  Always-on SoftDevice S140 v6.1.1 underneath manages POWER + CLOCK + DCDC
++ critical-section impl; app-side IRQs sit at SD-allowed P2 priority.  SSD1306 (DX-LR30
+add-on) is deferred until DX-LR30 returns to the active path; the UI core is
+`DrawTarget`-generic so the same screens render on both when that lands.
 
-- [x] **Hand-rolled ST7789 driver** in `boards/t114/src/display.rs` (mipidsi's `Builder::init()`
-      hangs on this hardware; replacement is a ~250-line driver with the nRF52840 SPIM
-      `PIN_CNF.INPUT=Connect` workaround for SCK loopback, 10 ms reset pulse, active-low
-      backlight on P0_15, `VEXT_CTL` on P0_21 active high, SPIM2 @ 8 MHz MODE_0).
+- [x] **Hand-rolled ST7789 driver** in `boards/t114/src/display.rs`.  Drives **VTFT_CTRL on
+      P0_03 active LOW** (the actual TFT VDD gate — verified against Meshtastic + MeshCore
+      variant.h after a debug saga where the original code wrongly assumed P0_21 was the gate).
+      1 s rail-warmup before SPI; 10 ms hardware reset pulse, Adafruit-style power+gamma
+      block, MADCTL 0x60, X_OFFSET=40 / Y_OFFSET=53, SPIM2 @ 8 MHz MODE_0, active-LOW
+      backlight on P0_15.
 - [x] `osrf-driver-input-joystick5way`: edge-wake driver (GPIOTE, no polling) generates
       `Press(dir)` / `LongPress(dir)`.  500 ms long-press threshold, 20 ms debounce, 100 ms
-      auto-repeat on Up / Down hold (typamatic-style scroll).  Pre-pressed-at-startup and
-      bounce-back guards.
+      auto-repeat on Up / Down / Left / Right hold (typamatic-style scroll).  Center
+      excluded from auto-repeat so long-press Center stays the universal "go home" action.
+      Pre-pressed-at-startup and bounce-back guards.
 - [x] `osrf-ui` crate (`core/ui/`):
+  - `Role::{Tx, Rx}` baked into UiState; controls which top menu (`MAIN_MENU_TX` /
+    `MAIN_MENU_RX`) drives Idle → menu and what the Idle banner shows.
   - `Settings` (band plan, channel, TX power, active key fingerprint), `LinkStatus`, `ScreenId`.
   - State machine `UiState::handle_event` returning optional `Command::{ApplyChannel, ApplyBandPlan, ApplyTxPower, ApplySetActiveKey}`.
-  - **Data-driven menu tree:** `MenuNode { title, items: &[MenuItem] }` with `ItemAction::{Submenu, List, Value, Custom}`.  Adding a submenu is a `static FOO_MENU = ...` declaration plus a parent reference — no match-arm edits.  Top level is `MAIN_MENU`.
+  - **Data-driven menu tree:** `MenuNode { title, items: &[MenuItem] }` with `ItemAction::{Submenu, List, Value, Custom}`.  Adding a submenu is a `static FOO_MENU = ...` declaration plus a parent reference — no match-arm edits.
   - **Nav stack** (`Vec<NavFrame, 4>` on UiState) — every Center/Right push, every Left pop.  Backing out of any submenu restores parent cursor + scroll.  `go_home()` clears the stack on long-press Center.
   - List screens: ChannelSelect (per band plan), BandPlanSelect, KeySelect (sorted by name with synthetic "Open" row).  Active-marker `*` + cursor `>` 2-char prefix.
-  - Value-edit screen: PowerSelect (numeric edit-buffer pattern, ±9..+22 dBm).
-  - Read-only: LinkStats, About.
+  - Value-edit screen: PowerSelect (numeric edit-buffer pattern, −9..+22 dBm).
+  - Read-only: LinkStats (RSSI + accepted + loss% + stuck-recoveries — all wired live), About.
+  - **Channel scan screen**: continuous rescan, per-channel bar graph with current + peak-since-open per channel.  Up to 144 channels supported (`MAX_SCAN_CHANNELS`), with adaptive bar geometry — wider bars at low channel counts (24 ch ISM), spectrum-trace mode at high counts (Wide 131 ch).  Markers (cursor + active stripe) under the bars.  Currently driven by a synthetic `synth_scan_pass` stub; real radio-side `scan_step` integration is pending (see open items below).
   - Stateful renderer with content-level diff (no flicker on row-only changes), background-aware MonoTextStyleBuilder, FONT_9X18 at 19 px row pitch (5 visible body rows on 240×135).
-  - Multi-band plans (`band_plan.rs`): ISM 915 (24 ch @ 1 MHz, 903–926 MHz), Sennheiser-G compat (5 ch), Shure compat (4 ch), Dense 100 kHz (8 ch — single-unit fine-tuning only).
+  - Multi-band plans (`band_plan.rs`): ISM 915 (24 ch @ 1 MHz, 903–926 MHz), Sennheiser-G compat (5 ch), Shure compat (4 ch), Dense Lo / Mid / Hi (3 × 87 ch @ 100 kHz tiling 902–928 MHz), Wide (131 ch @ 200 kHz over the full band).
   - Runtime KeyStore (`Vec<KeyEntry, 16>`, 24-bit fingerprint matching the on-wire `key_fp` header field, sorted-by-name view).  Profile-baked entries seeded at boot until BLE import lands.  Entry hidden from MAIN_MENU until AEAD lands (single-line gate).
-  - 27 host tests cover the state machine, menu tree, key store, and band-plan invariants.
-- [x] `profiles/t114_ui` smoke profile: brings up display + joystick, runs the state machine,
-      logs emitted commands.  Visual confirmation pass on hardware: scroll/hold-to-scroll/
-      cursor restoration on back/active marker tracking all working.
+  - 34 host tests cover the state machine, menu tree, key store, scan-state behaviour, and band-plan invariants.
+- [x] `profiles/t114_ui` profile with `ui_rx` and `ui_tx` binaries.  Each runs the UI loop
+      and the link runtime concurrently in the same task via `embassy_futures::join`:
+  - `ui_rx` joins `ui_loop` with `osrf_link_runtime::run_rx` + `UartMidiSink` driving the
+    FeatherWing MIDI OUT.
+  - `ui_tx` joins `ui_loop` with `osrf_link_runtime::run_tx` + `UartMidiSource` reading
+    FeatherWing MIDI IN.  Boot counter pulled from SD's RNG SVC (`sd_rand_application_vector_get`).
+- [x] **SoftDevice integration** (`boards/t114/src/softdevice.rs`).  `enable()` lowers
+      app-side peripheral IRQs to P2 (SPIM0/SPIM2/UARTE1; embassy's defaults sit at SD-
+      reserved P0), calls `Softdevice::enable` with a minimal LF-clock-only config, then
+      `sd_power_dcdc_mode_set(NRF_POWER_DCDC_ENABLE)` for DC-DC.  `run` task spawned for
+      SD's event loop.  RAM origin in `memory.x` set to `0x200032D8` per SD's runtime
+      report.  No BLE config yet — Stage 4 wires that.
+- [x] **Live LinkStatus feedback**: `osrf-link-runtime` exposes `LinkStats` + `LinkStatsCell`
+      (`critical_section::Mutex<Cell<LinkStats>>`).  `run_rx` writes `link_up`,
+      `last_rssi_dbm`, `total_accepted`, accepted/dropped/CRC counts, `recent_loss_pct`
+      (computed in the periodic-stats window), and `stuck_recoveries` on every loop
+      iteration; `run_tx` writes `total_sent` / `heartbeats_sent`.  UI snapshots the cell
+      on each render and translates into `osrf_ui::LinkStatus` for the Idle banner and
+      Link Stats screen.
 - [ ] **Live config-update plumbing**: `Signal<LinkConfig>` in `osrf-link-runtime`; UI pushes
-      to it on `Command::Apply*`, run loop reconfigures the radio without restart.
-- [ ] **Real LinkStatus updates**: feed RSSI / loss / accepted-count from `osrf-link-runtime`'s
-      RX path into the UI's `LinkStatus` struct (currently always-zero stub).
-- [ ] **Channel scan screen** *(pulled forward from "Beyond v2" in ROADMAP.md)*: continuous
-      rescan of every channel in the active band plan, displayed as a per-channel bar graph
-      with **two values per channel — current noise floor and max-since-screen-opened**.
-      Two bars stacked or "current bar + peak tick" on top.  On entry the peak buffer resets
-      so the display tracks "what's been on this channel since I started watching."
-  - Link-runtime API: `osrf-link-runtime::scan_step(&[ChannelInfo]) -> [(idx, rssi_dbm)]`
-        (one full pass: pause RX, retune to each, sample RSSI ~10 ms, restore operating
-        channel).  The UI calls this in a loop while the Scan screen is active and merges
-        each pass into per-channel `(current, max)` pairs.
-      - UI hook: `MenuItem { label: "Scan", action: Custom(ScreenId::ScanResults) }` and
-        a `ScanResults` screen that owns the `(current, max)` table.  `Press(Left)` exits
-        and discards the table; re-entering resets max-tracking.
-      - Most useful diagnostic for venue coordination (which Senn/Shure/Dense channels are
-        quiet right now, and which look quiet on average but have intermittent hits).
-- [ ] Embassy task layout: `ui_render` (low priority, 30 Hz cap), `ui_input` (event-driven,
-      edge-wake), `ui_state` (event-driven).  Currently single-loop in `t114_ui` profile;
-      split into tasks once live config-update lands.
+      to it on `Command::Apply*`, run loop reconfigures the radio between packets without
+      restart.  Today the radio config is fixed to `LinkConfig::default_915()` derived from
+      initial settings — `Command::Apply*` from the UI logs but doesn't yet retune.
+- [ ] **Real channel-scan integration**: replace `synth_scan_pass` with
+      `osrf-link-runtime::scan_step(&[ChannelInfo]) -> [(idx, rssi_dbm)]` (one full pass:
+      pause RX, retune to each, sample RSSI ~10 ms, restore operating channel).  The UI
+      already maintains the `(current, peak)` table from `apply_scan_pass`; needs a real
+      RSSI source.
+- [ ] **Async-SPI display refactor** to fix UI-induced packet loss.  Today the display
+      driver uses sync `Spim::blocking_write` (busy-waits during DMA), so each render
+      blocks the whole executor — including `run_rx` — for ~10-30 ms.  At ~3 Hz render
+      cadence that's enough RX-FIFO-overrun to lose 5-12% of packets.  Current mitigation
+      is rate-limiting: non-Scan screens render at most once per 500 ms, dropping loss
+      to ~1-3%.  Real fix: convert display SPI to `Spim::write().await` (yields during
+      DMA) so other tasks run between SPI bursts.  Two paths: (a) row-buffered
+      framebuffer + async flush, keep `DrawTarget` sync; (b) replace `DrawTarget` with
+      a project-local async draw API.  ~3 hours either way; (a) costs ~480 B of RAM and
+      keeps embedded-graphics integration.
+- [ ] **Embassy task split**.  Today everything runs joined into one task (`ui_loop` +
+      `run_rx`/`run_tx` via `embassy_futures::join`).  Once async-SPI lands, split into:
+      `ui_render` (low priority, 30 Hz cap), `ui_input` (event-driven, edge-wake), and
+      `ui_state` / link-runtime (high priority).  Removes the rate-limit hack.
 
 **Exit criteria:** all screens render, joystick navigates correctly, channel/band/power changes
-apply live (without reboot), scan reports per-channel RSSI for the active band plan.
+apply live (without reboot), scan reports per-channel RSSI for the active band plan, packet loss
+under sustained UI activity stays under 1%.
 
 ### Milestone 7 — persistence + crash safety (3–5 days)
 

@@ -21,7 +21,8 @@ pub mod synthetic;
 // (`profiles/t114_link_{rx,tx}` etc.) continue to compile against
 // `osrf_app_link_bench::*`.
 pub use osrf_link_runtime::{
-    configure_radio, run_rx, run_tx, LinkConfig, MidiSink, MidiSource, RF_PAYLOAD_MAX,
+    configure_radio, run_rx, run_tx, LinkConfig, LinkStats, LinkStatsCell, MidiSink,
+    MidiSource, RF_PAYLOAD_MAX,
 };
 
 /// Compatibility alias — the config struct used to be called
