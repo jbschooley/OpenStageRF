@@ -737,7 +737,12 @@ impl UiState {
         None
     }
 
-    fn go_home(&mut self) {
+    /// Reset to the Idle screen with a fresh nav stack and cursor —
+    /// the universal "go home" action.  Bound to long-press Center
+    /// from inside `handle_event`, and also called from profiles'
+    /// inactivity-timeout paths to bring the user back to Idle after
+    /// a stretch of no input.
+    pub fn go_home(&mut self) {
         self.screen = ScreenId::Idle;
         self.current_menu = self.role.main_menu();
         self.cursor = 0;

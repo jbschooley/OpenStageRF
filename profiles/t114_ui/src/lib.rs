@@ -37,7 +37,7 @@ use osrf_ui::{
     MAX_SCAN_CHANNELS,
 };
 
-use board::embassy_nrf::gpio::{Input, Pull};
+use board::embassy_nrf::gpio::{Input, Output, Pull};
 use board::framebuffer::Framebuffer;
 
 /// Joystick pin types per `boards/t114/src/lib.rs::joystick`.
@@ -87,6 +87,7 @@ pub async fn run(spawner: Spawner, role: Role) -> ! {
 
     // ── Display ─────────────────────────────────────────────────────────────
     let mut display = r.display;
+    let mut backlight = r.display_backlight;
     display.init().await;
     // SAFETY: `run()` is called exactly once per binary lifetime
     // (from `#[embassy_executor::main]`), so this is the only place
@@ -132,7 +133,7 @@ pub async fn run(spawner: Spawner, role: Role) -> ! {
     build_screen(&state, &settings, &keys, &initial_status, &mut widgets);
     let _ = renderer.render(&widgets, &state.scan, fb);
     display.flush(fb).await;
-    r.display_backlight.set_low(); // backlight on (active LOW)
+    backlight.set_low(); // backlight on (active LOW)
     defmt::info!("ui ready: role={:?} screen={:?}", role, state.screen);
 
     // ── Link runtime ───────────────────────────────────────────────────────
@@ -151,6 +152,7 @@ pub async fn run(spawner: Spawner, role: Role) -> ! {
             join(
                 ui_loop(
                     &mut display,
+                    &mut backlight,
                     fb,
                     &mut state,
                     &mut settings,
@@ -174,6 +176,7 @@ pub async fn run(spawner: Spawner, role: Role) -> ! {
             join(
                 ui_loop(
                     &mut display,
+                    &mut backlight,
                     fb,
                     &mut state,
                     &mut settings,
@@ -203,13 +206,25 @@ pub async fn run(spawner: Spawner, role: Role) -> ! {
 /// `LinkStatus` for the Idle / Link Stats screens.  Returns `!` —
 /// runs forever.
 ///
-/// Render cadence is the scan tick (~3 Hz) on every screen.  This
-/// used to be capped at 2 Hz on idle screens because the sync display
-/// SPI blocked `run_rx` long enough to drop 5-12 % of inbound packets
-/// — but [`board::Display::flush`] is now async, so the executor
-/// yields between SPI bursts and the rate-limit hack is gone.
+/// ## Inactivity / auto-off
+///
+/// Per-screen idle policy:
+///   - `Idle` → backlight off after [`IDLE_OFF_TIMEOUT`].
+///   - `LinkStats` → never auto-off (read-only live readout —
+///     the user wants to keep watching).
+///   - everything else (Menu, Scan, ChannelSelect, BandPlanSelect,
+///     PowerSelect, KeySelect, About) → return to Idle after
+///     [`MENU_TO_IDLE_TIMEOUT`], at which point the Idle 15 s timer
+///     restarts and ultimately drops the backlight.
+///
+/// While the backlight is off, the next joystick input is consumed
+/// just as a wake — `handle_event` is *not* invoked for it.  A user
+/// that wants to act on the wake-up press has to release and press
+/// again.  This matches the "screen-off press doesn't fire" contract
+/// from `docs/ui_design.md`.
 async fn ui_loop(
     display: &mut board::Display,
+    backlight: &mut Output<'static>,
     fb: &mut Framebuffer,
     state: &mut UiState,
     settings: &mut Settings,
@@ -217,20 +232,40 @@ async fn ui_loop(
     widgets: &mut WidgetList,
     renderer: &mut Renderer,
 ) -> ! {
+    /// Idle screen → backlight off when this long with no input.
+    const IDLE_OFF_TIMEOUT: Duration = Duration::from_secs(15);
+    /// Any non-Idle / non-LinkStats screen → return to Idle when
+    /// this long with no input (whereupon `IDLE_OFF_TIMEOUT` runs).
+    const MENU_TO_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
     let scan_tick = Duration::from_millis(300);
+    let mut last_input = Instant::now();
+    let mut display_on = true;
 
     loop {
         let next_tick = Timer::after(scan_tick);
         match select(EVENT_CHAN.receive(), next_tick).await {
             Either::First(event) => {
-                if let Some(cmd) = state.handle_event(settings, keys, event) {
+                last_input = Instant::now();
+                if !display_on {
+                    // Wake from sleep — first press just lights the
+                    // panel back up; the event itself is intentionally
+                    // dropped so the user doesn't accidentally fire a
+                    // menu action on the wake press.
+                    backlight.set_low();
+                    display_on = true;
+                    defmt::info!("ui: wake (joystick input)");
+                } else if let Some(cmd) = state.handle_event(settings, keys, event) {
                     defmt::info!("ui command: {:?}", cmd);
                     // TODO (M6 increment 4): push the new LinkConfig
                     // to the runtime via Signal<LinkConfig>.
                 }
             }
             Either::Second(()) => {
-                if state.screen == ScreenId::Scan {
+                // Tick: advance the scan stub if we're on the Scan
+                // screen *and* the panel is on.  No point synthesising
+                // bars the user can't see.
+                if display_on && state.screen == ScreenId::Scan {
                     let mut buf = [0i16; MAX_SCAN_CHANNELS];
                     let n = state.scan.channel_count as usize;
                     synth_scan_pass(&mut buf[..n]);
@@ -239,15 +274,50 @@ async fn ui_loop(
             }
         }
 
-        // Render every iteration — the renderer's per-widget content
-        // diff makes idle frames near-free (nothing changes → empty
-        // dirty box → flush returns immediately), and the async SPI
-        // path means even a full ScanGraph repaint doesn't starve
-        // `run_rx`.
-        let status = link_status_from_stats(&STATS.get());
-        build_screen(state, settings, keys, &status, widgets);
-        let _ = renderer.render(widgets, &state.scan, fb);
-        display.flush(fb).await;
+        // Inactivity transitions.  Only meaningful while the display
+        // is on — once off, we're already at the endpoint and stay
+        // there until the next event wakes us.
+        if display_on {
+            let idle_for = Instant::now().duration_since(last_input);
+            match state.screen {
+                ScreenId::LinkStats => {
+                    // Never times out — explicit per the UI design.
+                }
+                ScreenId::Idle => {
+                    if idle_for >= IDLE_OFF_TIMEOUT {
+                        defmt::info!("ui: auto-off (idle {} s)", IDLE_OFF_TIMEOUT.as_secs());
+                        backlight.set_high(); // backlight off (active LOW)
+                        display_on = false;
+                    }
+                }
+                _ => {
+                    if idle_for >= MENU_TO_IDLE_TIMEOUT {
+                        defmt::info!(
+                            "ui: menu->idle ({} s no input)",
+                            MENU_TO_IDLE_TIMEOUT.as_secs()
+                        );
+                        state.go_home();
+                        // Reset the idle countdown so the user gets the
+                        // full IDLE_OFF_TIMEOUT on Idle before the panel
+                        // actually goes dark.
+                        last_input = Instant::now();
+                    }
+                }
+            }
+        }
+
+        // Render only when the panel is on — no point streaming
+        // pixels into RAM the user can't see.  The renderer's
+        // per-widget content diff makes idle frames near-free
+        // (nothing changes → empty dirty box → flush returns
+        // immediately), and the async SPI path means even a full
+        // ScanGraph repaint doesn't starve `run_rx`.
+        if display_on {
+            let status = link_status_from_stats(&STATS.get());
+            build_screen(state, settings, keys, &status, widgets);
+            let _ = renderer.render(widgets, &state.scan, fb);
+            display.flush(fb).await;
+        }
     }
 }
 
