@@ -1314,6 +1314,7 @@ dependencies = [
 name = "osrf-link-runtime"
 version = "0.1.0"
 dependencies = [
+ "critical-section",
  "defmt 1.0.1",
  "embassy-futures",
  "embassy-time",
@@ -1619,8 +1620,10 @@ dependencies = [
  "embassy-sync 0.8.0",
  "embassy-time",
  "embedded-graphics-core",
+ "osrf-app-midi-node",
  "osrf-board-t114",
  "osrf-driver-input-joystick5way",
+ "osrf-link-runtime",
  "osrf-ui",
  "panic-probe",
 ]

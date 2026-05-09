@@ -102,6 +102,115 @@ impl LinkConfig {
     }
 }
 
+// ── Live stats observable by the UI / telemetry ─────────────────────────────
+
+/// Snapshot of link-runtime state that the UI (or any other consumer)
+/// can read at any time.  Updated by `run_rx` on every accepted
+/// packet, dropped packet, link transition, and stuck-recovery fire.
+/// `run_tx` updates a smaller subset (primarily `total_sent` /
+/// `heartbeats_sent`) — TX has no link-up notion since v1 has no ACK.
+#[derive(Debug, Clone, Copy)]
+pub struct LinkStats {
+    /// Receiver watchdog says the peer is alive.  RX-side only.
+    pub link_up: bool,
+    /// RSSI (dBm) of the most recent accepted packet.  `None` until
+    /// the first packet is received.  RX-side only.  `i16` to match
+    /// what the SX1262 driver reports — practical values are -120 to
+    /// -10 so an `i8` fits, but consumers can clamp at display time.
+    pub last_rssi_dbm: Option<i16>,
+    /// Total accepted packets since boot (heartbeats + MIDI + sysex).
+    /// RX-side.
+    pub total_accepted: u32,
+    /// Subset: accepted heartbeat packets.  RX-side.
+    pub accepted_heartbeats: u32,
+    /// Subset: accepted MIDI channel-voice packets.  RX-side.
+    pub accepted_midi: u32,
+    /// Packets that decoded but failed link-layer validation
+    /// (key-fingerprint mismatch, replay window, etc).  RX-side.
+    pub dropped: u32,
+    /// Packets the radio reported with a CRC error.  RX-side.
+    pub crc_mismatch: u32,
+    /// Stuck-channel recoveries fired (heartbeat-state failsafe).
+    /// RX-side.
+    pub stuck_recoveries: u32,
+    /// Packet loss (%) over the last 1-second window — `None` until
+    /// at least two consecutive windows have been observed (the
+    /// runtime needs a baseline `packet_seq` to compute against).
+    /// Updated once per second by `run_rx`.  Computed from
+    /// `(tx_packets - accepted_packets) / tx_packets`, so it
+    /// includes any cause the radio missed a packet (CRC error,
+    /// link-layer drop, decoder error).  RX-side.
+    pub recent_loss_pct: Option<u8>,
+    /// Total transmitted packets (heartbeats + MIDI).  TX-side.
+    pub total_sent: u32,
+    /// Subset: heartbeat packets sent.  TX-side.
+    pub heartbeats_sent: u32,
+}
+
+impl LinkStats {
+    pub const EMPTY: Self = Self {
+        link_up: false,
+        last_rssi_dbm: None,
+        total_accepted: 0,
+        accepted_heartbeats: 0,
+        accepted_midi: 0,
+        dropped: 0,
+        crc_mismatch: 0,
+        stuck_recoveries: 0,
+        recent_loss_pct: None,
+        total_sent: 0,
+        heartbeats_sent: 0,
+    };
+}
+
+impl Default for LinkStats {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+/// Cross-task shared cell for [`LinkStats`].  Single producer
+/// (`run_rx` or `run_tx` running in one task) updates via
+/// [`Self::update`]; any number of consumers read snapshots via
+/// [`Self::get`].  `const fn new` so a profile can declare a `static
+/// STATS: LinkStatsCell = LinkStatsCell::new();` and pass `&STATS` to
+/// the runtime + the UI render path.
+pub struct LinkStatsCell {
+    inner: critical_section::Mutex<core::cell::Cell<LinkStats>>,
+}
+
+impl LinkStatsCell {
+    pub const fn new() -> Self {
+        Self {
+            inner: critical_section::Mutex::new(core::cell::Cell::new(LinkStats::EMPTY)),
+        }
+    }
+
+    /// Copy out the current snapshot.  Safe to call from any task /
+    /// IRQ context — internally takes a critical section briefly.
+    pub fn get(&self) -> LinkStats {
+        critical_section::with(|cs| self.inner.borrow(cs).get())
+    }
+
+    /// Mutate the stored stats in place.  Closure-style so callers
+    /// don't have to round-trip through `get` / `set` and risk a
+    /// concurrent overwrite.
+    pub fn update<F: FnOnce(&mut LinkStats)>(&self, f: F) {
+        critical_section::with(|cs| {
+            let cell = self.inner.borrow(cs);
+            let mut s = cell.get();
+            f(&mut s);
+            cell.set(s);
+        });
+    }
+}
+
+impl Default for LinkStatsCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Source / Sink traits ─────────────────────────────────────────────────────
 
 pub trait MidiSource {
@@ -184,6 +293,7 @@ pub async fn run_tx<Spi, Busy, Dio1, Reset, Switch, Led, Source>(
     source: &mut Source,
     boot_counter: u16,
     config: &LinkConfig,
+    stats: &LinkStatsCell,
 ) -> !
 where
     Spi: SpiDevice,
@@ -313,6 +423,14 @@ where
                 overflow_count
             );
         }
+
+        // Push counters to the shared cell so consumers (UI / telemetry)
+        // can render them.  TX has no link-up signal in v1 (no ACK
+        // channel), so RX-side fields stay at their defaults.
+        stats.update(|s| {
+            s.total_sent = tx_count.wrapping_add(hb_count);
+            s.heartbeats_sent = hb_count;
+        });
     }
 }
 
@@ -335,6 +453,7 @@ pub async fn run_rx<Spi, Busy, Dio1, Reset, Switch, Led, Sink>(
     led: &mut Led,
     sink: &mut Sink,
     config: &LinkConfig,
+    stats: &LinkStatsCell,
 ) -> !
 where
     Spi: SpiDevice,
@@ -409,6 +528,12 @@ where
     const STUCK_NOTE_MIN_DIVERGENCE_MS: u64 = 100;
     // Counter of stuck-channel recoveries fired (diagnostic).
     let mut stuck_recoveries: u32 = 0;
+    // RSSI of the most recent accepted packet, exposed via `stats`.
+    let mut last_rssi: Option<i16> = None;
+    // Loss % over the most recent 1-second window — computed inside
+    // the periodic-stats block below and exposed via `stats`.  None
+    // until we've seen two consecutive windows.
+    let mut last_loss_pct: Option<u8> = None;
 
     loop {
         events.clear();
@@ -420,6 +545,7 @@ where
                 if was_down {
                     defmt::info!("link RX: link UP");
                 }
+                last_rssi = Some(pkt.rssi_dbm);
 
                 let n = pkt.len.min(radio_buf.len());
                 let now = Instant::now();
@@ -655,8 +781,32 @@ where
             prev_dropped = dropped;
             prev_crc = crc_mismatch;
             last_stats_log = now;
+            // Stash this window's loss for export via `stats`.
+            // Only meaningful when `tx_count > 0` (i.e. we actually
+            // observed packet_seq advancing); on a session reset or
+            // pre-first-packet window, leave the previous reading
+            // alone rather than reporting a misleading 0%.
+            if tx_count > 0 {
+                last_loss_pct = Some(((loss_x10 / 10) as u8).min(100));
+            }
             // Note: prev_packet_seq is now Some() once we've seen any
             // packet; the next window will compute real loss.
         }
+
+        // Push the latest counters into the shared cell so consumers
+        // (UI render path, telemetry exporters) see fresh values.
+        // One critical-section per loop iteration is cheap relative
+        // to the radio.rx_recv await we're about to block in.
+        stats.update(|s| {
+            s.link_up = link_up;
+            s.last_rssi_dbm = last_rssi;
+            s.total_accepted = accepted;
+            s.accepted_heartbeats = accepted_heartbeats;
+            s.accepted_midi = accepted_midi;
+            s.dropped = dropped;
+            s.crc_mismatch = crc_mismatch;
+            s.stuck_recoveries = stuck_recoveries;
+            s.recent_loss_pct = last_loss_pct;
+        });
     }
 }

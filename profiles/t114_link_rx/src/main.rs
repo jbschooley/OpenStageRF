@@ -14,11 +14,13 @@
 //! changes to `run_rx` itself.
 
 use embassy_executor::Spawner;
-use osrf_app_link_bench::{run_rx, synthetic::DefmtLogSink, LinkBenchConfig};
+use osrf_app_link_bench::{run_rx, synthetic::DefmtLogSink, LinkBenchConfig, LinkStatsCell};
 use osrf_board_t114 as board;
 
 use defmt_rtt as _;
 use panic_probe as _;
+
+static STATS: LinkStatsCell = LinkStatsCell::new();
 
 #[cortex_m_rt::pre_init]
 unsafe fn pre_init() {
@@ -36,5 +38,5 @@ async fn main(_spawner: Spawner) {
     let config = LinkBenchConfig::default_915();
 
     let mut sink = DefmtLogSink;
-    run_rx(&mut r.radio0, &mut r.status_led, &mut sink, &config).await
+    run_rx(&mut r.radio0, &mut r.status_led, &mut sink, &config, &STATS).await
 }
