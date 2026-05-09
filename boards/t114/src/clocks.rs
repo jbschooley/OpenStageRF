@@ -26,6 +26,7 @@
 //! the 32 MHz crystal that the T114 v2.0 schematic populates.
 
 use embassy_nrf::config::{Config, HfclkSource, LfclkSource};
+use embassy_nrf::interrupt::Priority;
 
 /// Default T114 clock config: LFXO (external 32.768 kHz crystal,
 /// ~±20 ppm) for LFCLK, HFINT (64 MHz internal RC) for SYSCLK.
@@ -37,10 +38,39 @@ use embassy_nrf::config::{Config, HfclkSource, LfclkSource};
 /// Re-tried on v2.1 hardware — LFXO starts cleanly, time driver
 /// runs at the much tighter ±20 ppm.  Revert to `InternalRC` if a
 /// future board fails to start.
+#[allow(unreachable_code)] // when `softdevice` feature is on, the function returns early
 pub fn default_config() -> Config {
     let mut c = Config::default();
-    c.hfclk_source = HfclkSource::Internal;        // explicit for clarity (also default)
-    c.lfclk_source = LfclkSource::ExternalXtal;    // 32.768 kHz crystal, ~±20 ppm
+
+    // SoftDevice reserves interrupt priorities **P0, P1, and P4**
+    // (per nrf-softdevice README); app-allowed are P2/P3/P5+.
+    // embassy-nrf's default is P0, which hard-faults under an active
+    // SD.  P2 is the nrf-softdevice docs' recommendation for time +
+    // GPIOTE — applied unconditionally so the same config covers
+    // SD-on and SD-off builds.
+    c.time_interrupt_priority = Priority::P2;
+    c.gpiote_interrupt_priority = Priority::P2;
+
+    // ── SoftDevice-aware path ───────────────────────────────────────────
+    // When SD is active, CLOCK + POWER are owned by SD.  Direct writes
+    // to HFCLK/LFCLK source or DCDCEN fault — symptom is the chip
+    // hanging silently inside `embassy_nrf::init()`, the next defmt
+    // log line never appearing.  Leave both at their `Config::default()`
+    // values (`HfclkSource::Internal`, `LfclkSource::InternalRC`,
+    // `dcdc.reg1 = false`) so embassy-nrf skips those registers
+    // entirely.  SD has already configured HFCLK + LFCLK + DCDC
+    // during its enable (LF-clock source from our SD config; HFXO
+    // started on demand by SD; DCDC enabled by `nrf_softdevice` if
+    // we ever ask for it via `sd_power_dcdc_mode_set`).
+    #[cfg(feature = "softdevice")]
+    return c;
+
+    // ── SD-less path ────────────────────────────────────────────────────
+    // No SoftDevice — embassy-nrf owns the chip and we can configure
+    // crystals + DCDC directly.
+    c.hfclk_source = HfclkSource::ExternalXtal;
+    c.lfclk_source = LfclkSource::ExternalXtal;
+    c.dcdc.reg1 = true;
     c
 }
 

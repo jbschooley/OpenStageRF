@@ -231,20 +231,64 @@ pub struct MenuNode {
     pub items: &'static [MenuItem],
 }
 
-/// Top-level menu, entered from Idle on Center/Right.  When
-/// adding new submenus, declare a `static FOO_MENU: MenuNode`
-/// and reference it from here (or any deeper parent) via
-/// [`ItemAction::Submenu`].
-pub static MAIN_MENU: MenuNode = MenuNode {
+/// Which side of the link this firmware is running.  Set once at
+/// boot per profile binary; the UI core branches on it for the
+/// menu (TX Power vs Link Stats) and the Idle screen (TX power
+/// readout vs RSSI / link-up indicator).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Role {
+    /// Transmitter — owns TX Power, can't observe link liveness
+    /// (no ACK in v1).  No KeyStore-AEAD on TX path until Stage 3.
+    Tx,
+    /// Receiver — owns the watchdog / Link Stats; TX Power is
+    /// meaningless (RX doesn't transmit).
+    Rx,
+}
+
+impl Role {
+    /// The MAIN_MENU appropriate for this role.  Used by the UI
+    /// core to pick which top-level menu Idle → Menu enters.
+    pub fn main_menu(self) -> &'static MenuNode {
+        match self {
+            Role::Tx => &MAIN_MENU_TX,
+            Role::Rx => &MAIN_MENU_RX,
+        }
+    }
+
+    /// Idle-screen banner suffix — `"TX"` or `"RX"`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Role::Tx => "TX",
+            Role::Rx => "RX",
+        }
+    }
+}
+
+/// TX-side top menu: channel + scan + band plan + TX power +
+/// about.  No Link Stats (v1 has no ACK channel; the TX has no
+/// way to observe whether RX is alive).
+pub static MAIN_MENU_TX: MenuNode = MenuNode {
     title: "Menu",
     items: &[
         MenuItem { label: "Channel",    action: ItemAction::List(ListKind::Channel) },
         MenuItem { label: "Scan",       action: ItemAction::Custom(ScreenId::Scan) },
         MenuItem { label: "Band Plan",  action: ItemAction::List(ListKind::BandPlan) },
         MenuItem { label: "TX Power",   action: ItemAction::Value(ValueKind::TxPower) },
-        // Hidden until AEAD lands (Stage 3 in ROADMAP.md) — KeySelect
-        // and the KeyStore still exist and work, but exposing them in
-        // the UI is misleading while there's no actual encryption.
+        // Key entry hidden until AEAD lands (Stage 3 in ROADMAP.md).
+        // MenuItem { label: "Key",        action: ItemAction::List(ListKind::Key) },
+        MenuItem { label: "About",      action: ItemAction::Custom(ScreenId::About) },
+    ],
+};
+
+/// RX-side top menu: channel + scan + band plan + link stats +
+/// about.  No TX Power (RX doesn't transmit).
+pub static MAIN_MENU_RX: MenuNode = MenuNode {
+    title: "Menu",
+    items: &[
+        MenuItem { label: "Channel",    action: ItemAction::List(ListKind::Channel) },
+        MenuItem { label: "Scan",       action: ItemAction::Custom(ScreenId::Scan) },
+        MenuItem { label: "Band Plan",  action: ItemAction::List(ListKind::BandPlan) },
         // MenuItem { label: "Key",        action: ItemAction::List(ListKind::Key) },
         MenuItem { label: "Link Stats", action: ItemAction::Custom(ScreenId::LinkStats) },
         MenuItem { label: "About",      action: ItemAction::Custom(ScreenId::About) },
@@ -338,6 +382,11 @@ pub struct NavFrame {
 /// whole states.
 #[derive(Debug, Clone)]
 pub struct UiState {
+    /// Which side of the link this firmware is running.  Picked
+    /// at construction by the profile binary
+    /// ([`UiState::with_role`]).  Selects the top-level menu and
+    /// drives the Idle screen's content.
+    pub role: Role,
     /// Current screen.
     pub screen: ScreenId,
     /// Currently active menu definition.  Meaningful when
@@ -379,15 +428,30 @@ pub struct UiState {
 
 impl Default for UiState {
     fn default() -> Self {
+        // Role::Rx is the default; profile binaries that want a
+        // TX UI use [`UiState::with_role(Role::Tx)`] instead.
         Self {
+            role: Role::Rx,
             screen: ScreenId::Idle,
-            current_menu: &MAIN_MENU,
+            current_menu: Role::Rx.main_menu(),
             cursor: 0,
             scroll_offset: 0,
             edit_mode: false,
             edit_buffer: 0,
             nav_stack: Vec::new(),
             scan: ScanState::default(),
+        }
+    }
+}
+
+impl UiState {
+    /// Construct a UiState bound to the given side of the link.
+    /// Picks the role-appropriate top menu and Idle layout.
+    pub fn with_role(role: Role) -> Self {
+        Self {
+            role,
+            current_menu: role.main_menu(),
+            ..Self::default()
         }
     }
 }
@@ -473,7 +537,7 @@ impl UiState {
         match event {
             JoystickEvent::Press(Direction::Center)
             | JoystickEvent::Press(Direction::Right) => {
-                self.enter_menu(&MAIN_MENU);
+                self.enter_menu(self.role.main_menu());
             }
             _ => {}
         }
@@ -675,7 +739,7 @@ impl UiState {
 
     fn go_home(&mut self) {
         self.screen = ScreenId::Idle;
-        self.current_menu = &MAIN_MENU;
+        self.current_menu = self.role.main_menu();
         self.cursor = 0;
         self.scroll_offset = 0;
         self.edit_mode = false;
@@ -695,7 +759,7 @@ impl UiState {
             self.scroll_offset = frame.scroll;
         } else {
             self.screen = ScreenId::Idle;
-            self.current_menu = &MAIN_MENU;
+            self.current_menu = self.role.main_menu();
             self.cursor = 0;
             self.scroll_offset = 0;
         }
@@ -1021,7 +1085,7 @@ pub fn build_screen(
 ) {
     out.clear();
     match state.screen {
-        ScreenId::Idle => build_idle(settings, keys, status, out),
+        ScreenId::Idle => build_idle(state, settings, keys, status, out),
         ScreenId::Menu => build_menu(state, out),
         ScreenId::Scan => build_scan(state, settings, out),
         ScreenId::ChannelSelect => build_channel_select(state, settings, out),
@@ -1039,17 +1103,39 @@ pub fn build_screen(
     }
 }
 
-fn build_idle(settings: &Settings, keys: &KeyStore, status: &LinkStatus, out: &mut WidgetList) {
+fn build_idle(
+    state: &UiState,
+    settings: &Settings,
+    keys: &KeyStore,
+    status: &LinkStatus,
+    out: &mut WidgetList,
+) {
     let _ = keys;
-    out.push(Widget::Title(s("OpenStageRF"))).ok();
-    let link_text = if status.up { s("Link: UP") } else { s("Link: LOST") };
-    out.push(Widget::LinkStatus {
-        row: 1,
-        up: status.up,
-        text: link_text,
-    })
-    .ok();
+    // Title carries the role suffix ("OpenStageRF TX" / "RX") so
+    // the user can tell at a glance which side they're holding.
+    let mut title: String<24> = String::new();
+    let _ = write!(&mut title, "OpenStageRF {}", state.role.label());
+    out.push(Widget::Title(title)).ok();
     let ch = settings.current_channel();
+    // Row 1: link status on RX (watchdog tracks heartbeats);
+    // TX power on TX (the most operationally relevant value to
+    // see at a glance — dialing it down at FOH is common).
+    match state.role {
+        Role::Rx => {
+            let link_text = if status.up { s("Link: UP") } else { s("Link: LOST") };
+            out.push(Widget::LinkStatus {
+                row: 1,
+                up: status.up,
+                text: link_text,
+            })
+            .ok();
+        }
+        Role::Tx => {
+            let mut row1: String<24> = String::new();
+            let _ = write!(&mut row1, "TX +{} dBm", settings.tx_power_dbm);
+            out.push(Widget::Text { row: 1, text: row1 }).ok();
+        }
+    }
     // Plan name + channel label.
     let mut row2: String<24> = String::new();
     let _ = write!(&mut row2, "{} {}", settings.band_plan.info().label, ch.label);
@@ -1058,10 +1144,21 @@ fn build_idle(settings: &Settings, keys: &KeyStore, status: &LinkStatus, out: &m
     let mut row3: String<24> = String::new();
     let _ = write!(&mut row3, "{}", ch.format_frequency());
     out.push(Widget::Text { row: 3, text: row3 }).ok();
-    // TX power.
-    let mut row4: String<24> = String::new();
-    let _ = write!(&mut row4, "TX +{} dBm", settings.tx_power_dbm);
-    out.push(Widget::Text { row: 4, text: row4 }).ok();
+    // Row 4: RSSI on RX (only meaningful here); blank on TX
+    // until we have something else worth showing (battery,
+    // packet rate, etc.).
+    if state.role == Role::Rx {
+        let mut row4: String<24> = String::new();
+        match status.last_rssi_dbm {
+            Some(r) => {
+                let _ = write!(&mut row4, "RSSI {} dBm", r);
+            }
+            None => {
+                let _ = write!(&mut row4, "RSSI --");
+            }
+        }
+        out.push(Widget::Text { row: 4, text: row4 }).ok();
+    }
     out.push(Widget::Footer(s("Center: menu"))).ok();
 }
 
@@ -1399,7 +1496,8 @@ mod tests {
             scroll_offset: 0,
             edit_mode: false,
             edit_buffer: 0,
-            current_menu: &MAIN_MENU,
+            role: Role::Rx,
+            current_menu: &MAIN_MENU_RX,
             nav_stack: Vec::new(),
             scan: ScanState::default(),
         };
@@ -1416,7 +1514,8 @@ mod tests {
             scroll_offset: 0,
             edit_mode: false,
             edit_buffer: 0,
-            current_menu: &MAIN_MENU,
+            role: Role::Rx,
+            current_menu: &MAIN_MENU_RX,
             nav_stack: Vec::new(),
             scan: ScanState::default(),
         };
@@ -1441,7 +1540,8 @@ mod tests {
             scroll_offset: 0,
             edit_mode: false,
             edit_buffer: 0,
-            current_menu: &MAIN_MENU,
+            role: Role::Rx,
+            current_menu: &MAIN_MENU_RX,
             nav_stack: Vec::new(),
             scan: ScanState::default(),
         };
@@ -1529,7 +1629,7 @@ mod tests {
         let keys = KeyStore::new();
         // Navigate to BandPlanSelect — find its row at runtime so
         // this tracks MAIN_MENU edits (e.g. inserting Scan).
-        let band_idx = MAIN_MENU
+        let band_idx = MAIN_MENU_RX
             .items
             .iter()
             .position(|i| matches!(i.action, ItemAction::List(ListKind::BandPlan)))
@@ -1569,7 +1669,8 @@ mod tests {
             scroll_offset: 0,
             edit_mode: false,
             edit_buffer: 0,
-            current_menu: &MAIN_MENU,
+            role: Role::Rx,
+            current_menu: &MAIN_MENU_RX,
             nav_stack: Vec::new(),
             scan: ScanState::default(),
         };
@@ -1637,7 +1738,8 @@ mod tests {
             scroll_offset: 0,
             edit_mode: false,
             edit_buffer: 0,
-            current_menu: &MAIN_MENU,
+            role: Role::Rx,
+            current_menu: &MAIN_MENU_RX,
             nav_stack: Vec::new(),
             scan: ScanState::default(),
         };
@@ -1670,7 +1772,7 @@ mod tests {
         let mut state = UiState::default();
         let mut settings = Settings::default();
         let keys = KeyStore::new();
-        let link_stats_idx = MAIN_MENU
+        let link_stats_idx = MAIN_MENU_RX
             .items
             .iter()
             .position(|i| matches!(i.action, ItemAction::Custom(ScreenId::LinkStats)))
@@ -1692,7 +1794,7 @@ mod tests {
     /// MainMenu row index Scan was on (so callers can verify
     /// Down-back lands there).
     fn enter_scan(state: &mut UiState, settings: &mut Settings, keys: &KeyStore) -> u8 {
-        let scan_idx = MAIN_MENU
+        let scan_idx = MAIN_MENU_RX
             .items
             .iter()
             .position(|i| matches!(i.action, ItemAction::Custom(ScreenId::Scan)))
@@ -1787,6 +1889,60 @@ mod tests {
             state.handle_event(&mut settings, &keys, press(Direction::Left));
         }
         assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn tx_role_uses_tx_menu_no_link_stats() {
+        let state = UiState::with_role(Role::Tx);
+        assert_eq!(state.role, Role::Tx);
+        assert!(core::ptr::eq(state.current_menu, &MAIN_MENU_TX));
+        assert!(MAIN_MENU_TX
+            .items
+            .iter()
+            .any(|i| matches!(i.action, ItemAction::Value(ValueKind::TxPower))));
+        assert!(!MAIN_MENU_TX
+            .items
+            .iter()
+            .any(|i| matches!(i.action, ItemAction::Custom(ScreenId::LinkStats))));
+    }
+
+    #[test]
+    fn rx_role_uses_rx_menu_no_tx_power() {
+        let state = UiState::with_role(Role::Rx);
+        assert_eq!(state.role, Role::Rx);
+        assert!(core::ptr::eq(state.current_menu, &MAIN_MENU_RX));
+        assert!(MAIN_MENU_RX
+            .items
+            .iter()
+            .any(|i| matches!(i.action, ItemAction::Custom(ScreenId::LinkStats))));
+        assert!(!MAIN_MENU_RX
+            .items
+            .iter()
+            .any(|i| matches!(i.action, ItemAction::Value(ValueKind::TxPower))));
+    }
+
+    #[test]
+    fn build_idle_title_includes_role() {
+        let mut widgets: WidgetList = WidgetList::new();
+        let settings = Settings::default();
+        let keys = KeyStore::new();
+        let status = LinkStatus::default();
+
+        let rx = UiState::with_role(Role::Rx);
+        build_screen(&rx, &settings, &keys, &status, &mut widgets);
+        let rx_title = widgets.iter().find_map(|w| match w {
+            Widget::Title(t) => Some(t.as_str()),
+            _ => None,
+        });
+        assert_eq!(rx_title, Some("OpenStageRF RX"));
+
+        let tx = UiState::with_role(Role::Tx);
+        build_screen(&tx, &settings, &keys, &status, &mut widgets);
+        let tx_title = widgets.iter().find_map(|w| match w {
+            Widget::Title(t) => Some(t.as_str()),
+            _ => None,
+        });
+        assert_eq!(tx_title, Some("OpenStageRF TX"));
     }
 
     #[test]

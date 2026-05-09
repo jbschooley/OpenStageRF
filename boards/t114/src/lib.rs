@@ -24,6 +24,8 @@ pub use embedded_hal_bus;
 
 pub mod clocks;
 pub mod display;
+#[cfg(feature = "softdevice")]
+pub mod softdevice;
 #[cfg(feature = "usb-log")]
 pub mod usb_log;
 
@@ -140,9 +142,13 @@ pub mod vext_power {
 }
 
 /// Address of the user-application slot in flash, matching `memory.x`'s
-/// `FLASH ORIGIN`.  Used by [`relocate_vtor()`] and kept here so a single
-/// edit changes both the linker layout and the runtime VTOR write.
-pub const FLASH_ORIGIN: u32 = 0x0000_1000;
+/// `FLASH ORIGIN`.  T114 layout with S140 v7.3.0 puts SD at 0x1000-0x26FFF,
+/// so the app vector table lands at `MBR_SIZE + SD_FLASH_SIZE_v7_3_0 =
+/// 0x1000 + 0x26000 = 0x27000`.  Used by both the linker and the runtime
+/// VTOR write in [`bootloader_handoff()`] — keeping them in lockstep is
+/// what makes a one-line move (e.g. for a future SD version with a
+/// different size) tractable.
+pub const FLASH_ORIGIN: u32 = 0x0002_7000;
 
 /// Relocate `SCB->VTOR` to the start of our flash slot, and stop the
 /// peripherals the Heltec bootloader leaves running on its way out.
@@ -176,7 +182,35 @@ pub const FLASH_ORIGIN: u32 = 0x0000_1000;
 /// blow away any in-flight DMA / timer state, which is fine at boot but
 /// catastrophic if invoked mid-program.
 #[inline(always)]
+#[allow(unreachable_code)] // when `softdevice` feature is on, the function returns early
 pub unsafe fn bootloader_handoff() {
+    // ── SoftDevice path: do nothing here ────────────────────────────────
+    // When the SoftDevice is installed in flash and being used, MBR +
+    // SD's reset handler ran before our pre_init.  They've already:
+    //   - set VTOR to SD's vector table at 0x1000 (so SD's SVC
+    //     dispatcher receives `sd_softdevice_enable` and friends)
+    //   - configured POWER + CLOCK + interrupt routing trampolines
+    //   - claimed RTC0 + TIMER0 + RADIO + EGU0 + SWI1/2 + CCM/AAR/ECB
+    //
+    // Anything we do here that touches VTOR or those peripherals
+    // breaks SD's setup.  In particular, writing VTOR=FLASH_ORIGIN
+    // (correct for SD-less boots) makes the SVC vector point at
+    // cortex-m-rt's default panicking handler, so the next
+    // `sd_softdevice_enable` SVC traps into nowhere — symptom is
+    // the chip hanging mid-`Softdevice::enable()` with no return.
+    // SD reads the app's vector-table address from a known-fixed
+    // location at SD-enable time; we don't have to tell it.
+    #[cfg(feature = "softdevice")]
+    return;
+
+    // ── SD-less path: full bootloader-handoff cleanup ───────────────────
+    // The bootloader's UF2 flow leaves several peripherals running and
+    // VTOR pointing at MBR.  Without SD intercepting interrupts, we
+    // need to relocate VTOR ourselves and clean the slate.
+
+    // VTOR relocation.
+    (*cortex_m::peripheral::SCB::PTR).vtor.write(FLASH_ORIGIN);
+
     // 1. Disable + clear-pending every NVIC source the bootloader may have
     //    armed.  ICER/ICPR are 8 × u32 at 0xE000_E180 / 0xE000_E280; writing
     //    1s to a bit clears it.  We deliberately do NOT touch PRIMASK —
@@ -253,6 +287,40 @@ pub unsafe fn bootloader_handoff() {
     for psel_offset in [0x544u32, 0x548, 0x560, 0x564, 0x568, 0x56C] {
         let reg = (0x4002_9000 + psel_offset) as *mut u32;
         core::ptr::write_volatile(reg, 0xFFFF_FFFF);
+    }
+
+    // 9. Constant-latency mode.  POWER.TASKS_CONSTLAT = 1 keeps
+    //    HFCLK + sub-power-domains running even when the executor
+    //    parks in `wfe()` between awaits.  Cheap insurance against
+    //    sleep-related peripheral glitches; doesn't fix the SPIM
+    //    issue addressed below but is the correct base posture.
+    core::ptr::write_volatile(0x4000_0078 as *mut u32, 1); // TASKS_CONSTLAT
+
+    // 10. Tear down all SPIM peripherals.  The Heltec bootloader
+    //     drives the display via SPIM2 (matching the Adafruit
+    //     nRF52 BSP's `SPI1` object), and on hand-off it leaves
+    //     the peripheral enabled with PSEL.SCK/MOSI/MISO bound to
+    //     the display pins.  embassy-nrf's `Spim::new` writes a
+    //     fresh config but doesn't fully reset every register
+    //     ahead of that, and on a strict-batch ST7789 LCM the
+    //     residual state survives into our first SPI burst —
+    //     symptom: display works fine when probe-rs flashes
+    //     (its halt → load → release-reset sweeps every
+    //     peripheral via SWD reset) but black on UF2 + USB power
+    //     because UF2 just jumps to the app vector table without
+    //     resetting peripherals.
+    //
+    //     For each SPIM[0..3]: ENABLE = 0, then disconnect SCK /
+    //     MOSI / MISO PSELs (write 0xFFFF_FFFF — bit 31 = CONNECT,
+    //     1 = disconnected).  CSN is only on SPIM2/SPIM3 and
+    //     embassy-nrf doesn't use hardware CS anyway, but disconnect
+    //     for completeness.
+    for &base in &[0x4000_3000u32, 0x4000_4000, 0x4002_3000, 0x4002_F000] {
+        core::ptr::write_volatile((base + 0x500) as *mut u32, 0); // ENABLE
+        core::ptr::write_volatile((base + 0x524) as *mut u32, 0xFFFF_FFFF); // PSEL.SCK
+        core::ptr::write_volatile((base + 0x528) as *mut u32, 0xFFFF_FFFF); // PSEL.MOSI
+        core::ptr::write_volatile((base + 0x52C) as *mut u32, 0xFFFF_FFFF); // PSEL.MISO
+        core::ptr::write_volatile((base + 0x540) as *mut u32, 0xFFFF_FFFF); // PSEL.CSN
     }
 }
 
@@ -474,21 +542,25 @@ fn build_resources(
     // ── Display: ST7789 240×135 TFT on TWISPI1 ──────────────────────────────
     // Pin assignments per Heltec's official Heltec_nRF52 BSP variant.h
     // (HT-n5262):
-    //   SCK   = P1_08
-    //   MOSI  = P1_09
-    //   CS    = P0_11
-    //   DC    = P0_12
-    //   RESET = P0_02
-    //   VEXT_CTL  = P0_21  — gates the external 3.3 V rail that powers
-    //                        the TFT panel.  ACTIVE HIGH.
+    //   SCK       = P1_08
+    //   MOSI      = P1_09
+    //   CS        = P0_11
+    //   DC        = P0_12
+    //   RESET     = P0_02
+    //   VTFT_CTRL = P0_03  — gates the TFT VDD rail.  ACTIVE LOW
+    //                        (drive LOW to enable LCM power).
+    //   VEXT      = P0_21  — gates the GPS / peripheral 3.3 V rail.
+    //                        Active HIGH.  *Not* the TFT power gate
+    //                        despite a previous (wrong) comment in
+    //                        this file claiming it was.  Empirically
+    //                        confirmed by Meshtastic + MeshCore source
+    //                        ([heltec_mesh_node_t114/variant.h] in
+    //                        both projects), and by the symptom an
+    //                        SD-aware OpenStageRF firmware spent a day
+    //                        debugging — display only worked when an
+    //                        SWD probe's 3.3 V wire back-fed the LCM
+    //                        rail through P0_03's leakage path.
     //   Backlight = P0_15  — TFT_LEDA_CTL.  ACTIVE LOW.
-    //
-    // Earlier comments in this file referenced a separate "VTFT_CTRL"
-    // on P0_03, but Heltec's authoritative BSP for the v2.0 hardware
-    // doesn't have such a pin — the TFT is powered through VEXT (the
-    // same rail that feeds the external sensor connector).  Empirical:
-    // driving P0_03 alone leaves the panel dark; driving P0_21 high
-    // brings it up.
     //
     // Hand-rolled driver in `display.rs`; replaces the prior mipidsi
     // path which hung during init on this hardware.  Build SPIM1 in
@@ -547,12 +619,21 @@ fn build_resources(
     let display_cs = Output::new(p.P0_11, Level::High, OutputDrive::HighDrive);
     let display_dc = Output::new(p.P0_12, Level::Low, OutputDrive::HighDrive);
     let display_reset = Output::new(p.P0_02, Level::High, OutputDrive::HighDrive);
-    // VEXT_CTL (P0_21) — gates the external 3.3 V rail that powers
-    // the TFT panel.  Active HIGH per Heltec BSP.  Leak the pin —
-    // we never need to manipulate it again under normal operation.
-    let vext = Output::new(p.P0_21, Level::High, OutputDrive::Standard);
-    core::mem::forget(vext);
-    let display = display::St7789Display::new(display_spi, display_cs, display_dc, display_reset);
+    // VTFT_CTRL (P0_03) — gates the TFT VDD rail.  ACTIVE LOW: drive
+    // LOW to enable LCM power, HIGH to disable.  Owned by Display so
+    // `init()` can apply the rail + the post-rail-up settling delay
+    // before any SPI traffic, matching what Meshtastic / MeshCore do.
+    let vtft = Output::new(p.P0_03, Level::High, OutputDrive::Standard);
+    let display =
+        display::St7789Display::new(display_spi, display_cs, display_dc, display_reset, vtft);
+    // VEXT (P0_21) — peripheral / GPS rail, active HIGH.  *Not* the
+    // TFT power gate (a previous comment in this file claimed it was;
+    // that was wrong — see comments above and BOOTLOADER_UPGRADE.md
+    // for the diagnostic story).  Raised here and leaked so the GPS
+    // and any external sensors stay powered; OpenStageRF doesn't use
+    // them yet but profiles that do (future) will need this on.
+    let vext_peripheral = Output::new(p.P0_21, Level::High, OutputDrive::Standard);
+    core::mem::forget(vext_peripheral);
     // Backlight: active LOW per the panel's wiring (Meshtastic
     // variant.h: TFT_BACKLIGHT_ON LOW).  Init HIGH so the backlight
     // is OFF at boot — UI code drives it low after the first clear.
