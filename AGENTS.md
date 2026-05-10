@@ -195,6 +195,31 @@ App-side IRQs run at priority **P2** (SD reserves P0/P1/P4).  See `boards/t114/s
 - **Recent log files** (`link_rxNN.log`) — captured RTT output from real hardware runs.  Useful for grounding any claim about RX/TX behaviour in actual measurements rather than guesses.
 - **Memory entries** (under `~/.claude/projects/.../memory/`, if you have auto-memory configured) — durable facts about user preferences, prior debugging incidents, and architectural rationale that aren't captured in code or commit messages.
 
+## Task topology (UI profile)
+
+The `t114_ui` profile splits work across multiple embassy tasks on two executors:
+
+| Task                  | Executor              | Priority | What it owns                                         |
+|-----------------------|-----------------------|----------|-------------------------------------------------------|
+| `softdevice::run`     | thread (main)         | (SD)     | SD event dispatch                                     |
+| `joystick_task`       | thread (main)         | low      | 5-way joystick → `EVENT_CHAN`                         |
+| `ui_render_task`      | thread (main)         | low      | display + framebuffer + renderer; awaits `FRAME`      |
+| **main task**         | thread (main)         | low      | UI state machine; produces frames + scan/cfg signals  |
+| `link_*_task` (1 of 3)| `EXECUTOR_LINK`       | **P2**   | radio + status LED + sink/source                      |
+
+`link_runtime_task` runs on an `InterruptExecutor` bound to `EGU0_SWI0` at priority P2 so radio IRQ work pre-empts UI work.  SoftDevice owns P0/P1/P4; the app uses P2/P3/P5/P6/P7.
+
+Shared statics (in `profiles/t114_ui/src/lib.rs`):
+- `STATS: LinkStatsCell` — link counters published to UI.
+- `CONFIG_UPDATES: LinkConfigSignal` — UI live-applies channel/power changes.
+- `SCAN: ScanController` — UI enables/disables scan mode and reads results.
+- `EVENT_CHAN: Channel<JoystickEvent, 8>` — joystick → UI.
+- `FRAME: Signal<FrameData>` — ui_state → ui_render handoff.  Latest-wins:
+  if a render is in flight when a newer frame signals, the older one is
+  discarded.
+
+The other profiles (`t114_link_rx`, `t114_link_tx`, `t114_midi_node_*`) use the simpler joined-task design (no UI) and don't need the interrupt executor.
+
 ## Things that look weird but are intentional
 
 - **`static mut FRAMEBUFFER: Framebuffer = Framebuffer::new();`** in `profiles/t114_ui/src/lib.rs` — 64 KB BSS allocation accessed via `addr_of_mut!`.  This is the correct pattern for placing a large const-initialised struct in BSS without needing `static_cell` and without putting it on the stack.
