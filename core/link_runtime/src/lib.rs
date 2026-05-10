@@ -35,7 +35,8 @@ use osrf_link::{
     PoppedPacket, PressedNotes, QueueKind, RxDrop, RxEvent, WatchdogTimer, MAX_BODY_LEN,
 };
 use osrf_radio_sx126x::{
-    GfskBandwidth, GfskPulseShape, RadioError, RfSwitchControl, Sx1262Radio,
+    Error as RadioErrorKind, GfskBandwidth, GfskPulseShape, RadioError, RfSwitchControl,
+    Sx1262Radio,
 };
 
 // ── Runtime config ──────────────────────────────────────────────────────────
@@ -344,6 +345,29 @@ impl Default for ScanController {
     }
 }
 
+/// Drop an inter-arrival gap into the right histogram bucket.
+/// Bucket edges (in ms): `<2`, `<12`, `<25`, `<50`, `<100`, `<250`,
+/// `≥250`.  See the `RX prof:` log line in [`run_rx`] for how to
+/// read the resulting numbers.
+fn bucket_rx_gap(buckets: &mut [u32; 7], gap_ms: u64) {
+    let idx = if gap_ms < 2 {
+        0
+    } else if gap_ms < 12 {
+        1
+    } else if gap_ms < 25 {
+        2
+    } else if gap_ms < 50 {
+        3
+    } else if gap_ms < 100 {
+        4
+    } else if gap_ms < 250 {
+        5
+    } else {
+        6
+    };
+    buckets[idx] = buckets[idx].wrapping_add(1);
+}
+
 /// Sample one scan channel: retune, settle, take
 /// [`SCAN_SAMPLES_PER_CHANNEL`] RSSI readings spaced
 /// [`SCAN_SAMPLE_INTERVAL_MS`] apart, return the peak (least-
@@ -561,6 +585,13 @@ where
         )
         .await?;
     radio.set_tx_power(config.tx_power_dbm).await?;
+    // Enable RX boosted mode — ~3 dB sensitivity gain at the cost
+    // of ~0.9 mA extra in continuous-RX supply current.  For this
+    // project the receiver is always-on while listening, so the
+    // sensitivity-vs-battery trade is dominated by sensitivity.
+    // Boost survives standby transitions but is wiped on `SLEEP`;
+    // we never enter SLEEP, so applying it once here is sufficient.
+    radio.set_rx_boosted(true).await?;
     radio.finish_init().await?;
     Ok(())
 }
@@ -1073,6 +1104,38 @@ where
     // until we've seen two consecutive windows.
     let mut last_loss_pct: Option<u8> = None;
 
+    // ── RX profile counters ──────────────────────────────────────
+    //
+    // Goal: distinguish the *flavour* of packet loss when it
+    // happens.  A CRC error is a different beast from an
+    // `UnexpectedIrq` (chip in a state we didn't expect — usually
+    // a sign that an IRQ got serviced late and we're reading a
+    // stale status), and both are different from an inter-packet
+    // gap that's much longer than the configured TX cadence
+    // (preemption / lost-but-no-error).
+    //
+    // Per-error-variant counts plus an inter-arrival-gap
+    // histogram are dumped alongside the existing 1 s stats line.
+    let mut err_crc_mismatch: u32 = 0;
+    let mut err_unexpected_irq: u32 = 0;
+    let mut err_spi: u32 = 0;
+    let mut err_bus: u32 = 0;
+    let mut err_other: u32 = 0;
+    // Last `Either4::First(Ok(_))` arrival — used to compute the
+    // inter-arrival gap.  Initialised to `now` at boot so the very
+    // first received packet doesn't show as a 100 s gap.
+    let mut last_rx_at = Instant::now();
+    // Histogram buckets for inter-arrival gaps (in ms).  Bucket
+    // edges chosen for visibility into the regimes we care about:
+    //   < 2 ms      : burst / back-to-back packets
+    //   < 12 ms     : one heartbeat interval (default 10 ms + slack)
+    //   < 25 ms     : ~2 heartbeats — first sign of trouble
+    //   < 50 ms     : noticeable jitter
+    //   < 100 ms    : significant SD-style preemption
+    //   < 250 ms    : RX-FIFO-overrun territory
+    //   ≥ 250 ms    : link is effectively interrupted
+    let mut rx_gap_buckets: [u32; 7] = [0; 7];
+
     // Local mirror of `scan.enabled()`.  Tracks whether *we* (the
     // runtime) currently have the chip in scan mode (standby +
     // per-channel sweep) versus normal continuous RX.  Reconciled
@@ -1213,6 +1276,12 @@ where
         .await
         {
             Either4::First(Ok(pkt)) if pkt.crc_ok => {
+                let arrived = Instant::now();
+                bucket_rx_gap(
+                    &mut rx_gap_buckets,
+                    arrived.duration_since(last_rx_at).as_millis(),
+                );
+                last_rx_at = arrived;
                 wd.kick();
                 let was_down = !link_up;
                 link_up = true;
@@ -1364,13 +1433,62 @@ where
                 }
             }
             Either4::First(Ok(_)) => {
+                // Chip set both `rx_done` and `crc_err` in the IRQ
+                // bitmap — a complete frame arrived but failed CRC.
+                // Counted in the existing `crc_mismatch` field so
+                // `recent_loss_pct` doesn't double-count it as
+                // "lost without trace."
                 crc_mismatch = crc_mismatch.wrapping_add(1);
                 if crc_mismatch % 50 == 0 {
                     defmt::warn!("RX: CRC mismatch count = {}", crc_mismatch);
                 }
             }
-            Either4::First(Err(_)) => {
-                defmt::warn!("RX: radio error");
+            Either4::First(Err(e)) => {
+                // Bucket by variant — different fingerprints suggest
+                // different root causes.  Throttle the per-variant
+                // log lines so a sustained error stream doesn't
+                // flood the RTT buffer.
+                match e {
+                    RadioErrorKind::CrcMismatch => {
+                        err_crc_mismatch = err_crc_mismatch.wrapping_add(1);
+                        if err_crc_mismatch % 50 == 0 {
+                            defmt::warn!(
+                                "RX: early-CRC-fail count = {}",
+                                err_crc_mismatch
+                            );
+                        }
+                    }
+                    RadioErrorKind::UnexpectedIrq(irq) => {
+                        err_unexpected_irq = err_unexpected_irq.wrapping_add(1);
+                        if err_unexpected_irq <= 5 || err_unexpected_irq % 20 == 0 {
+                            defmt::warn!(
+                                "RX: unexpected IRQ {=u16:#06x} (count {})",
+                                irq,
+                                err_unexpected_irq
+                            );
+                        }
+                    }
+                    RadioErrorKind::Spi => {
+                        err_spi = err_spi.wrapping_add(1);
+                        defmt::warn!("RX: SPI error (count {})", err_spi);
+                    }
+                    RadioErrorKind::Bus => {
+                        err_bus = err_bus.wrapping_add(1);
+                        defmt::warn!("RX: bus / pin-wait error (count {})", err_bus);
+                    }
+                    _ => {
+                        // Reset / Switch / PayloadTooLarge /
+                        // BufferTooSmall / InvalidSyncWord / Timeout.
+                        // These shouldn't fire on a healthy RX path
+                        // — `Reset`/`Switch` have generic payloads
+                        // that don't impl `defmt::Format` so we
+                        // can't print the variant directly.  The
+                        // count alone is enough to flag "something
+                        // unusual is going wrong; investigate."
+                        err_other = err_other.wrapping_add(1);
+                        defmt::warn!("RX: other radio error variant (count {})", err_other);
+                    }
+                }
             }
             Either4::Second(()) => {
                 if link_up {
@@ -1469,6 +1587,36 @@ where
                 dropped,
                 crc_mismatch,
             );
+            // RX profile dump — inter-arrival gap histogram and
+            // per-variant error counts.  Three buckets matter most
+            // for diagnosis:
+            //   `<2`  large = fine (burst MIDI, healthy link)
+            //   `<12` is the heartbeat-cadence happy path
+            //   `<25..<250` are jitter regimes
+            //   `>=250` means we're missing entire heartbeats
+            // `early-CRC` vs `unexpected-IRQ` distinguishes RF
+            // problems from chip-state-management problems.
+            defmt::info!(
+                "RX prof: gap_ms <2={} <12={} <25={} <50={} <100={} <250={} >=250={} | err crc={} crc-early={} unex-irq={} spi={} bus={} other={}",
+                rx_gap_buckets[0],
+                rx_gap_buckets[1],
+                rx_gap_buckets[2],
+                rx_gap_buckets[3],
+                rx_gap_buckets[4],
+                rx_gap_buckets[5],
+                rx_gap_buckets[6],
+                crc_mismatch,
+                err_crc_mismatch,
+                err_unexpected_irq,
+                err_spi,
+                err_bus,
+                err_other,
+            );
+            // Reset histogram each window so we see *current*
+            // jitter, not a smear of all history.  Error counters
+            // accumulate so trends are visible.
+            rx_gap_buckets = [0; 7];
+
             prev_midi = accepted_midi;
             prev_hb = accepted_heartbeats;
             prev_accepted = accepted;
