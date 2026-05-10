@@ -1621,6 +1621,7 @@ dependencies = [
  "embassy-sync 0.8.0",
  "embassy-time",
  "embedded-graphics-core",
+ "osrf-app-link-bench",
  "osrf-app-midi-node",
  "osrf-board-t114",
  "osrf-driver-input-joystick5way",

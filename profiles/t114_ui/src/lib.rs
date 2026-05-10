@@ -28,6 +28,7 @@ use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
+use osrf_app_link_bench::synthetic::ScenarioSource;
 use osrf_app_midi_node::{run_rx, run_tx, LinkConfig, UartMidiSink, UartMidiSource};
 use osrf_board_t114 as board;
 use osrf_driver_input_joystick5way::{Joystick5Way, JoystickEvent};
@@ -86,11 +87,24 @@ static SCAN: ScanController = ScanController::new();
 /// at startup.
 static mut FRAMEBUFFER: Framebuffer = Framebuffer::new();
 
+/// Which `MidiSource` flavour the TX-role build should drive
+/// the runtime with.  `Uart` reads real DIN MIDI from the
+/// FeatherWing UART (production path).  `Scenario` runs the
+/// synthetic burst-pattern source from `osrf-app-link-bench` —
+/// used by the `ui_bench_tx` binary to stress-test the link with
+/// the UI active so we can confirm the UI doesn't disturb burst
+/// handling.  Ignored for `Role::Rx`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxSource {
+    Uart,
+    Scenario,
+}
+
 /// Bring up display + joystick + UI state machine for the given
 /// link [`Role`] and run the main loop forever.  Called from each
 /// binary's `#[embassy_executor::main]` after the `pre_init`
 /// bootloader hand-off.
-pub async fn run(spawner: Spawner, role: Role) -> ! {
+pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     defmt::info!("ui (T114, {:?}): bringing up SD + display + joystick + link", role);
 
     // Order: `embassy_nrf::init()` (inside `board::resources()`)
@@ -197,30 +211,67 @@ pub async fn run(spawner: Spawner, role: Role) -> ! {
             // replace this with a flash-persisted counter.
             let boot_counter = read_random_u16();
             defmt::info!("boot_counter = {} (random per-boot)", boot_counter);
-            let mut source = UartMidiSource::new(r.midi_uart);
-            join(
-                ui_loop(
-                    &mut display,
-                    &mut backlight,
-                    fb,
-                    &mut state,
-                    &mut settings,
-                    &keys,
-                    &mut widgets,
-                    &mut renderer,
-                ),
-                run_tx(
-                    &mut r.radio0,
-                    &mut r.status_led,
-                    &mut source,
-                    boot_counter,
-                    &config,
-                    &STATS,
-                    Some(&CONFIG_UPDATES),
-                    Some(&SCAN),
-                ),
-            )
-            .await;
+            match tx_source {
+                TxSource::Uart => {
+                    let mut source = UartMidiSource::new(r.midi_uart);
+                    join(
+                        ui_loop(
+                            &mut display,
+                            &mut backlight,
+                            fb,
+                            &mut state,
+                            &mut settings,
+                            &keys,
+                            &mut widgets,
+                            &mut renderer,
+                        ),
+                        run_tx(
+                            &mut r.radio0,
+                            &mut r.status_led,
+                            &mut source,
+                            boot_counter,
+                            &config,
+                            &STATS,
+                            Some(&CONFIG_UPDATES),
+                            Some(&SCAN),
+                        ),
+                    )
+                    .await;
+                }
+                TxSource::Scenario => {
+                    // Synthetic burst-pattern source — cycles through
+                    // scale / chord / glissando / key-smash / quick-
+                    // stabs / pitch-wheel / mod-wheel scenarios.
+                    // r.midi_uart is unused on this path; let it
+                    // drop with the rest of `r` after the loop, since
+                    // the loop never returns we never actually drop.
+                    let mut source = ScenarioSource::new();
+                    defmt::info!("ui_bench_tx: synthetic scenario source running");
+                    join(
+                        ui_loop(
+                            &mut display,
+                            &mut backlight,
+                            fb,
+                            &mut state,
+                            &mut settings,
+                            &keys,
+                            &mut widgets,
+                            &mut renderer,
+                        ),
+                        run_tx(
+                            &mut r.radio0,
+                            &mut r.status_led,
+                            &mut source,
+                            boot_counter,
+                            &config,
+                            &STATS,
+                            Some(&CONFIG_UPDATES),
+                            Some(&SCAN),
+                        ),
+                    )
+                    .await;
+                }
+            }
         }
     }
     // Both halves of `join` return `!`, so we never get here.

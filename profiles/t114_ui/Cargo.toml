@@ -13,6 +13,7 @@ osrf-board-t114                = { workspace = true, features = ["defmt"] }
 osrf-driver-input-joystick5way = { workspace = true, features = ["defmt"] }
 osrf-ui                        = { workspace = true, features = ["defmt"] }
 osrf-app-midi-node             = { workspace = true }
+osrf-app-link-bench            = { workspace = true }
 osrf-link-runtime              = { workspace = true }
 
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
@@ -42,5 +43,11 @@ bench = false
 [[bin]]
 name  = "ui_tx"
 path  = "src/bin/ui_tx.rs"
+test  = false
+bench = false
+
+[[bin]]
+name  = "ui_bench_tx"
+path  = "src/bin/ui_bench_tx.rs"
 test  = false
 bench = false
