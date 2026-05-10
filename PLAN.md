@@ -357,15 +357,27 @@ add-on) is deferred until DX-LR30 returns to the active path; the UI core is
       matches the receiver's post-watchdog cleared state).  `apply_scan_pass`
       skips `SCAN_NO_DATA` slots so a partially-populated pass doesn't clobber
       previous readings.
-- [ ] **Embassy task split**.  Today everything runs joined into one task (`ui_loop` +
-      `run_rx`/`run_tx` via `embassy_futures::join`).  Originally motivated as a fix
-      for UI-induced packet loss, but the async-SPI refactor solved that directly —
-      loss is ~0 % under sustained UI activity now.  Splitting into `ui_render`
-      (low priority, 30 Hz cap) + `ui_input` (event-driven, edge-wake) +
-      `ui_state` / link-runtime (high priority) is still defensible for cleaner
-      separation of concerns and isolation of any future scan-mode latency on
-      input responsiveness, but no longer urgent.  Likely deferred unless
-      profiling shows render jitter actually matters in practice.
+- [x] **Embassy task split**.  Originally motivated as a fix for UI-induced packet
+      loss; that turned out to be solved by the async-SPI refactor alone.  Done
+      anyway as architectural groundwork for future audio (which requires
+      preemption to avoid buffer underruns), concurrent BLE telemetry during live
+      MIDI, encryption (modest benefit), and dual-core migration (free if tasks
+      already split).  Layout:
+      - `link_runtime_task` (run_rx / run_tx / scenarios — three concrete task
+        fns) on an `InterruptExecutor` bound to `EGU0_SWI0` at priority P2.
+        Preempts everything app-side when a radio IRQ lands.
+      - `ui_render_task` on the thread executor — owns display + framebuffer +
+        renderer, awaits a `Signal<FrameData>` from ui_state.
+      - Main task body = `ui_state_loop` (state machine, scan reconcile, auto-
+        off policy, frame production).  Pushes frames to ui_render via the
+        signal.
+      - `joystick_task` and `softdevice::run` as before on the thread executor.
+      Shared state already in place (`STATS`, `CONFIG_UPDATES`, `SCAN`,
+      `EVENT_CHAN`); added `FRAME: Signal<FrameData>` for ui_state→ui_render
+      handoff (latest-wins; render-in-flight discards intermediate frames).
+      RAM cost: BSS grew ~31 KB for the new task storage + Signal slots; total
+      now ~161 KB / 244 KB available.  Loss numbers unchanged from joined-task
+      design (already at ~0 %).
 
 **Exit criteria:** all screens render, joystick navigates correctly, channel/band/power changes
 apply live (without reboot), scan reports per-channel RSSI for the active band plan, packet loss

@@ -2,8 +2,9 @@
 #![no_std]
 
 //! Milestone 6 UI smoke test, T114 deployment.  Shared between
-//! the [`ui_tx`](../bin/ui_tx.rs) and [`ui_rx`](../bin/ui_rx.rs)
-//! binaries — each picks a [`Role`] and calls [`run`].
+//! the [`ui_tx`](../bin/ui_tx.rs), [`ui_rx`](../bin/ui_rx.rs),
+//! and [`ui_bench_tx`](../bin/ui_bench_tx.rs) binaries — each
+//! picks a [`Role`] / [`TxSource`] and calls [`run`].
 //!
 //! Brings up:
 //!   - ST7789 TFT (board crate's hand-rolled driver)
@@ -14,19 +15,34 @@
 //!   - Edge-wake joystick driver from `osrf-driver-input-joystick5way`.
 //!   - `osrf-ui` state machine + renderer.
 //!
-//! Two cooperating tasks:
-//!   - `joystick_task` waits for joystick events and feeds them
-//!     into a [`Channel`].
-//!   - The main task awaits the channel, runs `UiState::handle_event`,
-//!     re-renders, and logs any `Command` for debugging (no live
-//!     link wiring yet — that lands when we plumb a config-update
-//!     signal into `osrf-link-runtime`).
+//! # Task topology
+//!
+//! As of M6's task split, the work is decomposed across four async
+//! tasks plus the SoftDevice run task:
+//!
+//! | Task            | Executor            | Priority | Responsibilities                                |
+//! |-----------------|---------------------|----------|--------------------------------------------------|
+//! | `softdevice run`| thread (main)       | (SD)     | SD event dispatch                               |
+//! | `joystick`      | thread (main)       | low      | Edge-wake joystick → [`EVENT_CHAN`]              |
+//! | `ui_render`     | thread (main)       | low      | Renderer + framebuffer flush, awaits [`FRAME`]   |
+//! | **main** task   | thread (main)       | low      | UI state machine; produces frames + scan/cfg signals |
+//! | `link_runtime`  | interrupt executor  | **P2**   | Radio TX/RX, scan, live config                  |
+//!
+//! The interrupt executor is bound to `SWI0_EGU0` at priority P2 so
+//! `link_runtime` preempts everything else app-side when a radio IRQ
+//! lands.  SD's own P0/P1 interrupts preempt all of the above (we
+//! don't fight that).  See [the task split rationale in PLAN.md] for
+//! why we did this even though packet loss already measured 0 % under
+//! the joined-task design — short version: groundwork for future
+//! audio + dual-core + concurrent BLE.
+//!
+//! [the task split rationale in PLAN.md]: ../../../PLAN.md
 
-use embassy_executor::Spawner;
-use embassy_futures::join::join;
+use embassy_executor::{InterruptExecutor, Spawner};
 use embassy_futures::select::{select, Either};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer};
 use osrf_app_link_bench::synthetic::ScenarioSource;
 use osrf_app_midi_node::{run_rx, run_tx, LinkConfig, UartMidiSink, UartMidiSource};
@@ -35,10 +51,11 @@ use osrf_driver_input_joystick5way::{Joystick5Way, JoystickEvent};
 use osrf_link_runtime::{LinkConfigSignal, LinkStatsCell, ScanController};
 use osrf_ui::{
     band_plan_channel, build_screen, max_channel_index, BandPlan, Command, KeyStore, LinkStatus,
-    Renderer, Role, ScreenId, Settings, UiState, WidgetList, MAX_SCAN_CHANNELS,
+    Renderer, Role, ScanState, ScreenId, Settings, UiState, WidgetList, MAX_SCAN_CHANNELS,
 };
 
 use board::embassy_nrf::gpio::{Input, Output, Pull};
+use board::embassy_nrf::interrupt::{self, InterruptExt, Priority};
 use board::framebuffer::Framebuffer;
 
 /// Joystick pin types per `boards/t114/src/lib.rs::joystick`.
@@ -50,82 +67,126 @@ type Joystick = Joystick5Way<
     Input<'static>,
 >;
 
-/// Input event channel — joystick task pushes, main task pops.
-/// Capacity 8: more than enough for human input rates.
+// ── Shared statics ──────────────────────────────────────────────
+
+/// Input event channel — joystick task pushes, ui_state (main task) pops.
 static EVENT_CHAN: Channel<CriticalSectionRawMutex, JoystickEvent, 8> = Channel::new();
 
 /// Cross-task shared link-runtime stats.  `run_rx` / `run_tx` write
-/// counters + RSSI + link-up here on every loop iteration; the UI
-/// loop snapshots the latest values each render and turns them into
-/// a `LinkStatus` for the Idle / Link Stats screens.
+/// counters + RSSI + link-up here on every loop iteration; the ui_state
+/// task snapshots the latest values each frame build and translates
+/// them into a `LinkStatus` for the Idle / Link Stats screens.
 static STATS: LinkStatsCell = LinkStatsCell::new();
 
-/// Live config-update channel from UI → link runtime.  When the user
-/// applies a new channel / band plan / TX power, `ui_loop` rebuilds a
-/// `LinkConfig` and signals here; the runtime's `select` arm wakes,
+/// Live config-update channel from ui_state → link_runtime.  When the
+/// user applies a new channel / band plan / TX power, ui_state rebuilds
+/// a `LinkConfig` and signals here; the runtime's `select` arm wakes,
 /// re-runs `configure_radio`, and resumes (re-`rx_start` for RX).
 /// Latest-wins, so two rapid changes collapse to the most recent.
 static CONFIG_UPDATES: LinkConfigSignal = LinkConfigSignal::new();
 
-/// Channel-scan handoff between UI and runtime.  When the user enters
-/// the Scan screen, `ui_loop` calls `start()` with the current band
-/// plan's frequency list; the runtime's `run_rx` walks the list,
-/// sampling RSSI per channel.  Each render tick the UI snapshots the
-/// results into `state.scan` via `apply_scan_pass`.  Stop on Scan-
-/// screen exit so the link comes back up.  TX side ignores this
-/// (heartbeats keep flowing on the operating channel).
-
+/// Channel-scan handoff between ui_state and link_runtime.  When the
+/// user enters the Scan screen, ui_state calls `start()` with the
+/// current band plan's frequency list; the runtime walks the list,
+/// sampling RSSI per channel.  Each render tick the ui_state task
+/// snapshots the results into `state.scan` via `apply_scan_pass`.
 static SCAN: ScanController = ScanController::new();
 
+/// "Render this frame" handoff from ui_state → ui_render.  ui_state
+/// builds a fresh [`WidgetList`] from the UI state machine, snapshots
+/// the [`ScanState`] alongside it, and signals.  ui_render awaits
+/// here; latest-wins, so a render in flight when a newer frame
+/// signals means the older frame is dropped (which is what we want —
+/// always show the most recent state).
+static FRAME: Signal<CriticalSectionRawMutex, FrameData> = Signal::new();
+
+/// Snapshot of UI state needed for one render.  ScanState is copied
+/// (not referenced) because the ui_render task runs on a different
+/// executor and can't hold a reference into ui_state's locals.
+#[derive(Clone)]
+struct FrameData {
+    widgets: WidgetList,
+    scan: ScanState,
+}
+
 /// 64 KB in-RAM framebuffer the renderer paints into (sync via
-/// `DrawTarget`).  After each render we hand it to
-/// `board::Display::flush(...).await`, which streams the dirty box to
-/// the panel via async SPI — yielding the executor between DMA bursts
-/// so `run_rx` can keep up with the SX1262 RX FIFO.  Single-instance,
-/// owned by `run()`; `static mut` because `Framebuffer::new()` is
-/// `const fn` so the array goes in BSS rather than blowing the stack
-/// at startup.
+/// `DrawTarget`).  ui_render owns it after the initial paint; it lives
+/// in BSS because `Framebuffer::new()` is `const fn`, avoiding a
+/// stack-allocated 64 KB which would blow embassy's task pool.
 static mut FRAMEBUFFER: Framebuffer = Framebuffer::new();
 
-/// Which `MidiSource` flavour the TX-role build should drive
-/// the runtime with.  `Uart` reads real DIN MIDI from the
-/// FeatherWing UART (production path).  `Scenario` runs the
-/// synthetic burst-pattern source from `osrf-app-link-bench` —
-/// used by the `ui_bench_tx` binary to stress-test the link with
-/// the UI active so we can confirm the UI doesn't disturb burst
-/// handling.  Ignored for `Role::Rx`.
+/// Interrupt-driven executor running the `link_runtime` task at the
+/// highest app-allowed priority (P2 — P0/P1/P4 are reserved by the
+/// SoftDevice).  Bound to `SWI0_EGU0`; the radio's GPIOTE / SPIM
+/// interrupts wake the task through their wakers regardless of
+/// executor, but with `link_runtime` here the actual work runs at
+/// P2 instead of cooperating with UI rendering on the main task.
+static EXECUTOR_LINK: InterruptExecutor = InterruptExecutor::new();
+
+#[cortex_m_rt::interrupt]
+#[allow(non_snake_case)]
+unsafe fn EGU0_SWI0() {
+    EXECUTOR_LINK.on_interrupt()
+}
+
+// ── Public API ──────────────────────────────────────────────────
+
+/// Which `MidiSource` flavour the TX-role build should drive the
+/// runtime with.  `Uart` reads real DIN MIDI from the FeatherWing
+/// UART (production path).  `Scenario` runs the synthetic burst-
+/// pattern source from `osrf-app-link-bench` — used by the
+/// `ui_bench_tx` binary to stress-test the link with the UI active.
+/// Ignored for `Role::Rx`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxSource {
     Uart,
     Scenario,
 }
 
-/// Bring up display + joystick + UI state machine for the given
-/// link [`Role`] and run the main loop forever.  Called from each
-/// binary's `#[embassy_executor::main]` after the `pre_init`
-/// bootloader hand-off.
+/// Bring up the board, spawn all tasks, run the UI state machine
+/// forever.  Called from each binary's `#[embassy_executor::main]`.
 pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
-    defmt::info!("ui (T114, {:?}): bringing up SD + display + joystick + link", role);
+    defmt::info!(
+        "ui (T114, {:?}): bringing up SD + display + joystick + link",
+        role
+    );
 
     // Order: `embassy_nrf::init()` (inside `board::resources()`)
     // **must** come before `Softdevice::enable()` — SD claims CLOCK +
     // POWER on activation; embassy can no longer configure those
-    // afterwards.  See `boards/t114/src/softdevice.rs` module docs
-    // for the full SD setup contract.
-    let mut r = board::resources();
+    // afterwards.
+    let r = board::resources();
     let sd = board::softdevice::enable();
     spawner.spawn(board::softdevice::run(sd).expect("alloc softdevice run task"));
 
-    // ── Display ─────────────────────────────────────────────────────────────
+    // ── Display init + initial paint (synchronous, before split) ──
+    //
+    // The initial frame is rendered + flushed before we hand the
+    // display off to `ui_render`, then backlight goes on.  Order
+    // matters: rendering first means the user never sees the panel's
+    // power-on RAM state.
     let mut display = r.display;
     let mut backlight = r.display_backlight;
     display.init().await;
-    // SAFETY: `run()` is called exactly once per binary lifetime
-    // (from `#[embassy_executor::main]`), so this is the only place
-    // FRAMEBUFFER is borrowed.
+    // SAFETY: this is the one and only place we borrow FRAMEBUFFER.
     let fb: &'static mut Framebuffer = unsafe { &mut *core::ptr::addr_of_mut!(FRAMEBUFFER) };
 
-    // ── Joystick ────────────────────────────────────────────────────────────
+    let mut state = UiState::with_role(role);
+    let settings = Settings::default();
+    let mut keys = KeyStore::new();
+    let _ = keys.add("Studio A", 0x111111);
+    let _ = keys.add("Backup", 0x222222);
+    let mut widgets: WidgetList = WidgetList::new();
+    let mut renderer = Renderer::new();
+
+    let initial_status = link_status_from_stats(&STATS.get());
+    build_screen(&state, &settings, &keys, &initial_status, &mut widgets);
+    let _ = renderer.render(&widgets, &state.scan, fb);
+    display.flush(fb).await;
+    backlight.set_low(); // backlight on (active LOW)
+    defmt::info!("ui ready: role={:?} screen={:?}", role, state.screen);
+
+    // ── Joystick spawn ─────────────────────────────────────────────
     let pins = unsafe {
         use board::embassy_nrf::peripherals::*;
         (
@@ -144,175 +205,209 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     let joystick = Joystick5Way::new(js_up, js_dn, js_lt, js_rt, js_ct);
     spawner.spawn(joystick_task(joystick).expect("alloc joystick_task"));
 
-    // ── UI state ────────────────────────────────────────────────────────────
-    let mut state = UiState::with_role(role);
-    let mut settings = Settings::default();
-    // Placeholder keys, hidden from MAIN_MENU until AEAD lands.
-    let mut keys = KeyStore::new();
-    let _ = keys.add("Studio A", 0x111111);
-    let _ = keys.add("Backup", 0x222222);
-    let mut widgets: WidgetList = WidgetList::new();
-    let mut renderer = Renderer::new();
+    // ── ui_render task — owns display + fb + renderer ──────────────
+    spawner.spawn(ui_render_task(display, fb, renderer).expect("alloc ui_render_task"));
 
-    // Initial paint — `STATS` is empty so this looks like the
-    // pre-runtime stub did, but every subsequent render snapshots
-    // fresh stats inside `ui_loop`.  Order: paint into `fb` (sync),
-    // then flush the dirty region to the panel via async SPI, then
-    // turn the backlight on — so the user never sees the panel's
-    // power-on RAM contents.
-    let initial_status = link_status_from_stats(&STATS.get());
-    build_screen(&state, &settings, &keys, &initial_status, &mut widgets);
-    let _ = renderer.render(&widgets, &state.scan, fb);
-    display.flush(fb).await;
-    backlight.set_low(); // backlight on (active LOW)
-    defmt::info!("ui ready: role={:?} screen={:?}", role, state.screen);
-
-    // ── Link runtime ───────────────────────────────────────────────────────
-    // Fixed initial config — derived from `Settings::default()` at boot.
-    // `Command::Apply*` from the UI doesn't yet retune the radio (live
-    // reconfig is increment 4 of M6); for now `LinkConfig` matches
-    // `default_915` and stays that way for the run.
+    // ── link_runtime on its own interrupt executor at P2 ──────────
+    //
+    // The build initial `LinkConfig` from the UI's `Settings`.  Live
+    // updates flow through `CONFIG_UPDATES` after this.
     let config = link_config_from(&settings);
 
-    // Run the UI loop and the link runtime concurrently in this task
-    // via `embassy_futures::join`.  Both halves are infinite (`-> !`),
-    // so the join itself never resolves — exactly what we want.
+    let irq = interrupt::EGU0_SWI0;
+    irq.set_priority(Priority::P2);
+    let spawner_link = EXECUTOR_LINK.start(irq);
+
     match role {
         Role::Rx => {
-            let mut sink = UartMidiSink::new(r.midi_uart);
-            join(
-                ui_loop(
-                    &mut display,
-                    &mut backlight,
-                    fb,
-                    &mut state,
-                    &mut settings,
-                    &keys,
-                    &mut widgets,
-                    &mut renderer,
-                ),
-                run_rx(
-                    &mut r.radio0,
-                    &mut r.status_led,
-                    &mut sink,
-                    &config,
-                    &STATS,
-                    Some(&CONFIG_UPDATES),
-                    Some(&SCAN),
-                ),
-            )
-            .await;
+            let sink = UartMidiSink::new(r.midi_uart);
+            spawner_link.spawn(
+                link_rx_task(r.radio0, r.status_led, sink, config)
+                    .expect("alloc link_rx_task"),
+            );
         }
         Role::Tx => {
-            // Boot counter goes into the high 16 bits of the link-layer
-            // `seq` and MUST change across resets so the receiver's
-            // replay window doesn't reject our new low-seq packets as
-            // ancient duplicates.  Pull via SD's RNG SVC — M7 will
-            // replace this with a flash-persisted counter.
+            // Boot counter goes into the high 16 bits of the link-
+            // layer `seq` and MUST change across resets so RX's replay
+            // window doesn't reject post-reboot low-seq packets as
+            // ancient duplicates.  Pull via SD's RNG SVC; flash-
+            // persisted in M7.
             let boot_counter = read_random_u16();
             defmt::info!("boot_counter = {} (random per-boot)", boot_counter);
             match tx_source {
                 TxSource::Uart => {
-                    let mut source = UartMidiSource::new(r.midi_uart);
-                    join(
-                        ui_loop(
-                            &mut display,
-                            &mut backlight,
-                            fb,
-                            &mut state,
-                            &mut settings,
-                            &keys,
-                            &mut widgets,
-                            &mut renderer,
-                        ),
-                        run_tx(
-                            &mut r.radio0,
-                            &mut r.status_led,
-                            &mut source,
+                    let source = UartMidiSource::new(r.midi_uart);
+                    spawner_link.spawn(
+                        link_tx_uart_task(
+                            r.radio0,
+                            r.status_led,
+                            source,
                             boot_counter,
-                            &config,
-                            &STATS,
-                            Some(&CONFIG_UPDATES),
-                            Some(&SCAN),
-                        ),
-                    )
-                    .await;
+                            config,
+                        )
+                        .expect("alloc link_tx_uart_task"),
+                    );
                 }
                 TxSource::Scenario => {
-                    // Synthetic burst-pattern source — cycles through
-                    // scale / chord / glissando / key-smash / quick-
-                    // stabs / pitch-wheel / mod-wheel scenarios.
-                    // r.midi_uart is unused on this path; let it
-                    // drop with the rest of `r` after the loop, since
-                    // the loop never returns we never actually drop.
-                    let mut source = ScenarioSource::new();
                     defmt::info!("ui_bench_tx: synthetic scenario source running");
-                    join(
-                        ui_loop(
-                            &mut display,
-                            &mut backlight,
-                            fb,
-                            &mut state,
-                            &mut settings,
-                            &keys,
-                            &mut widgets,
-                            &mut renderer,
-                        ),
-                        run_tx(
-                            &mut r.radio0,
-                            &mut r.status_led,
-                            &mut source,
+                    spawner_link.spawn(
+                        link_tx_scenario_task(
+                            r.radio0,
+                            r.status_led,
                             boot_counter,
-                            &config,
-                            &STATS,
-                            Some(&CONFIG_UPDATES),
-                            Some(&SCAN),
-                        ),
-                    )
-                    .await;
+                            config,
+                        )
+                        .expect("alloc link_tx_scenario_task"),
+                    );
                 }
             }
         }
     }
-    // Both halves of `join` return `!`, so we never get here.
-    loop {}
+
+    // Drop neopixel — it was parked Low by `board::resources()` and
+    // we don't drive it from any task in this profile.  Leaking it
+    // keeps the pin held; dropping it would float.
+    core::mem::forget(r.neopixel_parked);
+
+    // ── Main task body = UI state loop ─────────────────────────────
+    ui_state_loop(&mut backlight, &mut state, settings, keys, &mut widgets).await
 }
 
-/// UI event loop, factored out of `run()` so the radio runtime can
-/// run concurrently in the same task via `embassy_futures::join`.
-/// Snapshots [`STATS`] each render pass and translates it into a
-/// `LinkStatus` for the Idle / Link Stats screens.  Returns `!` —
-/// runs forever.
+// ── Tasks ───────────────────────────────────────────────────────
+
+/// Renderer task — awaits a fresh [`FrameData`] on [`FRAME`], paints
+/// it into the framebuffer, and flushes the dirty region to the panel
+/// via async SPI.  Owns the display, framebuffer, and renderer for
+/// the lifetime of the program; nothing else writes to them.
+///
+/// When the panel is "off" (backlight high), ui_state simply doesn't
+/// signal new frames — so this task sleeps on `FRAME.wait()` until the
+/// user wakes the display.  No need for an explicit on/off path here.
+#[embassy_executor::task]
+async fn ui_render_task(
+    mut display: board::Display,
+    fb: &'static mut Framebuffer,
+    mut renderer: Renderer,
+) -> ! {
+    loop {
+        let frame = FRAME.wait().await;
+        let _ = renderer.render(&frame.widgets, &frame.scan, fb);
+        display.flush(fb).await;
+    }
+}
+
+/// Link-runtime task, RX role.  Owns the radio + status LED + the
+/// `UartMidiSink` driving the FeatherWing DIN MIDI OUT.  Runs on the
+/// high-priority interrupt executor so radio IRQ → packet handling
+/// preempts UI rendering / state work on the main task.
+#[embassy_executor::task]
+async fn link_rx_task(
+    mut radio0: board::Radio0,
+    mut status_led: Output<'static>,
+    mut sink: UartMidiSink<board::MidiUart>,
+    config: LinkConfig,
+) -> ! {
+    run_rx(
+        &mut radio0,
+        &mut status_led,
+        &mut sink,
+        &config,
+        &STATS,
+        Some(&CONFIG_UPDATES),
+        Some(&SCAN),
+    )
+    .await
+}
+
+/// Link-runtime task, TX role with real UART MIDI source.  Same
+/// priority story as [`link_rx_task`].
+#[embassy_executor::task]
+async fn link_tx_uart_task(
+    mut radio0: board::Radio0,
+    mut status_led: Output<'static>,
+    mut source: UartMidiSource<board::MidiUart>,
+    boot_counter: u16,
+    config: LinkConfig,
+) -> ! {
+    run_tx(
+        &mut radio0,
+        &mut status_led,
+        &mut source,
+        boot_counter,
+        &config,
+        &STATS,
+        Some(&CONFIG_UPDATES),
+        Some(&SCAN),
+    )
+    .await
+}
+
+/// Link-runtime task, TX role with the synthetic burst-pattern source.
+/// Same priority story as [`link_rx_task`]; the FeatherWing UART
+/// (`r.midi_uart`) is dropped when `run()` returns ownership of
+/// `r.midi_uart` to this profile and never used.
+#[embassy_executor::task]
+async fn link_tx_scenario_task(
+    mut radio0: board::Radio0,
+    mut status_led: Output<'static>,
+    boot_counter: u16,
+    config: LinkConfig,
+) -> ! {
+    let mut source = ScenarioSource::new();
+    run_tx(
+        &mut radio0,
+        &mut status_led,
+        &mut source,
+        boot_counter,
+        &config,
+        &STATS,
+        Some(&CONFIG_UPDATES),
+        Some(&SCAN),
+    )
+    .await
+}
+
+#[embassy_executor::task]
+async fn joystick_task(mut js: Joystick) {
+    loop {
+        let ev = js.next_event().await;
+        EVENT_CHAN.send(ev).await;
+    }
+}
+
+// ── UI state loop (main task body) ──────────────────────────────
+
+/// UI state machine driver.  Runs as the main task on the thread
+/// executor.  Responsibilities:
+///   - Receive joystick events from [`EVENT_CHAN`].
+///   - Dispatch them through [`UiState::handle_event`].
+///   - Push live config updates to [`CONFIG_UPDATES`].
+///   - Reconcile [`SCAN`] state with the active screen + band plan.
+///   - Implement the inactivity / auto-off policy.
+///   - Build a fresh [`FrameData`] each tick or event and hand it to
+///     `ui_render` via [`FRAME`].
 ///
 /// ## Inactivity / auto-off
 ///
 /// Per-screen idle policy:
 ///   - `Idle` → backlight off after [`IDLE_OFF_TIMEOUT`].
-///   - `LinkStats` and `Scan` → never auto-off (both are live
-///     readouts the user actively watches).
-///   - everything else (Menu, ChannelSelect, BandPlanSelect,
-///     PowerSelect, KeySelect, About) → return to Idle after
-///     [`MENU_TO_IDLE_TIMEOUT`], at which point the Idle 15 s timer
-///     restarts and ultimately drops the backlight.
+///   - `LinkStats` and `Scan` → never auto-off (live readouts).
+///   - everything else → return to Idle after [`MENU_TO_IDLE_TIMEOUT`],
+///     at which point Idle's 15 s timer can then drop the backlight.
 ///
-/// While the backlight is off, the next joystick input is consumed
-/// just as a wake — `handle_event` is *not* invoked for it.  A user
-/// that wants to act on the wake-up press has to release and press
-/// again.  This matches the "screen-off press doesn't fire" contract
-/// from `docs/ui_design.md`.
-async fn ui_loop(
-    display: &mut board::Display,
+/// Wake-from-sleep is "next joystick input is consumed, not
+/// dispatched" so the user doesn't accidentally fire a menu action on
+/// the wake press.
+async fn ui_state_loop(
     backlight: &mut Output<'static>,
-    fb: &mut Framebuffer,
     state: &mut UiState,
-    settings: &mut Settings,
-    keys: &KeyStore,
+    mut settings: Settings,
+    keys: KeyStore,
     widgets: &mut WidgetList,
-    renderer: &mut Renderer,
 ) -> ! {
     /// Idle screen → backlight off when this long with no input.
     const IDLE_OFF_TIMEOUT: Duration = Duration::from_secs(15);
-    /// Any non-Idle / non-LinkStats screen → return to Idle when
+    /// Any non-Idle / non-LinkStats / non-Scan screen → go_home when
     /// this long with no input (whereupon `IDLE_OFF_TIMEOUT` runs).
     const MENU_TO_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -320,10 +415,6 @@ async fn ui_loop(
     let mut last_input = Instant::now();
     let mut display_on = true;
 
-    // Channel-scan state tracking.  We keep the runtime's
-    // `ScanController` in sync with the UI's screen + band plan so
-    // entering the Scan screen kicks off a real RSSI sweep and
-    // leaving stops it (link resumes on operating channel).
     let mut scan_running = false;
     let mut scan_plan: Option<BandPlan> = None;
 
@@ -334,36 +425,25 @@ async fn ui_loop(
                 last_input = Instant::now();
                 if !display_on {
                     // Wake from sleep — first press just lights the
-                    // panel back up; the event itself is intentionally
-                    // dropped so the user doesn't accidentally fire a
-                    // menu action on the wake press.
+                    // panel back up.  Don't dispatch the event.
                     backlight.set_low();
                     display_on = true;
                     defmt::info!("ui: wake (joystick input)");
-                } else if let Some(cmd) = state.handle_event(settings, keys, event) {
+                } else if let Some(cmd) = state.handle_event(&mut settings, &keys, event) {
                     defmt::info!("ui command: {:?}", cmd);
-                    // Push live config to the runtime for any command
-                    // that maps onto a `LinkConfig` field.  ApplyChannel
-                    // / ApplyBandPlan / ApplyTxPower all do; key changes
-                    // don't (no AEAD in v1) so we just log those.
                     match cmd {
                         Command::ApplyChannel(_)
                         | Command::ApplyBandPlan(_)
                         | Command::ApplyTxPower(_) => {
-                            CONFIG_UPDATES.signal(link_config_from(settings));
+                            CONFIG_UPDATES.signal(link_config_from(&settings));
                         }
                         Command::ApplySetActiveKey(_) => {
-                            // No-op until AEAD lands — link layer
-                            // currently emits `key_fp = 0` regardless.
+                            // No-op until AEAD lands.
                         }
                     }
                 }
             }
             Either::Second(()) => {
-                // Tick: pull fresh per-channel RSSI from the runtime
-                // scanner if we're on the Scan screen *and* the panel
-                // is on.  No point reading the cell when the user
-                // can't see the bars.
                 if display_on && state.screen == ScreenId::Scan {
                     let mut buf = [0i16; MAX_SCAN_CHANNELS];
                     let n = state.scan.channel_count as usize;
@@ -373,11 +453,9 @@ async fn ui_loop(
             }
         }
 
-        // Reconcile the runtime scanner's mode with the UI's
-        // current screen.  Scanning is gated on `display_on` because
-        // the user can't see the bars otherwise — and pausing the
-        // scan when the panel sleeps lets the link resume between
-        // sleep periods.
+        // Reconcile the runtime scanner's mode with the UI's current
+        // screen.  Gated on `display_on` — pausing scan when the
+        // panel sleeps lets the link resume between sleeps.
         let want_scan = display_on && state.screen == ScreenId::Scan;
         let cur_plan = settings.band_plan;
         match (scan_running, want_scan, scan_plan == Some(cur_plan)) {
@@ -389,9 +467,6 @@ async fn ui_loop(
                 scan_plan = Some(cur_plan);
             }
             (true, true, false) => {
-                // Band plan changed while we were on Scan (rare —
-                // the user has to leave Scan to pick a plan, but
-                // future split-screen layouts might allow it).
                 let mut freqs = [0u32; MAX_SCAN_CHANNELS];
                 let n = collect_scan_frequencies(cur_plan, &mut freqs);
                 SCAN.start(&freqs[..n]);
@@ -405,23 +480,14 @@ async fn ui_loop(
             _ => {}
         }
 
-        // Inactivity transitions.  Only meaningful while the display
-        // is on — once off, we're already at the endpoint and stay
-        // there until the next event wakes us.
         if display_on {
             let idle_for = Instant::now().duration_since(last_input);
             match state.screen {
-                ScreenId::LinkStats | ScreenId::Scan => {
-                    // Never times out — both are live readouts the
-                    // user actively watches.  Scan in particular is a
-                    // setup-time activity (sweeping a band plan looking
-                    // for a clean channel) that can take many minutes;
-                    // bouncing back to Idle mid-survey would be hostile.
-                }
+                ScreenId::LinkStats | ScreenId::Scan => {}
                 ScreenId::Idle => {
                     if idle_for >= IDLE_OFF_TIMEOUT {
                         defmt::info!("ui: auto-off (idle {} s)", IDLE_OFF_TIMEOUT.as_secs());
-                        backlight.set_high(); // backlight off (active LOW)
+                        backlight.set_high();
                         display_on = false;
                     }
                 }
@@ -432,40 +498,34 @@ async fn ui_loop(
                             MENU_TO_IDLE_TIMEOUT.as_secs()
                         );
                         state.go_home();
-                        // Reset the idle countdown so the user gets the
-                        // full IDLE_OFF_TIMEOUT on Idle before the panel
-                        // actually goes dark.
                         last_input = Instant::now();
                     }
                 }
             }
         }
 
-        // Render only when the panel is on — no point streaming
-        // pixels into RAM the user can't see.  The renderer's
-        // per-widget content diff makes idle frames near-free
-        // (nothing changes → empty dirty box → flush returns
-        // immediately), and the async SPI path means even a full
-        // ScanGraph repaint doesn't starve `run_rx`.
+        // Build a fresh frame and hand it off to `ui_render`.  When
+        // the panel is off we just don't signal — the render task
+        // sleeps and the panel keeps whatever it had last frame
+        // (which doesn't matter because the backlight is off).
         if display_on {
             let status = link_status_from_stats(&STATS.get());
-            build_screen(state, settings, keys, &status, widgets);
-            let _ = renderer.render(widgets, &state.scan, fb);
-            display.flush(fb).await;
+            build_screen(state, &settings, &keys, &status, widgets);
+            FRAME.signal(FrameData {
+                widgets: widgets.clone(),
+                scan: state.scan.clone(),
+            });
         }
     }
 }
 
+// ── Helpers ─────────────────────────────────────────────────────
+
 /// Translate `osrf-link-runtime`'s `LinkStats` snapshot into the
-/// `osrf-ui` `LinkStatus` shape that the renderer expects.  Most
-/// fields map 1:1; `recent_loss_pct` is left `None` for now since
-/// the runtime doesn't currently expose a sliding-window loss
-/// percentage in the cell (it logs one to RTT but doesn't store it).
+/// `osrf-ui` `LinkStatus` shape that the renderer expects.
 fn link_status_from_stats(s: &osrf_link_runtime::LinkStats) -> LinkStatus {
     LinkStatus {
         up: s.link_up,
-        // SX1262 RSSI values comfortably fit in i8 (-120..-10 dBm
-        // range); clamp at conversion time to be safe.
         last_rssi_dbm: s.last_rssi_dbm.map(|r| r.clamp(i8::MIN as i16, i8::MAX as i16) as i8),
         recent_loss_pct: s.recent_loss_pct,
         total_accepted: s.total_accepted,
@@ -474,9 +534,8 @@ fn link_status_from_stats(s: &osrf_link_runtime::LinkStats) -> LinkStatus {
 }
 
 /// Build a [`LinkConfig`] from the UI's [`Settings`].  Today only
-/// `frequency_hz` and `tx_power_dbm` flow through — the rest stays at
-/// `default_915()` values.  When live reconfig lands (M6 increment 4)
-/// this is what `Command::Apply*` translates into.
+/// `frequency_hz` and `tx_power_dbm` flow through; the rest stays at
+/// `default_915()` values.
 fn link_config_from(settings: &Settings) -> LinkConfig {
     let mut c = LinkConfig::default_915();
     c.frequency_hz = settings.current_channel().frequency_khz * 1000;
@@ -485,8 +544,8 @@ fn link_config_from(settings: &Settings) -> LinkConfig {
 }
 
 /// Pull two random bytes from SD's RNG and pack into a `u16`.  Used
-/// once at boot for the link-layer `boot_counter` (high 16 bits of
-/// the 48-bit `seq`).  Replace with a flash-persisted counter in M7.
+/// once at boot for the link-layer `boot_counter`.  M7 will replace
+/// with a flash-persisted counter.
 fn read_random_u16() -> u16 {
     let mut bytes = [0u8; 2];
     let ret = board::softdevice::rand_bytes(&mut bytes);
@@ -502,8 +561,7 @@ fn read_random_u16() -> u16 {
 
 /// Build the frequency list (Hz) for a band plan, in channel-index
 /// order.  Used to seed [`ScanController::start`] when the user
-/// enters the Scan screen — the runtime then walks this list in
-/// `run_rx`'s scan branch, sampling RSSI per slot.
+/// enters the Scan screen.
 fn collect_scan_frequencies(plan: BandPlan, out: &mut [u32; MAX_SCAN_CHANNELS]) -> usize {
     let max_idx = max_channel_index(plan);
     let n = (max_idx as usize + 1).min(MAX_SCAN_CHANNELS);
@@ -512,12 +570,3 @@ fn collect_scan_frequencies(plan: BandPlan, out: &mut [u32; MAX_SCAN_CHANNELS]) 
     }
     n
 }
-
-#[embassy_executor::task]
-async fn joystick_task(mut js: Joystick) {
-    loop {
-        let ev = js.next_event().await;
-        EVENT_CHAN.send(ev).await;
-    }
-}
-
