@@ -10,7 +10,7 @@
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use osrf_board_t114 as board;
-use osrf_profile_t114_ui::run;
+use osrf_profile_t114_ui::{run, TxSource};
 use osrf_ui::Role;
 use panic_probe as _;
 
@@ -21,5 +21,5 @@ unsafe fn pre_init() {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    run(spawner, Role::Tx).await;
+    run(spawner, Role::Tx, TxSource::Uart).await;
 }
