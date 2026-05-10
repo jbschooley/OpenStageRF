@@ -263,6 +263,7 @@ const CMD_CLEAR_IRQ_STATUS: u8 = 0x02;
 const CMD_GET_STATUS: u8 = 0xC0;
 const CMD_GET_RX_BUFFER_STATUS: u8 = 0x13;
 const CMD_GET_PACKET_STATUS: u8 = 0x14;
+const CMD_GET_RSSI_INST: u8 = 0x15;
 const CMD_CALIBRATE_IMAGE: u8 = 0x98;
 const CMD_SET_DIO3_AS_TCXO_CTRL: u8 = 0x97;
 const CMD_SET_DIO2_AS_RF_SW: u8 = 0x9D;
@@ -747,6 +748,50 @@ where
         } else {
             Err(Error::UnexpectedIrq(irq))
         }
+    }
+
+    /// Move the chip to STDBY_RC.  Required before any of the
+    /// `Set*` commands that touch RF parameters (`SetRfFrequency`,
+    /// `SetModulationParams`, `SetPacketParams`); the chip silently
+    /// drops them otherwise.  Used by the channel-scan path in
+    /// `osrf-link-runtime` to walk a band plan via repeated
+    /// standby → set_frequency → rx → sample cycles.
+    pub async fn set_standby_rc(&mut self) -> Result<(), RadioError<Reset, Switch>> {
+        self.switch.to_idle().await.map_err(Error::Switch)?;
+        self.cmd(CMD_SET_STANDBY, &[0x00]).await
+    }
+
+    /// `SetRfFrequency` only — skips the `CalibrateImage` step that
+    /// the full [`Self::set_frequency`] runs.  Within the same band
+    /// (per datasheet table 9-2), one calibration during init is
+    /// enough; subsequent retunes can use this fast path.  Saves
+    /// ~3-4 ms per call versus `set_frequency`, which dominates the
+    /// per-channel cost during a band-plan sweep.
+    ///
+    /// Caller must ensure the chip is in `STDBY_RC` (or
+    /// `STDBY_XOSC`) — otherwise the new frequency register write
+    /// won't take effect.  Use [`Self::set_standby_rc`] first.
+    pub async fn set_frequency_fast(
+        &mut self,
+        hz: u32,
+    ) -> Result<(), RadioError<Reset, Switch>> {
+        let reg = (((hz as u64) << 25) / 32_000_000) as u32;
+        self.cmd(CMD_SET_RF_FREQ, &reg.to_be_bytes()).await
+    }
+
+    /// Read the instantaneous RSSI of the channel currently being
+    /// listened on.  Chip must be in RX (continuous or single
+    /// reception); reading in standby gives a meaningless value.
+    /// Returns dBm.
+    ///
+    /// SX1262 datasheet §13.5.3: the response is a single byte
+    /// `RssiInst`; dBm = `-RssiInst / 2`.  Practical range on the
+    /// LR1262's front end is roughly −120 dBm (noise floor) to
+    /// −10 dBm (saturation).
+    pub async fn get_rssi_inst(&mut self) -> Result<i16, RadioError<Reset, Switch>> {
+        let mut buf = [0u8; 1];
+        self.cmd_read(CMD_GET_RSSI_INST, &[], &mut buf).await?;
+        Ok(-((buf[0] as i16) >> 1))
     }
 
     /// One-shot convenience: `rx_start` + `rx_recv` + standby.  Useful for

@@ -22,7 +22,7 @@ pub mod synthetic;
 // `osrf_app_link_bench::*`.
 pub use osrf_link_runtime::{
     configure_radio, run_rx, run_tx, LinkConfig, LinkConfigSignal, LinkStats, LinkStatsCell,
-    MidiSink, MidiSource, RF_PAYLOAD_MAX,
+    MidiSink, MidiSource, ScanController, RF_PAYLOAD_MAX, SCAN_MAX_CHANNELS, SCAN_RSSI_NONE,
 };
 
 /// Compatibility alias — the config struct used to be called

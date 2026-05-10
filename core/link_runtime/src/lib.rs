@@ -23,7 +23,7 @@
 //! marked link-down so the next packet (post-restart) triggers a
 //! session reset.
 
-use embassy_futures::select::{select3, Either3};
+use embassy_futures::select::{select, select3, select4, Either3, Either4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer};
@@ -151,6 +151,183 @@ impl LinkConfigSignal {
 }
 
 impl Default for LinkConfigSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Channel-scan control ────────────────────────────────────────────────────
+
+/// Maximum channel count a scan request can address.  Sized to match
+/// `osrf_ui::MAX_SCAN_CHANNELS` so a UI-driven scan never gets clipped
+/// regardless of band plan (the densest plan in the UI core, "Wide",
+/// has 131 channels at 200 kHz spacing).
+pub const SCAN_MAX_CHANNELS: usize = 144;
+
+/// Sentinel RSSI for "no measurement yet" — written into the results
+/// array on `start()` and overwritten as the runtime sweeps.  Renderers
+/// can detect this and draw a placeholder bar.
+pub const SCAN_RSSI_NONE: i16 = i16::MIN;
+
+/// Per-channel dwell time before sampling RSSI.  Long enough for the
+/// receiver's AGC to settle on the new channel (typical SX1262
+/// RX-on-to-RxReady is ~70 µs; we use a couple of ms of headroom for
+/// front-end stabilisation), short enough that a 24-channel ISM sweep
+/// completes in <200 ms.
+const SCAN_DWELL_MS: u64 = 5;
+
+/// Shared scan-mode controller.  The UI signals "begin scanning these
+/// frequencies" by calling [`start`](Self::start); the runtime's
+/// `run_rx` loop notices, walks the chip out of continuous RX, sweeps
+/// the channel list (standby → set_frequency_fast → rx_start → 5 ms
+/// dwell → `get_rssi_inst`), and continues looping until
+/// [`stop`](Self::stop) is called — at which point it re-applies the
+/// operating `LinkConfig` and resumes normal RX.
+///
+/// While a scan is active the link is effectively down: RX isn't
+/// listening on the operating channel.  The receiver state is reset
+/// on scan exit so the next packet from TX triggers a fresh session.
+///
+/// `run_tx` ignores the controller — TX has nothing to do during a
+/// scan and continues transmitting (heartbeats + any queued MIDI) on
+/// the operating channel.  The TX→RX bridge "looks broken" only from
+/// the RX side's perspective, which is the correct semantic.
+pub struct ScanController {
+    inner: critical_section::Mutex<core::cell::RefCell<ScanInner>>,
+    /// Fires on enable/disable transitions and on `start()` channel-list
+    /// changes.  `run_rx` includes `wait_change().await` in its `select`
+    /// so it preempts `rx_recv` immediately rather than waiting for the
+    /// next packet (which may never arrive on a quiet channel).
+    state_change: Signal<CriticalSectionRawMutex, ()>,
+}
+
+struct ScanInner {
+    enabled: bool,
+    channel_count: u8,
+    frequencies: [u32; SCAN_MAX_CHANNELS],
+    results: [i16; SCAN_MAX_CHANNELS],
+    /// Increments each time the runtime completes a full sweep
+    /// through all channels.  UI consumers can read this to know
+    /// whether the displayed bars represent "still filling in" vs
+    /// "complete coverage of the band plan."
+    completed_passes: u32,
+}
+
+impl ScanInner {
+    const fn empty() -> Self {
+        Self {
+            enabled: false,
+            channel_count: 0,
+            frequencies: [0; SCAN_MAX_CHANNELS],
+            results: [SCAN_RSSI_NONE; SCAN_MAX_CHANNELS],
+            completed_passes: 0,
+        }
+    }
+}
+
+impl ScanController {
+    pub const fn new() -> Self {
+        Self {
+            inner: critical_section::Mutex::new(core::cell::RefCell::new(ScanInner::empty())),
+            state_change: Signal::new(),
+        }
+    }
+
+    /// Begin (or update) a scan.  `frequencies` is the band-plan
+    /// channel list in any order — the runtime sweeps it index-0
+    /// upward and wraps.  Latest call wins; switching band plans
+    /// while scanning is just another `start()` with the new list.
+    /// All previous results are cleared to [`SCAN_RSSI_NONE`].
+    pub fn start(&self, frequencies: &[u32]) {
+        critical_section::with(|cs| {
+            let mut s = self.inner.borrow(cs).borrow_mut();
+            let n = frequencies.len().min(SCAN_MAX_CHANNELS);
+            s.channel_count = n as u8;
+            s.frequencies[..n].copy_from_slice(&frequencies[..n]);
+            for r in s.results.iter_mut() {
+                *r = SCAN_RSSI_NONE;
+            }
+            s.completed_passes = 0;
+            s.enabled = true;
+        });
+        self.state_change.signal(());
+    }
+
+    /// Stop scanning.  Runtime re-applies the operating `LinkConfig`
+    /// and resumes normal RX on the next loop iteration.
+    pub fn stop(&self) {
+        critical_section::with(|cs| {
+            self.inner.borrow(cs).borrow_mut().enabled = false;
+        });
+        self.state_change.signal(());
+    }
+
+    /// Snapshot the latest RSSI per channel into `out`.  Returns the
+    /// number of slots written (capped by both the controller's
+    /// `channel_count` and `out.len()`).  Called by the UI render path
+    /// each tick to feed `osrf_ui::UiState::apply_scan_pass`.
+    /// Channels that haven't been sampled yet hold [`SCAN_RSSI_NONE`].
+    pub fn read_results(&self, out: &mut [i16]) -> usize {
+        critical_section::with(|cs| {
+            let s = self.inner.borrow(cs).borrow();
+            let n = (s.channel_count as usize).min(out.len());
+            out[..n].copy_from_slice(&s.results[..n]);
+            n
+        })
+    }
+
+    /// Number of full sweeps the runtime has completed since the most
+    /// recent `start()`.  0 = first pass still in progress.
+    pub fn completed_passes(&self) -> u32 {
+        critical_section::with(|cs| self.inner.borrow(cs).borrow().completed_passes)
+    }
+
+    // ── runtime-side accessors ───────────────────────────────────
+
+    fn enabled(&self) -> bool {
+        critical_section::with(|cs| self.inner.borrow(cs).borrow().enabled)
+    }
+
+    fn channel_count(&self) -> u8 {
+        critical_section::with(|cs| self.inner.borrow(cs).borrow().channel_count)
+    }
+
+    fn nth_frequency(&self, idx: u8) -> Option<u32> {
+        critical_section::with(|cs| {
+            let s = self.inner.borrow(cs).borrow();
+            if (idx as usize) < s.channel_count as usize {
+                Some(s.frequencies[idx as usize])
+            } else {
+                None
+            }
+        })
+    }
+
+    fn write_rssi(&self, idx: u8, rssi: i16) {
+        critical_section::with(|cs| {
+            let mut s = self.inner.borrow(cs).borrow_mut();
+            if (idx as usize) < s.channel_count as usize {
+                s.results[idx as usize] = rssi;
+            }
+        });
+    }
+
+    fn note_pass_complete(&self) {
+        critical_section::with(|cs| {
+            let mut s = self.inner.borrow(cs).borrow_mut();
+            s.completed_passes = s.completed_passes.wrapping_add(1);
+        });
+    }
+
+    /// Async wait for any state-change (start / stop / channel-list
+    /// replacement).  Used inside `run_rx`'s `select` so a UI scan
+    /// request preempts the in-flight `rx_recv` immediately.
+    async fn wait_change(&self) {
+        self.state_change.wait().await;
+    }
+}
+
+impl Default for ScanController {
     fn default() -> Self {
         Self::new()
     }
@@ -625,6 +802,12 @@ async fn apply_rx_reconfig<Spi, Busy, Dio1, Reset, Switch>(
 /// link-down so the next packet triggers a session reset.
 ///
 /// `config_updates` (optional): see [`run_tx`] — same semantics.
+///
+/// `scan` (optional): a [`ScanController`] for UI-driven channel-scan
+/// mode.  When `Some` and the controller is `enabled`, the runtime
+/// puts the chip in standby and walks its frequency list, sampling
+/// `get_rssi_inst` per channel and writing back results.  `None`
+/// (or "not enabled") keeps the chip in continuous RX as before.
 pub async fn run_rx<Spi, Busy, Dio1, Reset, Switch, Led, Sink>(
     radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
     led: &mut Led,
@@ -632,6 +815,7 @@ pub async fn run_rx<Spi, Busy, Dio1, Reset, Switch, Led, Sink>(
     config: &LinkConfig,
     stats: &LinkStatsCell,
     config_updates: Option<&LinkConfigSignal>,
+    scan: Option<&ScanController>,
 ) -> !
 where
     Spi: SpiDevice,
@@ -714,37 +898,144 @@ where
     // until we've seen two consecutive windows.
     let mut last_loss_pct: Option<u8> = None;
 
+    // Local mirror of `scan.enabled()`.  Tracks whether *we* (the
+    // runtime) currently have the chip in scan mode (standby +
+    // per-channel sweep) versus normal continuous RX.  Reconciled
+    // at the top of every loop iteration against the controller's
+    // public flag — when they disagree, we walk the chip through
+    // the appropriate transition.
+    let mut scanning = false;
+    // Index into the scan controller's frequency list.  Wraps at
+    // `channel_count`; on each wrap we bump the controller's
+    // `completed_passes` so UI consumers know when a full sweep
+    // has concluded.
+    let mut scan_idx: u8 = 0;
+
     loop {
         events.clear();
+
+        // Reconcile our local `scanning` flag against the controller's
+        // public `enabled`.  This is the single point where we walk the
+        // chip between "continuous RX on operating channel" and
+        // "standby + per-channel sweep" — keeps the transition logic in
+        // one place rather than scattered across event arms.
+        let scan_wanted = scan.map_or(false, |s| s.enabled());
+        match (scanning, scan_wanted) {
+            (false, true) => {
+                // Normal → Scanning: leave continuous RX, drop into
+                // standby so the upcoming `set_frequency_fast` calls
+                // take effect.  Walk-back of `link_up`/`receiver` is
+                // deferred until we exit (the receiver may stay up if
+                // the user pops back to the same channel quickly).
+                if let Err(_) = radio.set_standby_rc().await {
+                    defmt::error!("link RX: set_standby_rc failed entering scan");
+                }
+                scan_idx = 0;
+                scanning = true;
+                defmt::info!("link RX: scan mode ON (channels={})",
+                    scan.map_or(0, |s| s.channel_count()));
+            }
+            (true, false) => {
+                // Scanning → Normal: re-apply the operating LinkConfig
+                // (which puts the chip back in standby with the operating
+                // RF parameters) and resume continuous RX.  The link
+                // looks fresh from RX's side: clear pressed-notes,
+                // divergence timers, link-up flag — the next packet
+                // from TX will trigger a full session reset.
+                let _ = configure_radio(radio, &current).await;
+                let _ = radio.rx_start().await;
+                receiver.mark_link_down();
+                link_up = false;
+                rx_state.reset();
+                divergence_since = [None; 16];
+                wd.kick();
+                scanning = false;
+                defmt::info!("link RX: scan mode OFF, resuming on {} Hz", current.frequency_hz);
+            }
+            _ => {}
+        }
 
         // Apply any pending live-config update before re-entering
         // `rx_recv`.  Catches updates that landed during the prior
         // packet's processing (sink writes, stuck-note recovery)
-        // when nothing was watching the signal.
+        // when nothing was watching the signal.  Skipped during
+        // scan mode — config changes there only update the local
+        // `current` so the right config is restored on scan exit.
         if let Some(sig) = config_updates {
             if let Some(new_cfg) = sig.try_take() {
-                apply_rx_reconfig(
-                    radio,
-                    &mut current,
-                    &new_cfg,
-                    &mut wd,
-                    &mut receiver,
-                    &mut rx_state,
-                    &mut divergence_since,
-                    &mut link_up,
-                )
-                .await;
+                if scanning {
+                    current = new_cfg;
+                    defmt::info!("link RX: deferred reconfigure (scanning); will apply on scan exit");
+                } else {
+                    apply_rx_reconfig(
+                        radio,
+                        &mut current,
+                        &new_cfg,
+                        &mut wd,
+                        &mut receiver,
+                        &mut rx_state,
+                        &mut divergence_since,
+                        &mut link_up,
+                    )
+                    .await;
+                }
             }
         }
 
+        // ── Scan mode: sample one channel per loop iteration ─────
+        if scanning {
+            // unwrap safe: `scanning == true` only reached when
+            // `scan.is_some()` (see reconcile above).
+            let s = scan.unwrap();
+            let count = s.channel_count();
+            if count == 0 {
+                // No channels configured — wait briefly for a
+                // start() with a non-empty list rather than busy-
+                // looping.  state_change wakes us early.
+                let _ = select(Timer::after_millis(50), s.wait_change()).await;
+                continue;
+            }
+            let i = scan_idx % count;
+            if let Some(freq) = s.nth_frequency(i) {
+                let _ = radio.set_frequency_fast(freq).await;
+                let _ = radio.rx_start().await;
+                Timer::after_millis(SCAN_DWELL_MS).await;
+                let rssi = radio.get_rssi_inst().await.unwrap_or(SCAN_RSSI_NONE);
+                s.write_rssi(i, rssi);
+                let _ = radio.set_standby_rc().await;
+            }
+            scan_idx = scan_idx.wrapping_add(1);
+            if scan_idx % count == 0 {
+                s.note_pass_complete();
+            }
+            // No `stats` push during scan — RX-side counters don't
+            // advance and pushing zeros every iteration would just
+            // be churn on the stats cell.
+            continue;
+        }
+
+        // ── Normal mode: continuous RX with watchdog + signal arms ─
         let cfg_wait = async {
             match config_updates {
                 Some(s) => s.wait().await,
                 None => core::future::pending::<LinkConfig>().await,
             }
         };
-        match select3(radio.rx_recv(&mut radio_buf), wd.wait(), cfg_wait).await {
-            Either3::First(Ok(pkt)) if pkt.crc_ok => {
+        let scan_wait = async {
+            match scan {
+                Some(s) => s.wait_change().await,
+                None => core::future::pending::<()>().await,
+            }
+        };
+        match select4(
+            radio.rx_recv(&mut radio_buf),
+            wd.wait(),
+            cfg_wait,
+            scan_wait,
+        )
+        .await
+        {
+            Either4::First(Ok(pkt)) if pkt.crc_ok => {
                 wd.kick();
                 let was_down = !link_up;
                 link_up = true;
@@ -895,16 +1186,16 @@ where
                     }
                 }
             }
-            Either3::First(Ok(_)) => {
+            Either4::First(Ok(_)) => {
                 crc_mismatch = crc_mismatch.wrapping_add(1);
                 if crc_mismatch % 50 == 0 {
                     defmt::warn!("RX: CRC mismatch count = {}", crc_mismatch);
                 }
             }
-            Either3::First(Err(_)) => {
+            Either4::First(Err(_)) => {
                 defmt::warn!("RX: radio error");
             }
-            Either3::Second(()) => {
+            Either4::Second(()) => {
                 if link_up {
                     link_up = false;
                     defmt::warn!(
@@ -926,7 +1217,7 @@ where
                 }
                 wd.kick();
             }
-            Either3::Third(new_cfg) => {
+            Either4::Third(new_cfg) => {
                 apply_rx_reconfig(
                     radio,
                     &mut current,
@@ -938,6 +1229,13 @@ where
                     &mut link_up,
                 )
                 .await;
+                continue;
+            }
+            Either4::Fourth(()) => {
+                // Scan controller fired (start / stop / channel-list
+                // change).  Top-of-loop reconcile picks it up — just
+                // restart the iteration so it sees the fresh state
+                // before re-entering `rx_recv`.
                 continue;
             }
         }
