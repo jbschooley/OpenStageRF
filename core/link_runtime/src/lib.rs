@@ -23,7 +23,7 @@
 //! marked link-down so the next packet (post-restart) triggers a
 //! session reset.
 
-use embassy_futures::select::{select, select3, select4, Either3, Either4};
+use embassy_futures::select::{select, select4, Either4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer};
@@ -169,20 +169,31 @@ pub const SCAN_MAX_CHANNELS: usize = 144;
 /// can detect this and draw a placeholder bar.
 pub const SCAN_RSSI_NONE: i16 = i16::MIN;
 
-/// Per-channel dwell time before sampling RSSI.  Long enough for the
-/// receiver's AGC to settle on the new channel (typical SX1262
-/// RX-on-to-RxReady is ~70 µs; we use a couple of ms of headroom for
-/// front-end stabilisation), short enough that a 24-channel ISM sweep
-/// completes in <200 ms.
-const SCAN_DWELL_MS: u64 = 5;
+/// Receiver settle time after entering RX on a fresh channel,
+/// before the first RSSI sample.  Typical SX1262 RX-on-to-RxReady
+/// is ~70 µs; 1 ms is plenty of headroom for the front-end and
+/// AGC to stabilise even with the narrow scan-time IF filter.
+const SCAN_SETTLE_MS: u64 = 1;
+/// How many `get_rssi_inst` samples to take per channel, spaced
+/// [`SCAN_SAMPLE_INTERVAL_MS`] apart.  We report the **peak** value
+/// observed across the window — `get_rssi_inst` is a single
+/// instantaneous read, so at a fixed offset against a TX that's
+/// on-air ~1 ms / 10 ms (heartbeat) we'd catch the carrier only
+/// ~10 % of the time.  6 × 1 ms = 6 ms window catches the carrier
+/// ~60 % of the time per pass; the UI's `peak_dbm` accumulator
+/// covers the remaining gaps within ~3 passes (~3 s on Wide).
+const SCAN_SAMPLES_PER_CHANNEL: u8 = 6;
+/// Time between RSSI samples within a single channel's dwell.
+const SCAN_SAMPLE_INTERVAL_MS: u64 = 1;
 
 /// Shared scan-mode controller.  The UI signals "begin scanning these
 /// frequencies" by calling [`start`](Self::start); the runtime's
 /// `run_rx` loop notices, walks the chip out of continuous RX, sweeps
-/// the channel list (standby → set_frequency_fast → rx_start → 5 ms
-/// dwell → `get_rssi_inst`), and continues looping until
-/// [`stop`](Self::stop) is called — at which point it re-applies the
-/// operating `LinkConfig` and resumes normal RX.
+/// the channel list ([`scan_one_channel`] per slot — peak RSSI over
+/// a >10 ms window so heartbeat-cadence carriers are reliably
+/// caught), and continues looping until [`stop`](Self::stop) is
+/// called, at which point it re-applies the operating `LinkConfig`
+/// and resumes normal RX.
 ///
 /// While a scan is active the link is effectively down: RX isn't
 /// listening on the operating channel.  The receiver state is reset
@@ -331,6 +342,49 @@ impl Default for ScanController {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Sample one scan channel: retune, settle, take
+/// [`SCAN_SAMPLES_PER_CHANNEL`] RSSI readings spaced
+/// [`SCAN_SAMPLE_INTERVAL_MS`] apart, return the peak (least-
+/// negative) reading.  Leaves the chip in `STDBY_RC` so the
+/// caller can either retune to the next channel or reconfigure
+/// for normal operation.
+///
+/// Returns [`SCAN_RSSI_NONE`] if any radio command failed — the
+/// renderer treats that as "no measurement," which is more honest
+/// than reporting a stale or fabricated value.
+async fn scan_one_channel<Spi, Busy, Dio1, Reset, Switch>(
+    radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
+    freq_hz: u32,
+) -> i16
+where
+    Spi: SpiDevice,
+    Busy: Wait,
+    Dio1: Wait,
+    Reset: embedded_hal::digital::OutputPin,
+    Switch: RfSwitchControl,
+{
+    if radio.set_frequency_fast(freq_hz).await.is_err() {
+        return SCAN_RSSI_NONE;
+    }
+    if radio.rx_start().await.is_err() {
+        return SCAN_RSSI_NONE;
+    }
+    Timer::after_millis(SCAN_SETTLE_MS).await;
+
+    let mut peak = SCAN_RSSI_NONE;
+    for _ in 0..SCAN_SAMPLES_PER_CHANNEL {
+        if let Ok(r) = radio.get_rssi_inst().await {
+            if r > peak {
+                peak = r;
+            }
+        }
+        Timer::after_millis(SCAN_SAMPLE_INTERVAL_MS).await;
+    }
+
+    let _ = radio.set_standby_rc().await;
+    peak
 }
 
 // ── Live stats observable by the UI / telemetry ─────────────────────────────
@@ -563,6 +617,17 @@ async fn apply_tx_reconfig<Spi, Busy, Dio1, Reset, Switch>(
 /// channel/power change applies between packets without a restart.
 /// Profiles with no UI pass `None` and the polling path is a single
 /// `Option::is_some` check per loop iteration.
+///
+/// `scan` (optional): a [`ScanController`] for UI-driven channel
+/// scanning on the TX side.  Same shape as RX — when enabled the
+/// runtime puts the chip in standby and walks the controller's
+/// frequency list, sampling `get_rssi_inst` per channel.  TX is
+/// silent during a scan (no MIDI, no heartbeats) so the receiver's
+/// watchdog will fire and the link drops; on scan exit the operating
+/// `LinkConfig` is re-applied and TX resumes — receiver session
+/// resets on the next packet.  Source events that arrive during the
+/// scan stay in the UART's hardware buffer and drain naturally
+/// once TX resumes (subject to the buffer's depth).
 pub async fn run_tx<Spi, Busy, Dio1, Reset, Switch, Led, Source>(
     radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
     led: &mut Led,
@@ -571,6 +636,7 @@ pub async fn run_tx<Spi, Busy, Dio1, Reset, Switch, Led, Source>(
     config: &LinkConfig,
     stats: &LinkStatsCell,
     config_updates: Option<&LinkConfigSignal>,
+    scan: Option<&ScanController>,
 ) -> !
 where
     Spi: SpiDevice,
@@ -610,17 +676,114 @@ where
     let mut hb_count: u32 = 0;
     let mut overflow_count: u32 = 0;
 
+    // Scan-mode tracking — same semantics as the RX side.  When the
+    // controller's `enabled` flips on, we walk the chip into standby
+    // and start sweeping; flips off, we re-`configure_radio` and
+    // resume the normal TX path.
+    let mut scanning = false;
+    let mut scan_idx: u8 = 0;
+
     loop {
         let now = Instant::now();
+
+        // Reconcile scan mode.  Single point where the chip transitions
+        // between TX/heartbeat duty and channel-sweep duty.
+        let scan_wanted = scan.map_or(false, |s| s.enabled());
+        match (scanning, scan_wanted) {
+            (false, true) => {
+                if let Err(_) = radio.set_standby_rc().await {
+                    defmt::error!("link TX: set_standby_rc failed entering scan");
+                }
+                // Scan reuses the operating IF bandwidth so the
+                // user sees what an actual link on each channel
+                // would experience — the TX signal occupies
+                // ~400 kHz, so a wide IF picking up adjacent-
+                // channel energy *is* the safety picture for
+                // dense plans.
+                // Drop any pre-scan in-flight state so we don't flush
+                // it onto the receiver's fresh post-scan session:
+                //   - Pending MIDI events (chord copies, delayed
+                //     NoteOff retransmits) get discarded.
+                //   - `tx_state` is reset so the first heartbeat
+                //     after scan exit advertises an empty active-
+                //     channel mask, matching the RX side's post-
+                //     watchdog cleared state and avoiding a phantom
+                //     stuck-note-recovery cycle on resume.
+                queue = MidiTxQueue::new();
+                tx_state = ChannelNoteCounts::new();
+                scan_idx = 0;
+                scanning = true;
+                defmt::info!(
+                    "link TX: scan mode ON (channels={})",
+                    scan.map_or(0, |s| s.channel_count())
+                );
+            }
+            (true, false) => {
+                let _ = configure_radio(radio, &current).await;
+                // HeartbeatTimer carries a "last send" timestamp; reset
+                // it so the resume burst doesn't immediately fire a
+                // heartbeat on top of any queued events.
+                hb = HeartbeatTimer::new(Duration::from_millis(current.heartbeat_ms));
+                scanning = false;
+                defmt::info!("link TX: scan mode OFF, resuming on {} Hz", current.frequency_hz);
+            }
+            _ => {}
+        }
 
         // 0. Apply any pending live-config update before the next
         //    blocking await.  Catches updates that landed during the
         //    prior burst (between `radio.tx()` calls) when there's no
-        //    `select` arm watching the signal.
+        //    `select` arm watching the signal.  Skipped during scan —
+        //    only the local `current` is updated so the right config
+        //    is restored on scan exit.
         if let Some(sig) = config_updates {
             if let Some(new_cfg) = sig.try_take() {
-                apply_tx_reconfig(radio, &mut current, &new_cfg, &mut hb).await;
+                if scanning {
+                    current = new_cfg;
+                    defmt::info!(
+                        "link TX: deferred reconfigure (scanning); will apply on scan exit"
+                    );
+                } else {
+                    apply_tx_reconfig(radio, &mut current, &new_cfg, &mut hb).await;
+                }
             }
+        }
+
+        // ── Scan mode: sample one channel, advance, loop ─────────
+        if scanning {
+            // Drain and discard any MIDI bytes that arrived during
+            // the scan.  Premise: the user isn't playing while
+            // scanning (it's a setup-time activity) — and the
+            // alternative, queueing events for a post-scan flush,
+            // dumps a chord onto a fresh RX session that has
+            // already watchdog'd and cleared its pressed-notes
+            // state, producing audible artifacts.  Pulling bytes
+            // out of the source also stops its hardware UART RX
+            // buffer from filling and back-pressuring the
+            // FeatherWing on long sweeps.
+            loop {
+                match source.try_next(&mut midi_buf) {
+                    Ok(Some(_)) => {}
+                    _ => break,
+                }
+            }
+
+            let s = scan.unwrap();
+            let count = s.channel_count();
+            if count == 0 {
+                let _ = select(Timer::after_millis(50), s.wait_change()).await;
+                continue;
+            }
+            let i = scan_idx % count;
+            if let Some(freq) = s.nth_frequency(i) {
+                let rssi = scan_one_channel(radio, freq).await;
+                s.write_rssi(i, rssi);
+            }
+            scan_idx = scan_idx.wrapping_add(1);
+            if scan_idx % count == 0 {
+                s.note_pass_complete();
+            }
+            continue;
         }
 
         // 1. Drain any source events into the queue (non-blocking).
@@ -673,25 +836,37 @@ where
         }
 
         // 3. Queue empty — wait for source-ready OR heartbeat deadline,
-        //    *or* a config update if one is wired in.  Adding the
-        //    update arm here means a config change at idle is applied
-        //    immediately rather than after the next heartbeat fires.
+        //    *or* a config update / scan request if either is wired
+        //    in.  Adding the update arms here means a UI-driven
+        //    transition at idle applies immediately rather than after
+        //    the next heartbeat fires.
         let cfg_wait = async {
             match config_updates {
                 Some(s) => s.wait().await,
                 None => core::future::pending::<LinkConfig>().await,
             }
         };
-        match select3(source.wait_ready(), hb.wait(), cfg_wait).await {
-            Either3::First(()) => {
+        let scan_wait = async {
+            match scan {
+                Some(s) => s.wait_change().await,
+                None => core::future::pending::<()>().await,
+            }
+        };
+        match select4(source.wait_ready(), hb.wait(), cfg_wait, scan_wait).await {
+            Either4::First(()) => {
                 // Source has an event ready; loop to drain.
                 continue;
             }
-            Either3::Second(()) => {
+            Either4::Second(()) => {
                 // Heartbeat fired — fall through to send one.
             }
-            Either3::Third(new_cfg) => {
+            Either4::Third(new_cfg) => {
                 apply_tx_reconfig(radio, &mut current, &new_cfg, &mut hb).await;
+                continue;
+            }
+            Either4::Fourth(()) => {
+                // Scan-controller state change — top-of-loop reconcile
+                // picks it up.
                 continue;
             }
         }
@@ -746,7 +921,7 @@ enum BufferedEvent {
 /// Apply a new `LinkConfig` to the radio mid-flight (RX side):
 /// re-`configure_radio` and re-`rx_start`, then reset the watchdog
 /// to the new ms.  Cancels any in-flight `rx_recv` (caller must
-/// have already lost the race in `select3`).
+/// have already lost the race in `select4`).
 ///
 /// On hard failure the runtime logs and keeps listening on the
 /// previous config — same recoverability stance as TX.
@@ -930,10 +1105,16 @@ where
                 if let Err(_) = radio.set_standby_rc().await {
                     defmt::error!("link RX: set_standby_rc failed entering scan");
                 }
+                // Scan keeps the operating IF bandwidth — we want
+                // each channel's RSSI to reflect what a real link
+                // there would see, including the TX's full ~400 kHz
+                // occupied bandwidth bleeding into neighbours.
                 scan_idx = 0;
                 scanning = true;
-                defmt::info!("link RX: scan mode ON (channels={})",
-                    scan.map_or(0, |s| s.channel_count()));
+                defmt::info!(
+                    "link RX: scan mode ON (channels={})",
+                    scan.map_or(0, |s| s.channel_count())
+                );
             }
             (true, false) => {
                 // Scanning → Normal: re-apply the operating LinkConfig
@@ -997,12 +1178,8 @@ where
             }
             let i = scan_idx % count;
             if let Some(freq) = s.nth_frequency(i) {
-                let _ = radio.set_frequency_fast(freq).await;
-                let _ = radio.rx_start().await;
-                Timer::after_millis(SCAN_DWELL_MS).await;
-                let rssi = radio.get_rssi_inst().await.unwrap_or(SCAN_RSSI_NONE);
+                let rssi = scan_one_channel(radio, freq).await;
                 s.write_rssi(i, rssi);
-                let _ = radio.set_standby_rc().await;
             }
             scan_idx = scan_idx.wrapping_add(1);
             if scan_idx % count == 0 {

@@ -68,6 +68,7 @@ async fn main(_spawner: Spawner) {
         &config,
         &STATS,
         None,
+        None,
     )
     .await
 }

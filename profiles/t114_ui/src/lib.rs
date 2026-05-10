@@ -217,6 +217,7 @@ pub async fn run(spawner: Spawner, role: Role) -> ! {
                     &config,
                     &STATS,
                     Some(&CONFIG_UPDATES),
+                    Some(&SCAN),
                 ),
             )
             .await;
@@ -236,9 +237,9 @@ pub async fn run(spawner: Spawner, role: Role) -> ! {
 ///
 /// Per-screen idle policy:
 ///   - `Idle` → backlight off after [`IDLE_OFF_TIMEOUT`].
-///   - `LinkStats` → never auto-off (read-only live readout —
-///     the user wants to keep watching).
-///   - everything else (Menu, Scan, ChannelSelect, BandPlanSelect,
+///   - `LinkStats` and `Scan` → never auto-off (both are live
+///     readouts the user actively watches).
+///   - everything else (Menu, ChannelSelect, BandPlanSelect,
 ///     PowerSelect, KeySelect, About) → return to Idle after
 ///     [`MENU_TO_IDLE_TIMEOUT`], at which point the Idle 15 s timer
 ///     restarts and ultimately drops the backlight.
@@ -359,8 +360,12 @@ async fn ui_loop(
         if display_on {
             let idle_for = Instant::now().duration_since(last_input);
             match state.screen {
-                ScreenId::LinkStats => {
-                    // Never times out — explicit per the UI design.
+                ScreenId::LinkStats | ScreenId::Scan => {
+                    // Never times out — both are live readouts the
+                    // user actively watches.  Scan in particular is a
+                    // setup-time activity (sweeping a band plan looking
+                    // for a clean channel) that can take many minutes;
+                    // bouncing back to Idle mid-survey would be hostile.
                 }
                 ScreenId::Idle => {
                     if idle_for >= IDLE_OFF_TIMEOUT {
