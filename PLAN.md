@@ -313,29 +313,59 @@ add-on) is deferred until DX-LR30 returns to the active path; the UI core is
       iteration; `run_tx` writes `total_sent` / `heartbeats_sent`.  UI snapshots the cell
       on each render and translates into `osrf_ui::LinkStatus` for the Idle banner and
       Link Stats screen.
-- [ ] **Live config-update plumbing**: `Signal<LinkConfig>` in `osrf-link-runtime`; UI pushes
-      to it on `Command::Apply*`, run loop reconfigures the radio between packets without
-      restart.  Today the radio config is fixed to `LinkConfig::default_915()` derived from
-      initial settings — `Command::Apply*` from the UI logs but doesn't yet retune.
-- [ ] **Real channel-scan integration**: replace `synth_scan_pass` with
-      `osrf-link-runtime::scan_step(&[ChannelInfo]) -> [(idx, rssi_dbm)]` (one full pass:
-      pause RX, retune to each, sample RSSI ~10 ms, restore operating channel).  The UI
-      already maintains the `(current, peak)` table from `apply_scan_pass`; needs a real
-      RSSI source.
-- [ ] **Async-SPI display refactor** to fix UI-induced packet loss.  Today the display
-      driver uses sync `Spim::blocking_write` (busy-waits during DMA), so each render
-      blocks the whole executor — including `run_rx` — for ~10-30 ms.  At ~3 Hz render
-      cadence that's enough RX-FIFO-overrun to lose 5-12% of packets.  Current mitigation
-      is rate-limiting: non-Scan screens render at most once per 500 ms, dropping loss
-      to ~1-3%.  Real fix: convert display SPI to `Spim::write().await` (yields during
-      DMA) so other tasks run between SPI bursts.  Two paths: (a) row-buffered
-      framebuffer + async flush, keep `DrawTarget` sync; (b) replace `DrawTarget` with
-      a project-local async draw API.  ~3 hours either way; (a) costs ~480 B of RAM and
-      keeps embedded-graphics integration.
+- [x] **Async-SPI display refactor** to fix UI-induced packet loss.  Display driver
+      pushes pixels via `Spim::write().await` (yields during DMA) instead of
+      `blocking_write`.  Path (a) from the original sketch: a 240×135 RGB565
+      [`Framebuffer`](boards/t114/src/framebuffer.rs) in BSS impls `DrawTarget`
+      synchronously; renderer paints into it; `Display::flush(&mut fb).await` streams
+      the dirty bounding box one row per `Spim::write()` call.  Removed the
+      `IDLE_RENDER_INTERVAL` rate-limit hack — render every iteration of `ui_loop`
+      now.  Loss under sustained UI activity dropped from 5-12% to ~0%.  ~64 KB
+      framebuffer in BSS; total RAM use ~129 KB of the 244 KB available.
+- [x] **Auto-off / inactivity-driven Idle return**.  Per-screen policy in `ui_loop`:
+      Idle → backlight off after 15 s of no input; Menu / ChannelSelect /
+      BandPlanSelect / PowerSelect / KeySelect / About → `state.go_home()` after
+      120 s; LinkStats and Scan stay on indefinitely (live readouts).  Wake-from-
+      sleep is "next joystick press lights the panel and is consumed" — the press
+      doesn't fire its action, so the user can't accidentally trigger a menu item
+      on the wake press.  `UiState::go_home` exposed `pub` so the profile timeout
+      path can call it.
+- [x] **Live config-update plumbing**: `LinkConfigSignal` (newtype around
+      `embassy_sync::signal::Signal`) in `osrf-link-runtime`; UI pushes a fresh
+      `LinkConfig` (rebuilt from `Settings`) on `Command::Apply{Channel,BandPlan,
+      TxPower}`; `run_tx` / `run_rx` poll the signal at top-of-loop and add
+      `wait()` as an arm of their idle `select` so a config change at idle is
+      applied immediately (rather than after the next packet / heartbeat).
+      `apply_*_reconfig` helpers walk the chip through `init` → `configure_radio`
+      → resume (`rx_start` for RX), reset Heartbeat / Watchdog timers if the ms
+      changed, force a session-reset on RX (new RF params imply a new peer).
+      `ApplySetActiveKey` doesn't trigger reconfigure (no AEAD in v1).
+- [x] **Real channel-scan integration**.  New `ScanController` (critical-section
+      `Mutex<RefCell<ScanInner>>` + state-change `Signal`) plus radio driver
+      additions (`set_standby_rc`, `set_frequency_fast`, `get_rssi_inst`).  `run_rx`
+      and `run_tx` both gained an `Option<&ScanController>` parameter and a
+      mode-aware loop: top-of-loop reconciles "is the controller enabled" against
+      a local `scanning` flag, walks the chip between continuous-RX/heartbeat-TX
+      and scan-mode at the transition.  In scan mode each iteration runs
+      `scan_one_channel`: `set_frequency_fast → rx_start → 1 ms settle → 6 RSSI
+      samples spaced 1 ms apart → set_standby_rc`, peak across the 6 samples
+      written to the controller's results array.  6-sample window catches the
+      heartbeat carrier ~60 % per pass; UI's `peak_dbm` accumulator covers the
+      gaps within ~3 passes.  Wide 131-ch full pass: ~920 ms.  ISM 24-ch:
+      ~170 ms.  TX scan drains and discards source MIDI events during sweep
+      (resets queue + `tx_state` on entry so the post-scan heartbeat mask
+      matches the receiver's post-watchdog cleared state).  `apply_scan_pass`
+      skips `SCAN_NO_DATA` slots so a partially-populated pass doesn't clobber
+      previous readings.
 - [ ] **Embassy task split**.  Today everything runs joined into one task (`ui_loop` +
-      `run_rx`/`run_tx` via `embassy_futures::join`).  Once async-SPI lands, split into:
-      `ui_render` (low priority, 30 Hz cap), `ui_input` (event-driven, edge-wake), and
-      `ui_state` / link-runtime (high priority).  Removes the rate-limit hack.
+      `run_rx`/`run_tx` via `embassy_futures::join`).  Originally motivated as a fix
+      for UI-induced packet loss, but the async-SPI refactor solved that directly —
+      loss is ~0 % under sustained UI activity now.  Splitting into `ui_render`
+      (low priority, 30 Hz cap) + `ui_input` (event-driven, edge-wake) +
+      `ui_state` / link-runtime (high priority) is still defensible for cleaner
+      separation of concerns and isolation of any future scan-mode latency on
+      input responsiveness, but no longer urgent.  Likely deferred unless
+      profiling shows render jitter actually matters in practice.
 
 **Exit criteria:** all screens render, joystick navigates correctly, channel/band/power changes
 apply live (without reboot), scan reports per-channel RSSI for the active band plan, packet loss

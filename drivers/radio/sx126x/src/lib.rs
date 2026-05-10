@@ -277,6 +277,13 @@ const CMD_READ_BUFFER: u8 = 0x1E;
 // ---- Register addresses we touch ----
 const REG_TX_CLAMP_CONFIG: u16 = 0x08D8;
 const REG_SYNC_WORD_BASE: u16 = 0x06C0;
+/// RX gain control register (datasheet table 13-25).  Default
+/// `0x94` (rx_default).  Setting `0x96` enables "rx_boosted" mode
+/// — an extra LNA gain stage that improves sensitivity by ~3 dB
+/// at a cost of ~0.9 mA additional RX-mode supply current.
+const REG_RX_GAIN: u16 = 0x08AC;
+const RX_GAIN_DEFAULT: u8 = 0x94;
+const RX_GAIN_BOOSTED: u8 = 0x96;
 
 impl<Spi, Busy, Dio1, Reset, Switch> Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>
 where
@@ -748,6 +755,28 @@ where
         } else {
             Err(Error::UnexpectedIrq(irq))
         }
+    }
+
+    /// Toggle the SX1262's RX gain register between `rx_default`
+    /// (0x94) and `rx_boosted` (0x96).  Boosted adds an extra LNA
+    /// gain stage and is worth ~3 dB receiver sensitivity at the
+    /// cost of ~0.9 mA additional RX-mode supply current
+    /// (datasheet §9.4 "RX Gain Setting" + table 11-7 supply
+    /// current figures).  Caveat per datasheet: the boost setting
+    /// is wiped by the chip on every wake from sleep, so callers
+    /// applying it once at boot are good as long as the chip
+    /// stays out of `SLEEP` mode (we never enter it; STBY_RC and
+    /// STBY_XOSC preserve the register).
+    pub async fn set_rx_boosted(
+        &mut self,
+        boosted: bool,
+    ) -> Result<(), RadioError<Reset, Switch>> {
+        let val = if boosted {
+            RX_GAIN_BOOSTED
+        } else {
+            RX_GAIN_DEFAULT
+        };
+        self.write_register(REG_RX_GAIN, &[val]).await
     }
 
     /// Move the chip to STDBY_RC.  Required before any of the
