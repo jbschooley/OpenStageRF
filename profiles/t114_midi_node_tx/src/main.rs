@@ -61,7 +61,9 @@ async fn main(_spawner: Spawner) {
         &mut r.status_led,
         &mut source,
         boot_counter,
-        &config, &STATS
+        &config,
+        &STATS,
+        None,
     )
     .await
 }

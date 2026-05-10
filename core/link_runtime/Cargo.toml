@@ -12,6 +12,7 @@ embedded-hal       = { workspace = true }
 embedded-hal-async = { workspace = true }
 embassy-time       = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
 embassy-futures    = "0.1"
+embassy-sync       = "0.8"
 heapless           = { workspace = true }
 defmt              = { workspace = true }
 # Cross-task shared state for `LinkStatsCell` — a `Mutex<Cell<LinkStats>>`
