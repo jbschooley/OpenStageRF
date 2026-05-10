@@ -31,10 +31,10 @@ use embassy_time::{Duration, Instant, Timer};
 use osrf_app_midi_node::{run_rx, run_tx, LinkConfig, UartMidiSink, UartMidiSource};
 use osrf_board_t114 as board;
 use osrf_driver_input_joystick5way::{Joystick5Way, JoystickEvent};
-use osrf_link_runtime::LinkStatsCell;
+use osrf_link_runtime::{LinkConfigSignal, LinkStatsCell};
 use osrf_ui::{
-    build_screen, KeyStore, LinkStatus, Renderer, Role, ScreenId, Settings, UiState, WidgetList,
-    MAX_SCAN_CHANNELS,
+    build_screen, Command, KeyStore, LinkStatus, Renderer, Role, ScreenId, Settings, UiState,
+    WidgetList, MAX_SCAN_CHANNELS,
 };
 
 use board::embassy_nrf::gpio::{Input, Output, Pull};
@@ -58,6 +58,13 @@ static EVENT_CHAN: Channel<CriticalSectionRawMutex, JoystickEvent, 8> = Channel:
 /// loop snapshots the latest values each render and turns them into
 /// a `LinkStatus` for the Idle / Link Stats screens.
 static STATS: LinkStatsCell = LinkStatsCell::new();
+
+/// Live config-update channel from UI → link runtime.  When the user
+/// applies a new channel / band plan / TX power, `ui_loop` rebuilds a
+/// `LinkConfig` and signals here; the runtime's `select` arm wakes,
+/// re-runs `configure_radio`, and resumes (re-`rx_start` for RX).
+/// Latest-wins, so two rapid changes collapse to the most recent.
+static CONFIG_UPDATES: LinkConfigSignal = LinkConfigSignal::new();
 
 /// 64 KB in-RAM framebuffer the renderer paints into (sync via
 /// `DrawTarget`).  After each render we hand it to
@@ -160,7 +167,14 @@ pub async fn run(spawner: Spawner, role: Role) -> ! {
                     &mut widgets,
                     &mut renderer,
                 ),
-                run_rx(&mut r.radio0, &mut r.status_led, &mut sink, &config, &STATS),
+                run_rx(
+                    &mut r.radio0,
+                    &mut r.status_led,
+                    &mut sink,
+                    &config,
+                    &STATS,
+                    Some(&CONFIG_UPDATES),
+                ),
             )
             .await;
         }
@@ -191,6 +205,7 @@ pub async fn run(spawner: Spawner, role: Role) -> ! {
                     boot_counter,
                     &config,
                     &STATS,
+                    Some(&CONFIG_UPDATES),
                 ),
             )
             .await;
@@ -257,8 +272,21 @@ async fn ui_loop(
                     defmt::info!("ui: wake (joystick input)");
                 } else if let Some(cmd) = state.handle_event(settings, keys, event) {
                     defmt::info!("ui command: {:?}", cmd);
-                    // TODO (M6 increment 4): push the new LinkConfig
-                    // to the runtime via Signal<LinkConfig>.
+                    // Push live config to the runtime for any command
+                    // that maps onto a `LinkConfig` field.  ApplyChannel
+                    // / ApplyBandPlan / ApplyTxPower all do; key changes
+                    // don't (no AEAD in v1) so we just log those.
+                    match cmd {
+                        Command::ApplyChannel(_)
+                        | Command::ApplyBandPlan(_)
+                        | Command::ApplyTxPower(_) => {
+                            CONFIG_UPDATES.signal(link_config_from(settings));
+                        }
+                        Command::ApplySetActiveKey(_) => {
+                            // No-op until AEAD lands — link layer
+                            // currently emits `key_fp = 0` regardless.
+                        }
+                    }
                 }
             }
             Either::Second(()) => {

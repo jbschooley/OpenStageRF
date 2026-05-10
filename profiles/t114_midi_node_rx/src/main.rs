@@ -45,5 +45,5 @@ async fn main(_spawner: Spawner) {
     let config = LinkConfig::default_915();
     let mut sink = UartMidiSink::new(r.midi_uart);
 
-    run_rx(&mut r.radio0, &mut r.status_led, &mut sink, &config, &STATS).await
+    run_rx(&mut r.radio0, &mut r.status_led, &mut sink, &config, &STATS, None).await
 }

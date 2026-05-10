@@ -67,6 +67,7 @@ async fn main(_spawner: Spawner) {
         boot_counter,
         &config,
         &STATS,
+        None,
     )
     .await
 }

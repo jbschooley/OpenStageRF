@@ -23,7 +23,9 @@
 //! marked link-down so the next packet (post-restart) triggers a
 //! session reset.
 
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select3, Either3};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer};
 use embedded_hal::digital::StatefulOutputPin;
 use embedded_hal_async::{digital::Wait, spi::SpiDevice};
@@ -99,6 +101,58 @@ impl LinkConfig {
             watchdog_ms: 200,
             heartbeat_ms: 10,
         }
+    }
+}
+
+// ── Live config-update signalling ───────────────────────────────────────────
+
+/// Latest-wins slot for live `LinkConfig` updates.  The UI (or any
+/// future producer — flash-restore, BLE config write, telemetry-driven
+/// retune) calls [`signal`](Self::signal) with the new config; the
+/// runtime's `run_tx` / `run_rx` loop checks for a pending update at
+/// each iteration's blocking point and, if one is present, walks the
+/// radio through `init` → re-`configure_radio` → resume (`rx_start`
+/// for RX; just continue for TX).
+///
+/// "Latest-wins" is the right semantics here — only the most recent
+/// config matters; if two updates land before the runtime polls, the
+/// older one is obsolete.  Embassy's [`Signal`] is exactly that.
+///
+/// Profiles that don't need live config (everything except
+/// `t114_ui`) pass `None` for `config_updates` and the runtime skips
+/// the update arm of its `select` entirely — zero cost.
+pub struct LinkConfigSignal {
+    inner: Signal<CriticalSectionRawMutex, LinkConfig>,
+}
+
+impl LinkConfigSignal {
+    pub const fn new() -> Self {
+        Self { inner: Signal::new() }
+    }
+    /// Publish a new config.  Latest-wins: a previously signalled
+    /// (but not yet consumed) config is dropped.
+    pub fn signal(&self, c: LinkConfig) {
+        self.inner.signal(c);
+    }
+    /// Async wait for the next update.  Used by the runtime inside
+    /// `select` so it pre-empts whatever blocking await is in flight.
+    pub async fn wait(&self) -> LinkConfig {
+        self.inner.wait().await
+    }
+    /// Non-blocking poll.  Returns `Some` if a config has been
+    /// signalled and not yet consumed (clears the slot in the same
+    /// call).  Used at the top of each runtime loop iteration so a
+    /// config that landed during the prior fast-path (TX burst, RX
+    /// packet processing) gets applied before the next blocking
+    /// await.
+    pub fn try_take(&self) -> Option<LinkConfig> {
+        self.inner.try_take()
+    }
+}
+
+impl Default for LinkConfigSignal {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -282,11 +336,56 @@ where
 
 // ── TX loop ─────────────────────────────────────────────────────────────────
 
+/// Apply a new `LinkConfig` to the radio mid-flight (TX side):
+/// re-run [`configure_radio`] (which walks the chip back through
+/// `init` → set_*) and update the heartbeat-timer cadence if it
+/// changed.  No RX-restart needed — `run_tx` doesn't keep the radio
+/// in continuous-receive mode.
+///
+/// On reconfigure failure the runtime logs and keeps the previous
+/// config — better than wedging into a halt-on-failure loop, since
+/// a misconfigured tune attempt should be recoverable on the next
+/// update.
+async fn apply_tx_reconfig<Spi, Busy, Dio1, Reset, Switch>(
+    radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
+    current: &mut LinkConfig,
+    new_cfg: &LinkConfig,
+    hb: &mut HeartbeatTimer,
+) where
+    Spi: SpiDevice,
+    Busy: Wait,
+    Dio1: Wait,
+    Reset: embedded_hal::digital::OutputPin,
+    Switch: RfSwitchControl,
+{
+    if let Err(_) = configure_radio(radio, new_cfg).await {
+        defmt::error!("link TX: live reconfigure failed; keeping previous config");
+        return;
+    }
+    if new_cfg.heartbeat_ms != current.heartbeat_ms {
+        *hb = HeartbeatTimer::new(Duration::from_millis(new_cfg.heartbeat_ms));
+    }
+    *current = *new_cfg;
+    defmt::info!(
+        "link TX: live reconfigure → {} Hz / {} bps / +{} dBm",
+        current.frequency_hz,
+        current.bitrate_bps,
+        current.tx_power_dbm,
+    );
+}
+
 /// Run the TX side: consume MIDI messages from `source`, queue them with
 /// status-aware dedup + per-event seq, transmit packets via the credit-
 /// based round-robin queue.  When the queue is empty for
 /// `config.heartbeat_ms`, send a `Heartbeat` instead so the receiver's
 /// watchdog stays fed.
+///
+/// `config_updates` (optional): a [`LinkConfigSignal`] for live
+/// reconfig.  When `Some`, the loop polls it at each iteration and
+/// includes its `wait()` in the queue-empty `select`, so a UI-driven
+/// channel/power change applies between packets without a restart.
+/// Profiles with no UI pass `None` and the polling path is a single
+/// `Option::is_some` check per loop iteration.
 pub async fn run_tx<Spi, Busy, Dio1, Reset, Switch, Led, Source>(
     radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
     led: &mut Led,
@@ -294,6 +393,7 @@ pub async fn run_tx<Spi, Busy, Dio1, Reset, Switch, Led, Source>(
     boot_counter: u16,
     config: &LinkConfig,
     stats: &LinkStatsCell,
+    config_updates: Option<&LinkConfigSignal>,
 ) -> !
 where
     Spi: SpiDevice,
@@ -304,7 +404,8 @@ where
     Led: StatefulOutputPin,
     Source: MidiSource,
 {
-    if let Err(_) = configure_radio(radio, config).await {
+    let mut current = *config;
+    if let Err(_) = configure_radio(radio, &current).await {
         defmt::error!("link TX: radio configure failed; halting");
         loop {
             Timer::after_millis(1000).await;
@@ -312,14 +413,14 @@ where
     }
     defmt::info!(
         "link TX: {} Hz / {} bps GFSK / +{} dBm, boot_counter={}",
-        config.frequency_hz,
-        config.bitrate_bps,
-        config.tx_power_dbm,
+        current.frequency_hz,
+        current.bitrate_bps,
+        current.tx_power_dbm,
         boot_counter
     );
 
     let mut sender = LinkSender::no_crypto(boot_counter);
-    let mut hb = HeartbeatTimer::new(Duration::from_millis(config.heartbeat_ms));
+    let mut hb = HeartbeatTimer::new(Duration::from_millis(current.heartbeat_ms));
     let mut queue = MidiTxQueue::new();
     // Per-channel pressed-note counts for the heartbeat active-channel
     // mask.  Updated on every successful push_channel_voice; encoded
@@ -334,6 +435,16 @@ where
 
     loop {
         let now = Instant::now();
+
+        // 0. Apply any pending live-config update before the next
+        //    blocking await.  Catches updates that landed during the
+        //    prior burst (between `radio.tx()` calls) when there's no
+        //    `select` arm watching the signal.
+        if let Some(sig) = config_updates {
+            if let Some(new_cfg) = sig.try_take() {
+                apply_tx_reconfig(radio, &mut current, &new_cfg, &mut hb).await;
+            }
+        }
 
         // 1. Drain any source events into the queue (non-blocking).
         //    `try_next` is sync and safe to call repeatedly; each event
@@ -384,16 +495,27 @@ where
             continue;
         }
 
-        // 3. Queue empty — wait for source-ready OR heartbeat deadline.
-        //    `wait_ready` may use `embassy_time::Timer` internally; that's
-        //    safe inside `select` because the executor's waker is real.
-        match select(source.wait_ready(), hb.wait()).await {
-            Either::First(()) => {
+        // 3. Queue empty — wait for source-ready OR heartbeat deadline,
+        //    *or* a config update if one is wired in.  Adding the
+        //    update arm here means a config change at idle is applied
+        //    immediately rather than after the next heartbeat fires.
+        let cfg_wait = async {
+            match config_updates {
+                Some(s) => s.wait().await,
+                None => core::future::pending::<LinkConfig>().await,
+            }
+        };
+        match select3(source.wait_ready(), hb.wait(), cfg_wait).await {
+            Either3::First(()) => {
                 // Source has an event ready; loop to drain.
                 continue;
             }
-            Either::Second(()) => {
+            Either3::Second(()) => {
                 // Heartbeat fired — fall through to send one.
+            }
+            Either3::Third(new_cfg) => {
+                apply_tx_reconfig(radio, &mut current, &new_cfg, &mut hb).await;
+                continue;
             }
         }
 
@@ -444,16 +566,72 @@ enum BufferedEvent {
     SysEx(heapless::Vec<u8, { osrf_link::MAX_SYSEX_BYTES }>),
 }
 
+/// Apply a new `LinkConfig` to the radio mid-flight (RX side):
+/// re-`configure_radio` and re-`rx_start`, then reset the watchdog
+/// to the new ms.  Cancels any in-flight `rx_recv` (caller must
+/// have already lost the race in `select3`).
+///
+/// On hard failure the runtime logs and keeps listening on the
+/// previous config — same recoverability stance as TX.
+async fn apply_rx_reconfig<Spi, Busy, Dio1, Reset, Switch>(
+    radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
+    current: &mut LinkConfig,
+    new_cfg: &LinkConfig,
+    wd: &mut WatchdogTimer,
+    receiver: &mut LinkReceiver,
+    rx_state: &mut PressedNotes,
+    divergence_since: &mut [Option<Instant>; 16],
+    link_up: &mut bool,
+) where
+    Spi: SpiDevice,
+    Busy: Wait,
+    Dio1: Wait,
+    Reset: embedded_hal::digital::OutputPin,
+    Switch: RfSwitchControl,
+{
+    if let Err(_) = configure_radio(radio, new_cfg).await {
+        defmt::error!("link RX: live reconfigure failed; keeping previous config");
+        // Try to resume RX on the *previous* config so we don't
+        // get stuck in standby after a partially-applied set_*.
+        let _ = radio.rx_start().await;
+        return;
+    }
+    if let Err(_) = radio.rx_start().await {
+        defmt::error!("link RX: rx_start failed after reconfigure");
+        return;
+    }
+    *wd = WatchdogTimer::new(Duration::from_millis(new_cfg.watchdog_ms));
+    // The new config implies a new peer (or at least new RF
+    // parameters) — anything we knew about the prior session's
+    // packet_seq / pressed-notes is no longer trustworthy.  Force
+    // a session-reset on the next received packet and clear local
+    // pressed-state so a stale mask doesn't trigger recovery.
+    receiver.mark_link_down();
+    *link_up = false;
+    rx_state.reset();
+    *divergence_since = [None; 16];
+    *current = *new_cfg;
+    defmt::info!(
+        "link RX: live reconfigure → {} Hz / {} bps / watchdog={}ms",
+        current.frequency_hz,
+        current.bitrate_bps,
+        current.watchdog_ms,
+    );
+}
+
 /// Run the RX side: receive packets, dedup at packet + event level,
 /// reassemble SysEx, hand each surviving event to the sink.  On
 /// watchdog expiry call `sink.all_notes_off` and mark the receiver as
 /// link-down so the next packet triggers a session reset.
+///
+/// `config_updates` (optional): see [`run_tx`] — same semantics.
 pub async fn run_rx<Spi, Busy, Dio1, Reset, Switch, Led, Sink>(
     radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
     led: &mut Led,
     sink: &mut Sink,
     config: &LinkConfig,
     stats: &LinkStatsCell,
+    config_updates: Option<&LinkConfigSignal>,
 ) -> !
 where
     Spi: SpiDevice,
@@ -464,7 +642,8 @@ where
     Led: StatefulOutputPin,
     Sink: MidiSink,
 {
-    if let Err(_) = configure_radio(radio, config).await {
+    let mut current = *config;
+    if let Err(_) = configure_radio(radio, &current).await {
         defmt::error!("link RX: radio configure failed; halting");
         loop {
             Timer::after_millis(1000).await;
@@ -478,13 +657,13 @@ where
     }
     defmt::info!(
         "link RX: listening on {} Hz / {} bps GFSK, watchdog={}ms",
-        config.frequency_hz,
-        config.bitrate_bps,
-        config.watchdog_ms
+        current.frequency_hz,
+        current.bitrate_bps,
+        current.watchdog_ms
     );
 
     let mut receiver = LinkReceiver::no_crypto();
-    let mut wd = WatchdogTimer::new(Duration::from_millis(config.watchdog_ms));
+    let mut wd = WatchdogTimer::new(Duration::from_millis(current.watchdog_ms));
     let mut radio_buf = [0u8; RF_PAYLOAD_MAX as usize];
     let mut accepted: u32 = 0;
     let mut accepted_heartbeats: u32 = 0;
@@ -537,8 +716,35 @@ where
 
     loop {
         events.clear();
-        match select(radio.rx_recv(&mut radio_buf), wd.wait()).await {
-            Either::First(Ok(pkt)) if pkt.crc_ok => {
+
+        // Apply any pending live-config update before re-entering
+        // `rx_recv`.  Catches updates that landed during the prior
+        // packet's processing (sink writes, stuck-note recovery)
+        // when nothing was watching the signal.
+        if let Some(sig) = config_updates {
+            if let Some(new_cfg) = sig.try_take() {
+                apply_rx_reconfig(
+                    radio,
+                    &mut current,
+                    &new_cfg,
+                    &mut wd,
+                    &mut receiver,
+                    &mut rx_state,
+                    &mut divergence_since,
+                    &mut link_up,
+                )
+                .await;
+            }
+        }
+
+        let cfg_wait = async {
+            match config_updates {
+                Some(s) => s.wait().await,
+                None => core::future::pending::<LinkConfig>().await,
+            }
+        };
+        match select3(radio.rx_recv(&mut radio_buf), wd.wait(), cfg_wait).await {
+            Either3::First(Ok(pkt)) if pkt.crc_ok => {
                 wd.kick();
                 let was_down = !link_up;
                 link_up = true;
@@ -689,21 +895,21 @@ where
                     }
                 }
             }
-            Either::First(Ok(_)) => {
+            Either3::First(Ok(_)) => {
                 crc_mismatch = crc_mismatch.wrapping_add(1);
                 if crc_mismatch % 50 == 0 {
                     defmt::warn!("RX: CRC mismatch count = {}", crc_mismatch);
                 }
             }
-            Either::First(Err(_)) => {
+            Either3::First(Err(_)) => {
                 defmt::warn!("RX: radio error");
             }
-            Either::Second(()) => {
+            Either3::Second(()) => {
                 if link_up {
                     link_up = false;
                     defmt::warn!(
                         "link RX: LINK LOST (no packet for {}ms) → all-notes-off",
-                        config.watchdog_ms
+                        current.watchdog_ms
                     );
                     if let Err(_) = sink.all_notes_off().await {
                         defmt::error!("sink all_notes_off failed");
@@ -719,6 +925,20 @@ where
                     let _ = led.toggle();
                 }
                 wd.kick();
+            }
+            Either3::Third(new_cfg) => {
+                apply_rx_reconfig(
+                    radio,
+                    &mut current,
+                    &new_cfg,
+                    &mut wd,
+                    &mut receiver,
+                    &mut rx_state,
+                    &mut divergence_since,
+                    &mut link_up,
+                )
+                .await;
+                continue;
             }
         }
 
