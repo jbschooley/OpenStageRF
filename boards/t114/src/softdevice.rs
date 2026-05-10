@@ -118,4 +118,5 @@ fn lower_app_interrupt_priorities() {
     interrupt::TWISPI1.set_priority(Priority::P2); // bound but unused; harmless
     interrupt::SPI2.set_priority(Priority::P2);    // ST7789 display SPIM
     interrupt::UARTE1.set_priority(Priority::P2);  // DIN MIDI UART
+    interrupt::SAADC.set_priority(Priority::P2);   // Battery ADC
 }

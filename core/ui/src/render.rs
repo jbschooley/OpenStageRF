@@ -33,12 +33,12 @@ use embedded_graphics::{
     mono_font::{ascii::FONT_9X18, MonoFont, MonoTextStyle, MonoTextStyleBuilder},
     pixelcolor::BinaryColor,
     prelude::*,
-    primitives::{PrimitiveStyle, Rectangle},
+    primitives::{Line, PrimitiveStyle, Rectangle},
     text::{Baseline, Text, TextStyleBuilder},
 };
 use heapless::{String, Vec as HVec};
 
-use crate::{ScanState, Widget, WidgetList, MAX_WIDGETS, SCAN_NO_DATA};
+use crate::{battery::NO_BATTERY_MV, ScanState, Widget, WidgetList, MAX_WIDGETS, SCAN_NO_DATA};
 
 /// Glyph height + 1 px inter-row gap.
 const ROW_HEIGHT_PX: u32 = 19;
@@ -222,6 +222,100 @@ impl Renderer {
                     .draw(display)?;
                 }
 
+                Widget::BatteryIndicator {
+                    voltage_mv,
+                    percent,
+                    plugged_in,
+                } => {
+                    // Format as "  87% 4.05V" — fixed 11 chars so
+                    // width-change cases (99→100, etc.) don't
+                    // leave trailing pixels.  "—" placeholder when
+                    // no reading yet.
+                    let mut text_buf: String<12> = String::new();
+                    if *voltage_mv < NO_BATTERY_MV {
+                        // No battery present (or pre-first-reading).
+                        // A floating divider reads ~0 mV; a partial-
+                        // contact / damaged cell can read intermediate
+                        // junk.  Either way, don't pretend to know
+                        // SoC — show the placeholder.
+                        let _ = write!(&mut text_buf, " --% ----V");
+                    } else {
+                        // Voltage rendered as X.XXV (millivolt-rounded
+                        // to the hundredth).  Percent right-padded
+                        // to 3 chars so we don't shrink when going
+                        // from "100%" down to "99%".
+                        let v_int = (*voltage_mv) / 1000;
+                        let v_frac = ((*voltage_mv) % 1000) / 10;
+                        let _ = write!(
+                            &mut text_buf,
+                            "{:>3}% {}.{:02}V",
+                            percent, v_int, v_frac
+                        );
+                    }
+
+                    // Compute pixel x where the text starts.  Right-
+                    // align the block (text + optional bolt) to the
+                    // panel's right edge with `RIGHT_MARGIN_PX`
+                    // breathing room.
+                    let bolt_w: u32 = if *plugged_in { 7 } else { 0 };
+                    let bolt_gap: u32 = if *plugged_in { 3 } else { 0 };
+                    let text_w = text_buf.len() as u32 * GLYPH_WIDTH_PX;
+                    let total_w = text_w + bolt_gap + bolt_w + RIGHT_MARGIN_PX;
+                    let x_text = (bbox.size.width as i32) - (total_w as i32);
+
+                    // Clear our slot to fg (matching the title bar
+                    // background) so a width shrink doesn't leave
+                    // stale glyphs hanging behind.
+                    Rectangle::new(
+                        Point::new(x_text - 2, 0),
+                        Size::new(total_w + 2, ROW_HEIGHT_PX),
+                    )
+                    .into_styled(PrimitiveStyle::with_fill(fg))
+                    .draw(display)?;
+
+                    Text::with_text_style(
+                        &text_buf,
+                        Point::new(x_text, 1),
+                        inverted_style,
+                        baseline_top,
+                    )
+                    .draw(display)?;
+
+                    if *plugged_in {
+                        // Tiny 3-segment lightning bolt centred to
+                        // the right of the text.  FONT_9X18 doesn't
+                        // have a bolt glyph and iso_8859_1 doesn't
+                        // either, so we hand-draw one from line
+                        // segments.  Origin is the bolt's top-left
+                        // corner; the bolt occupies ~7×13 px.
+                        let bx = x_text + text_w as i32 + bolt_gap as i32;
+                        let by: i32 = 3;
+                        let stroke = PrimitiveStyle::with_stroke(bg, 1);
+                        // Top diagonal: top-right down to mid-left.
+                        Line::new(
+                            Point::new(bx + 4, by),
+                            Point::new(bx + 1, by + 6),
+                        )
+                        .into_styled(stroke)
+                        .draw(display)?;
+                        // Horizontal crossbar at the kink.
+                        Line::new(
+                            Point::new(bx + 1, by + 6),
+                            Point::new(bx + 5, by + 6),
+                        )
+                        .into_styled(stroke)
+                        .draw(display)?;
+                        // Bottom diagonal: from crossbar's right down
+                        // to lower-left tip.
+                        Line::new(
+                            Point::new(bx + 5, by + 6),
+                            Point::new(bx + 2, by + 12),
+                        )
+                        .into_styled(stroke)
+                        .draw(display)?;
+                    }
+                }
+
                 Widget::Text { row, text } => {
                     let y = row_to_y(*row);
                     if y >= bbox.size.height as i32 {
@@ -364,6 +458,10 @@ fn widget_row(w: &Widget) -> u8 {
         Widget::Footer(_) => FOOTER_ROW,
         Widget::LinkStatus { row, .. } => *row,
         Widget::ScanGraph { .. } => FULLSCREEN_ROW,
+        // Battery indicator paints over the right side of the title
+        // row; treated as row 0 so the diff machinery groups it with
+        // the title for clear/redraw scoping.
+        Widget::BatteryIndicator { .. } => 0,
     }
 }
 

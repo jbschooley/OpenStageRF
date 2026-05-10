@@ -38,12 +38,16 @@ use heapless::{String, Vec};
 pub use osrf_driver_input_joystick5way::{Direction, JoystickEvent};
 
 pub mod band_plan;
+pub mod battery;
 pub mod key_store;
 pub mod render;
 
 pub use band_plan::{
     channel as band_plan_channel, max_channel_index, BandPlan, BandPlanInfo, ChannelInfo,
     BAND_PLANS,
+};
+pub use battery::{
+    voltage_to_percent, BatteryStatus, CRITICAL_THRESHOLD_PCT, LOW_THRESHOLD_PCT, SHUTDOWN_MV,
 };
 pub use key_store::{KeyEntry, KeyStore, MAX_KEY_NAME, MAX_KEYS};
 pub use render::{render, Renderer};
@@ -1063,6 +1067,21 @@ pub enum Widget {
     /// Status indicator for the link.  `up=true` is "good";
     /// renderer typically draws as a coloured dot or text colour.
     LinkStatus { row: u8, up: bool, text: String<24> },
+    /// Battery indicator overlaid on the right side of the title
+    /// row (row 0).  Pushed by the profile *after* `build_screen`
+    /// returns, so every screen gets it without each `build_*`
+    /// function having to opt in.  Renderer paints over the
+    /// rightmost portion of the inverted title bar.
+    BatteryIndicator {
+        /// Latest measured Vbat in mV.  0 = no reading yet —
+        /// renderer shows placeholder text.
+        voltage_mv: u16,
+        /// Latest SoC percent 0..=100.
+        percent: u8,
+        /// USB present.  Renderer draws a small lightning-bolt
+        /// glyph beside the text when true.
+        plugged_in: bool,
+    },
     /// Channel-scan graph marker.  Carries only what changes per
     /// frame at small cost; the (much larger) per-channel RSSI
     /// arrays live in [`UiState::scan`] and are passed to the
