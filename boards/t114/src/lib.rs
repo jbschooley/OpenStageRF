@@ -14,7 +14,7 @@
 //!   - SPI3    (periph 3, dedicated) → radio1 (dual_spi_diff_bus)
 //! No two modules share the same nRF52840 peripheral instance.
 
-use embassy_nrf::{bind_interrupts, buffered_uarte, peripherals, spim};
+use embassy_nrf::{bind_interrupts, buffered_uarte, peripherals, saadc, spim};
 
 // Re-export so profile binaries can drive HAL-level peripherals without
 // depending on these crates directly.
@@ -22,6 +22,7 @@ pub use embassy_nrf;
 pub use embedded_hal;
 pub use embedded_hal_bus;
 
+pub mod battery;
 pub mod clocks;
 pub mod display;
 pub mod framebuffer;
@@ -37,6 +38,7 @@ bind_interrupts!(pub struct Irqs {
     TWISPI1 => spim::InterruptHandler<peripherals::TWISPI1>;
     SPI2    => spim::InterruptHandler<peripherals::SPI2>;
     UARTE1  => buffered_uarte::InterruptHandler<peripherals::UARTE1>;
+    SAADC   => saadc::InterruptHandler;
 });
 
 // ── Built-in SX1262 radio (TWISPI0 in SPI mode) ──────────────────────────────
@@ -261,6 +263,14 @@ pub struct Resources {
     /// it dark.  Replaced with a real driver if/when the NeoPixel is
     /// actually used.
     pub neopixel_parked: embassy_nrf::gpio::Output<'static>,
+
+    /// Battery voltage monitor (SAADC on P0_04 / AIN2, divider
+    /// enable on P0_06 / ADC_CTRL).  See [`battery::BatteryMonitor`].
+    /// Profiles that want a battery indicator spawn a periodic
+    /// sampling task using this; profiles that don't care can drop
+    /// it (no power cost — `ADC_CTRL` is held low so the divider is
+    /// off until the first sample).
+    pub battery: battery::BatteryMonitor,
 }
 
 /// Initialise hardware with the default clock config and bundle the common
@@ -489,6 +499,13 @@ fn build_resources(
     // NeoPixel driver when/if it's ever used.
     let neopixel_parked = Output::new(p.P0_14, Level::Low, OutputDrive::Standard);
 
+    // ── Battery monitor (SAADC on P0_04, divider enable on P0_06) ─────────
+    // ADC_CTRL is initialised LOW (divider disabled) — no current drain
+    // until the profile actually samples.  Heltec's BAT_ADC → AIN2 routes
+    // a 1:3.9 divided Vbat to the SAADC; the driver applies the 4.9×
+    // empirical multiplier on read.
+    let battery = battery::BatteryMonitor::new(p.SAADC, p.P0_04, p.P0_06, Irqs);
+
     (
         Resources {
             status_led,
@@ -497,6 +514,7 @@ fn build_resources(
             display,
             display_backlight,
             neopixel_parked,
+            battery,
         },
         usbd,
     )

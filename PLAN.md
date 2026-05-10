@@ -409,11 +409,21 @@ of bricking it mid-show.
 - [ ] **Portability + no-alloc CI audit** (`xtask audit`): fail CI if any `core/`,
       `drivers/`, or `protocols/` crate directly depends on an `embassy-*` HAL crate, or if
       any non-board/profile `.rs` imports `alloc`.
+- [ ] **Low-battery save-before-shutdown.**  The battery indicator added in M6 watches Vbat
+      via the T114's P0_04 ADC and warns the UI at < 20 %.  Critical threshold (≤ 3100 mV
+      sustained for N reads at ~5 s cadence) needs to trigger an orderly shutdown:
+      `sink.all_notes_off()`, persist current `Settings` + boot-counter to flash (via the
+      `sequential-storage` paths above), drive the LED to a "shutting down" pattern,
+      then enter `wfi` loop.  Without persistence this can't be a clean shutdown — losing
+      settings every time the battery dies is worse UX than the warning.  Requires the
+      flash-storage layer to be in place, which is why this lands here rather than
+      alongside the M6 battery work.
 
 **Exit criteria:** power-cycle the device, settings retained; boot counter visible in
 `[About]` screen and increments on each boot; injected `panic!()` reboots within the WDT
 window and the next About screen shows the panic line; injected infinite-loop in any task
-reboots within the WDT window.
+reboots within the WDT window; pulling battery just under 3.1 V triggers an orderly
+shutdown that retains the previous setting state on next power-up.
 
 ## Total estimate
 

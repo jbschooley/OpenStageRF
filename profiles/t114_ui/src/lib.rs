@@ -50,8 +50,9 @@ use osrf_board_t114 as board;
 use osrf_driver_input_joystick5way::{Joystick5Way, JoystickEvent};
 use osrf_link_runtime::{LinkConfigSignal, LinkStatsCell, ScanController};
 use osrf_ui::{
-    band_plan_channel, build_screen, max_channel_index, BandPlan, Command, KeyStore, LinkStatus,
-    Renderer, Role, ScanState, ScreenId, Settings, UiState, WidgetList, MAX_SCAN_CHANNELS,
+    band_plan_channel, build_screen, max_channel_index, BandPlan, BatteryStatus, Command,
+    KeyStore, LinkStatus, Renderer, Role, ScanState, ScreenId, Settings, UiState, Widget,
+    WidgetList, MAX_SCAN_CHANNELS,
 };
 
 use board::embassy_nrf::gpio::{Input, Output, Pull};
@@ -91,6 +92,20 @@ static CONFIG_UPDATES: LinkConfigSignal = LinkConfigSignal::new();
 /// sampling RSSI per channel.  Each render tick the ui_state task
 /// snapshots the results into `state.scan` via `apply_scan_pass`.
 static SCAN: ScanController = ScanController::new();
+
+/// Latest battery reading.  Written by [`battery_task`] every
+/// [`BATTERY_SAMPLE_INTERVAL_S`] seconds and on every USB-plug
+/// event, read by `ui_state_loop` each frame build to populate the
+/// top-bar indicator.  `Cell<BatteryStatus>` is fine here:
+/// `BatteryStatus` is `Copy` and updates are infrequent.
+static BATTERY: critical_section::Mutex<core::cell::Cell<BatteryStatus>> =
+    critical_section::Mutex::new(core::cell::Cell::new(BatteryStatus::UNKNOWN));
+
+/// Sample-rate for battery monitoring.  Meshtastic uses 5 s; we
+/// match.  Faster polling buys nothing (LiPo Vbat moves slowly
+/// relative to a 5 s window) and burns extra current through the
+/// divider.
+const BATTERY_SAMPLE_INTERVAL_S: u64 = 5;
 
 /// "Render this frame" handoff from ui_state → ui_render.  ui_state
 /// builds a fresh [`WidgetList`] from the UI state machine, snapshots
@@ -181,6 +196,15 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
 
     let initial_status = link_status_from_stats(&STATS.get());
     build_screen(&state, &settings, &keys, &initial_status, &mut widgets);
+    // Include the (still-unknown) battery indicator on the initial
+    // paint so the title bar's right side is properly themed from
+    // frame zero rather than briefly showing whatever was beneath.
+    let initial_battery = critical_section::with(|cs| BATTERY.borrow(cs).get());
+    let _ = widgets.push(Widget::BatteryIndicator {
+        voltage_mv: initial_battery.voltage_mv,
+        percent: initial_battery.percent,
+        plugged_in: initial_battery.plugged_in,
+    });
     let _ = renderer.render(&widgets, &state.scan, fb);
     display.flush(fb).await;
     backlight.set_low(); // backlight on (active LOW)
@@ -204,6 +228,9 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     let js_ct = Input::new(pins.4, Pull::Up);
     let joystick = Joystick5Way::new(js_up, js_dn, js_lt, js_rt, js_ct);
     spawner.spawn(joystick_task(joystick).expect("alloc joystick_task"));
+
+    // ── Battery monitor — periodic SAADC sampler ──────────────────
+    spawner.spawn(battery_task(r.battery).expect("alloc battery_task"));
 
     // ── ui_render task — owns display + fb + renderer ──────────────
     spawner.spawn(ui_render_task(display, fb, renderer).expect("alloc ui_render_task"));
@@ -375,6 +402,43 @@ async fn joystick_task(mut js: Joystick) {
     }
 }
 
+/// Periodic battery sampler.  Wakes every
+/// [`BATTERY_SAMPLE_INTERVAL_S`] seconds, reads Vbat via the
+/// SAADC + divider, polls VBUS presence via
+/// [`board::battery::vbus_present`], writes to the shared
+/// [`BATTERY`] cell.
+///
+/// Low / critical warning logs only fire when an actual battery is
+/// detected (Vbat ≥ `NO_BATTERY_MV`) — a probe-only board with no
+/// cell wired in stays quiet rather than spamming the log with
+/// "critical: 0 mV" messages.
+#[embassy_executor::task]
+async fn battery_task(mut monitor: board::battery::BatteryMonitor) {
+    loop {
+        let mv = monitor.sample().await;
+        let plugged_in = board::battery::vbus_present();
+        let status = BatteryStatus::from_reading(mv, plugged_in);
+        critical_section::with(|cs| BATTERY.borrow(cs).set(status));
+        // Only nag when there's a real battery to nag about.  An
+        // unpopulated cell socket reads ~0 mV and would otherwise
+        // log "critical" forever.
+        if status.is_critical() {
+            defmt::warn!(
+                "battery critical: {=u16} mV ({=u8} %)",
+                status.voltage_mv,
+                status.percent
+            );
+        } else if status.is_low() {
+            defmt::info!(
+                "battery low: {=u16} mV ({=u8} %)",
+                status.voltage_mv,
+                status.percent
+            );
+        }
+        embassy_time::Timer::after_secs(BATTERY_SAMPLE_INTERVAL_S).await;
+    }
+}
+
 // ── UI state loop (main task body) ──────────────────────────────
 
 /// UI state machine driver.  Runs as the main task on the thread
@@ -511,6 +575,16 @@ async fn ui_state_loop(
         if display_on {
             let status = link_status_from_stats(&STATS.get());
             build_screen(state, &settings, &keys, &status, widgets);
+            // Top-bar battery indicator — pushed by the profile (not
+            // by `build_screen`) so every screen gets it without each
+            // `build_*` having to opt in.  Renderer paints over the
+            // right side of the inverted title bar.
+            let battery = critical_section::with(|cs| BATTERY.borrow(cs).get());
+            let _ = widgets.push(Widget::BatteryIndicator {
+                voltage_mv: battery.voltage_mv,
+                percent: battery.percent,
+                plugged_in: battery.plugged_in,
+            });
             FRAME.signal(FrameData {
                 widgets: widgets.clone(),
                 scan: state.scan.clone(),
