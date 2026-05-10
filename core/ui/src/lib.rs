@@ -644,6 +644,16 @@ impl UiState {
     pub fn apply_scan_pass(&mut self, rssi: &[i16]) {
         let n = (rssi.len()).min(self.scan.channel_count as usize);
         for i in 0..n {
+            // [`SCAN_NO_DATA`] means "this slot wasn't sampled in
+            // this pass" — common with the runtime's incremental
+            // scanner where each render-tick reads a partially-
+            // populated results array.  Leave the previous reading
+            // (and the peak) intact instead of clobbering it with a
+            // sentinel that the renderer would interpret as "draw
+            // nothing."
+            if rssi[i] == SCAN_NO_DATA {
+                continue;
+            }
             self.scan.current_dbm[i] = rssi[i];
             if rssi[i] > self.scan.peak_dbm[i] {
                 self.scan.peak_dbm[i] = rssi[i];

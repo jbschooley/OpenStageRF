@@ -32,7 +32,7 @@ pub mod uart;
 // on `osrf-link-runtime` directly.
 pub use osrf_link_runtime::{
     configure_radio, run_rx, run_tx, LinkConfig, LinkConfigSignal, LinkStats, LinkStatsCell,
-    RF_PAYLOAD_MAX,
+    ScanController, RF_PAYLOAD_MAX, SCAN_MAX_CHANNELS, SCAN_RSSI_NONE,
 };
 
 pub use uart::{UartMidiSink, UartMidiSource};

@@ -31,10 +31,10 @@ use embassy_time::{Duration, Instant, Timer};
 use osrf_app_midi_node::{run_rx, run_tx, LinkConfig, UartMidiSink, UartMidiSource};
 use osrf_board_t114 as board;
 use osrf_driver_input_joystick5way::{Joystick5Way, JoystickEvent};
-use osrf_link_runtime::{LinkConfigSignal, LinkStatsCell};
+use osrf_link_runtime::{LinkConfigSignal, LinkStatsCell, ScanController};
 use osrf_ui::{
-    build_screen, Command, KeyStore, LinkStatus, Renderer, Role, ScreenId, Settings, UiState,
-    WidgetList, MAX_SCAN_CHANNELS,
+    band_plan_channel, build_screen, max_channel_index, BandPlan, Command, KeyStore, LinkStatus,
+    Renderer, Role, ScreenId, Settings, UiState, WidgetList, MAX_SCAN_CHANNELS,
 };
 
 use board::embassy_nrf::gpio::{Input, Output, Pull};
@@ -65,6 +65,16 @@ static STATS: LinkStatsCell = LinkStatsCell::new();
 /// re-runs `configure_radio`, and resumes (re-`rx_start` for RX).
 /// Latest-wins, so two rapid changes collapse to the most recent.
 static CONFIG_UPDATES: LinkConfigSignal = LinkConfigSignal::new();
+
+/// Channel-scan handoff between UI and runtime.  When the user enters
+/// the Scan screen, `ui_loop` calls `start()` with the current band
+/// plan's frequency list; the runtime's `run_rx` walks the list,
+/// sampling RSSI per channel.  Each render tick the UI snapshots the
+/// results into `state.scan` via `apply_scan_pass`.  Stop on Scan-
+/// screen exit so the link comes back up.  TX side ignores this
+/// (heartbeats keep flowing on the operating channel).
+
+static SCAN: ScanController = ScanController::new();
 
 /// 64 KB in-RAM framebuffer the renderer paints into (sync via
 /// `DrawTarget`).  After each render we hand it to
@@ -174,6 +184,7 @@ pub async fn run(spawner: Spawner, role: Role) -> ! {
                     &config,
                     &STATS,
                     Some(&CONFIG_UPDATES),
+                    Some(&SCAN),
                 ),
             )
             .await;
@@ -257,6 +268,13 @@ async fn ui_loop(
     let mut last_input = Instant::now();
     let mut display_on = true;
 
+    // Channel-scan state tracking.  We keep the runtime's
+    // `ScanController` in sync with the UI's screen + band plan so
+    // entering the Scan screen kicks off a real RSSI sweep and
+    // leaving stops it (link resumes on operating channel).
+    let mut scan_running = false;
+    let mut scan_plan: Option<BandPlan> = None;
+
     loop {
         let next_tick = Timer::after(scan_tick);
         match select(EVENT_CHAN.receive(), next_tick).await {
@@ -290,16 +308,49 @@ async fn ui_loop(
                 }
             }
             Either::Second(()) => {
-                // Tick: advance the scan stub if we're on the Scan
-                // screen *and* the panel is on.  No point synthesising
-                // bars the user can't see.
+                // Tick: pull fresh per-channel RSSI from the runtime
+                // scanner if we're on the Scan screen *and* the panel
+                // is on.  No point reading the cell when the user
+                // can't see the bars.
                 if display_on && state.screen == ScreenId::Scan {
                     let mut buf = [0i16; MAX_SCAN_CHANNELS];
                     let n = state.scan.channel_count as usize;
-                    synth_scan_pass(&mut buf[..n]);
+                    SCAN.read_results(&mut buf[..n]);
                     state.apply_scan_pass(&buf[..n]);
                 }
             }
+        }
+
+        // Reconcile the runtime scanner's mode with the UI's
+        // current screen.  Scanning is gated on `display_on` because
+        // the user can't see the bars otherwise — and pausing the
+        // scan when the panel sleeps lets the link resume between
+        // sleep periods.
+        let want_scan = display_on && state.screen == ScreenId::Scan;
+        let cur_plan = settings.band_plan;
+        match (scan_running, want_scan, scan_plan == Some(cur_plan)) {
+            (false, true, _) => {
+                let mut freqs = [0u32; MAX_SCAN_CHANNELS];
+                let n = collect_scan_frequencies(cur_plan, &mut freqs);
+                SCAN.start(&freqs[..n]);
+                scan_running = true;
+                scan_plan = Some(cur_plan);
+            }
+            (true, true, false) => {
+                // Band plan changed while we were on Scan (rare —
+                // the user has to leave Scan to pick a plan, but
+                // future split-screen layouts might allow it).
+                let mut freqs = [0u32; MAX_SCAN_CHANNELS];
+                let n = collect_scan_frequencies(cur_plan, &mut freqs);
+                SCAN.start(&freqs[..n]);
+                scan_plan = Some(cur_plan);
+            }
+            (true, false, _) => {
+                SCAN.stop();
+                scan_running = false;
+                scan_plan = None;
+            }
+            _ => {}
         }
 
         // Inactivity transitions.  Only meaningful while the display
@@ -393,27 +444,17 @@ fn read_random_u16() -> u16 {
     u16::from_be_bytes(bytes)
 }
 
-/// Stub scanner: synthesize per-channel noise floors that move
-/// over time so the Scan screen visibly updates without a real
-/// radio.  Each channel oscillates around its own baseline at a
-/// distinct phase, with one occasional spike per pass to exercise
-/// the peak-tick render path.  Replace with a real
-/// `link_runtime.scan_step(...)` call once live config-update
-/// plumbing lands.
-fn synth_scan_pass(out: &mut [i16]) {
-    let n = out.len();
-    let t = Instant::now().as_millis() as i32;
-    let spike_target = (t / 600) as usize % n.max(1);
-    for (i, slot) in out.iter_mut().enumerate() {
-        let phase = ((t / 50) + (i as i32) * 30) % 240;
-        let tri = if phase < 120 { phase } else { 240 - phase };
-        let baseline = -100 - (i as i32 % 5);
-        let mut dbm = baseline + (tri / 10);
-        if spike_target == i {
-            dbm += 18;
-        }
-        *slot = dbm as i16;
+/// Build the frequency list (Hz) for a band plan, in channel-index
+/// order.  Used to seed [`ScanController::start`] when the user
+/// enters the Scan screen — the runtime then walks this list in
+/// `run_rx`'s scan branch, sampling RSSI per slot.
+fn collect_scan_frequencies(plan: BandPlan, out: &mut [u32; MAX_SCAN_CHANNELS]) -> usize {
+    let max_idx = max_channel_index(plan);
+    let n = (max_idx as usize + 1).min(MAX_SCAN_CHANNELS);
+    for i in 0..n {
+        out[i] = band_plan_channel(plan, i as u8).frequency_khz * 1000;
     }
+    n
 }
 
 #[embassy_executor::task]

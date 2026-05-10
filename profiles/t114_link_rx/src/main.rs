@@ -38,5 +38,5 @@ async fn main(_spawner: Spawner) {
     let config = LinkBenchConfig::default_915();
 
     let mut sink = DefmtLogSink;
-    run_rx(&mut r.radio0, &mut r.status_led, &mut sink, &config, &STATS, None).await
+    run_rx(&mut r.radio0, &mut r.status_led, &mut sink, &config, &STATS, None, None).await
 }
