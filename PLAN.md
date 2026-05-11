@@ -462,9 +462,19 @@ battery triggers a clean shutdown with audible-MIDI-quiet rather than a brownout
       write to `0xE000EDFC` at the top of `run()` clears them.  Production boots never
       see this (no probe → no bits set → no-op write), but it makes dev iteration
       survivable without NRESET-after-every-cargo-run.  See chat 2026-05-11.
-- [ ] **Portability + no-alloc CI audit** (`xtask audit`): fail CI if any `core/`,
-      `drivers/`, or `protocols/` crate directly depends on an `embassy-*` HAL crate, or if
-      any non-board/profile `.rs` imports `alloc`.
+- [x] **Portability + no-alloc CI audit** (`cargo xtask audit`).  Scans every crate
+      under `core/`, `drivers/`, `protocols/`, `crypto/`, `apps/`; flags two classes
+      of violation and exits non-zero on any hit:
+        1. Any `[dependencies]` entry whose name starts with `embassy-` that isn't on
+           a whitelist of framework crates (`embassy-time`, `embassy-sync`,
+           `embassy-futures`, `embassy-executor`, `embassy-usb*`) — HAL crates
+           (`embassy-nrf`, `embassy-stm32`, …) must live in `boards/` or `profiles/`.
+        2. Any `.rs` file under those dirs containing `extern crate alloc` or
+           `use alloc::` — heap allocation stays an explicit per-board choice.
+      `boards/`, `profiles/`, `ports/`, `xtask/` are exempt (those are exactly where
+      HAL + allocator wiring belong).  Smoke-tested both detection paths in
+      2026-05-11 chat; current workspace passes clean (14 shared crates).  Hook into
+      CI as a single `cargo xtask audit` step whenever the workflow gets written.
 - [x] **Low-battery graceful shutdown — quick version.**  Critical threshold (Vbat ≤
       `SHUTDOWN_MV`, sustained for 5 reads at 5 s cadence, USB unplugged) triggers, in order:
         1. `SHUTDOWN.signal()` from `battery_task` → link runtime arm wakes.
@@ -499,9 +509,9 @@ battery triggers a clean shutdown with audible-MIDI-quiet rather than a brownout
   - About scroll Up/Down works, with overshoot clamping (Down past end doesn't
     accumulate scroll the user has to undo).
 
-**Remaining sub-items:** key store stub, portability/no-alloc CI audit (`xtask audit`).
-Both are listed above with `[ ]` and can be picked up independently; everything else
-in this milestone has landed.
+**Milestone status:** ✅ complete (2026-05-11).  Key store stub and portability /
+no-alloc audit landed alongside the panic / shutdown / About work.  Only follow-on
+item is wiring `cargo xtask audit` into a CI workflow once one exists.
 
 ### Milestone 8 — power management + battery chemistry options (3–5 days)
 
