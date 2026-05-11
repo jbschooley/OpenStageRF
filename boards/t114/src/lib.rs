@@ -26,6 +26,7 @@ pub mod battery;
 pub mod clocks;
 pub mod display;
 pub mod framebuffer;
+pub mod panic_record;
 pub mod softdevice;
 pub mod storage;
 #[cfg(feature = "usb-log")]
@@ -272,6 +273,15 @@ pub struct Resources {
     /// it (no power cost — `ADC_CTRL` is held low so the divider is
     /// off until the first sample).
     pub battery: battery::BatteryMonitor,
+
+    /// Hardware watchdog peripheral token.  Profiles that want
+    /// hang-detection turn this into an [`embassy_nrf::wdt::Watchdog`]
+    /// with 1..=8 [`embassy_nrf::wdt::WatchdogHandle`]s — one per
+    /// monitored task.  Once started the WDT can't be stopped
+    /// without a reset, so profiles that don't care can simply
+    /// drop the token (the peripheral stays unconfigured /
+    /// dormant).
+    pub wdt: embassy_nrf::Peri<'static, embassy_nrf::peripherals::WDT>,
 }
 
 /// Initialise hardware with the default clock config and bundle the common
@@ -507,6 +517,10 @@ fn build_resources(
     // empirical multiplier on read.
     let battery = battery::BatteryMonitor::new(p.SAADC, p.P0_04, p.P0_06, Irqs);
 
+    // ── Watchdog peripheral token ──────────────────────────────────────────
+    // Passed through; profile decides whether to arm it and how many slots.
+    let wdt = p.WDT;
+
     (
         Resources {
             status_led,
@@ -516,6 +530,7 @@ fn build_resources(
             display_backlight,
             neopixel_parked,
             battery,
+            wdt,
         },
         usbd,
     )

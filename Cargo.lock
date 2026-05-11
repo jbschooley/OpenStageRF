@@ -1647,7 +1647,6 @@ dependencies = [
  "osrf-driver-input-joystick5way",
  "osrf-link-runtime",
  "osrf-ui",
- "panic-probe",
  "sequential-storage",
 ]
 

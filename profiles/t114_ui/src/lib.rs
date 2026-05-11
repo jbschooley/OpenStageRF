@@ -60,6 +60,7 @@ use sequential_storage::map;
 
 use board::embassy_nrf::gpio::{Input, Output, Pull};
 use board::embassy_nrf::interrupt::{self, InterruptExt, Priority};
+use board::embassy_nrf::wdt::{Config as WdtConfig, Watchdog, WatchdogHandle};
 use board::framebuffer::Framebuffer;
 
 /// Joystick pin types per `boards/t114/src/lib.rs::joystick`.
@@ -109,6 +110,27 @@ static BATTERY: critical_section::Mutex<core::cell::Cell<BatteryStatus>> =
 /// relative to a 5 s window) and burns extra current through the
 /// divider.
 const BATTERY_SAMPLE_INTERVAL_S: u64 = 5;
+
+/// Hardware-watchdog timeout in 32 768 Hz ticks (5 seconds).  Each
+/// monitored task owns one [`WatchdogHandle`] and must call
+/// [`WatchdogHandle::pet`] at least this often, or the WDT triggers
+/// a chip reset.  5 s is comfortable for our task cadences
+/// (`ui_state_loop` pets every ~300 ms, `ui_render_task` pets after
+/// each frame or a 2 s no-frame timer) while giving meaningful hang
+/// detection — a stuck task is caught within 5 s, on the next boot
+/// `RESETREAS` will have the DOG bit set so the diagnostic surfaces.
+///
+/// Link-runtime is *not* watchdog-monitored in this version.  The
+/// link layer has its own 200 ms link-loss watchdog; a HW-WDT slot
+/// for `run_rx` / `run_tx` would couple the runtime to embassy-nrf
+/// and we'd rather keep `core/link_runtime` HAL-agnostic.  If the
+/// runtime ever hangs the link goes silent + the RX-side watchdog
+/// fires all-notes-off, which is the right operational signal.
+const WDT_TIMEOUT_TICKS: u32 = 5 * 32_768;
+/// How often `ui_render_task` falls through its FRAME wait to pet
+/// the WDT when the display is off (no frames signalled).  Must be
+/// comfortably less than `WDT_TIMEOUT_TICKS` worth of seconds.
+const WDT_RENDER_IDLE_PET_S: u64 = 2;
 
 /// "Render this frame" handoff from ui_state → ui_render.  ui_state
 /// builds a fresh [`WidgetList`] from the UI state machine, snapshots
@@ -183,6 +205,12 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     Timer::after_millis(10).await;
     let mut flash = board::storage::flash(sd);
 
+    // Recover any panic staged by the prior boot (if any).  Reads
+    // and clears RESETREAS, takes the staged record from .uninit,
+    // logs + persists to the panic-ring flash region.  Idempotent:
+    // a clean cold boot here is a no-op.
+    recover_pending_panic(&mut flash).await;
+
     // ── Display init + initial paint (synchronous, before split) ──
     //
     // The initial frame is rendered + flushed before we hand the
@@ -244,8 +272,20 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     // ── Battery monitor — periodic SAADC sampler ──────────────────
     spawner.spawn(battery_task(r.battery).expect("alloc battery_task"));
 
-    // ── ui_render task — owns display + fb + renderer ──────────────
-    spawner.spawn(ui_render_task(display, fb, renderer).expect("alloc ui_render_task"));
+    // ── Hardware watchdog — arm with 2 slots (main + ui_render) ───
+    // Done late in boot so the slow startup steps (display rail
+    // warmup, SD enable, initial flash reads) don't trip the WDT
+    // before any task is alive to pet it.  Once armed, can't be
+    // disarmed — any reset path resets the chip.
+    let mut wdt_config = WdtConfig::default();
+    wdt_config.timeout_ticks = WDT_TIMEOUT_TICKS;
+    let (_wdt, [wdt_main, wdt_render]) =
+        Watchdog::try_new(r.wdt, wdt_config).expect("WDT already configured differently");
+
+    // ── ui_render task — owns display + fb + renderer + WDT handle ─
+    spawner.spawn(
+        ui_render_task(display, fb, renderer, wdt_render).expect("alloc ui_render_task"),
+    );
 
     // ── link_runtime on its own interrupt executor at P2 ──────────
     //
@@ -312,6 +352,7 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     ui_state_loop(
         &mut backlight,
         &mut flash,
+        wdt_main,
         &mut state,
         settings,
         keys,
@@ -324,22 +365,35 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
 
 /// Renderer task — awaits a fresh [`FrameData`] on [`FRAME`], paints
 /// it into the framebuffer, and flushes the dirty region to the panel
-/// via async SPI.  Owns the display, framebuffer, and renderer for
-/// the lifetime of the program; nothing else writes to them.
+/// via async SPI.  Owns the display, framebuffer, renderer, and one
+/// hardware-watchdog handle for the lifetime of the program; nothing
+/// else writes to them.
 ///
-/// When the panel is "off" (backlight high), ui_state simply doesn't
-/// signal new frames — so this task sleeps on `FRAME.wait()` until the
-/// user wakes the display.  No need for an explicit on/off path here.
+/// WDT handling: pet after every render *or* every
+/// [`WDT_RENDER_IDLE_PET_S`] seconds of no-frame idle.  The latter
+/// matters when the panel is off (auto-off or pre-soft-on-boot):
+/// `ui_state` stops signalling frames, so without the timer fallback
+/// the slot would go stale and the chip would reset every 5 s.
 #[embassy_executor::task]
 async fn ui_render_task(
     mut display: board::Display,
     fb: &'static mut Framebuffer,
     mut renderer: Renderer,
+    mut wdt: WatchdogHandle,
 ) -> ! {
     loop {
-        let frame = FRAME.wait().await;
-        let _ = renderer.render(&frame.widgets, &frame.scan, fb);
-        display.flush(fb).await;
+        match select(FRAME.wait(), Timer::after_secs(WDT_RENDER_IDLE_PET_S)).await {
+            Either::First(frame) => {
+                let _ = renderer.render(&frame.widgets, &frame.scan, fb);
+                display.flush(fb).await;
+            }
+            Either::Second(()) => {
+                // No frame arrived in the idle-pet window — display
+                // is off or ui_state is quiet.  Nothing to render;
+                // just fall through to pet the WDT and re-wait.
+            }
+        }
+        wdt.pet();
     }
 }
 
@@ -485,6 +539,7 @@ async fn battery_task(mut monitor: board::battery::BatteryMonitor) {
 async fn ui_state_loop(
     backlight: &mut Output<'static>,
     flash: &mut Flash,
+    mut wdt: WatchdogHandle,
     state: &mut UiState,
     mut settings: Settings,
     keys: KeyStore,
@@ -504,6 +559,12 @@ async fn ui_state_loop(
     let mut scan_plan: Option<BandPlan> = None;
 
     loop {
+        // Pet the WDT at every loop iteration top.  Cadence is the
+        // scan_tick (~300 ms) plus whatever flash-write time an
+        // Apply* command added — comfortably under the 5 s timeout.
+        // Bursts of joystick events may pet faster than that.
+        wdt.pet();
+
         let next_tick = Timer::after(scan_tick);
         match select(EVENT_CHAN.receive(), next_tick).await {
             Either::First(event) => {
@@ -824,6 +885,183 @@ async fn save_tx_power(flash: &mut Flash, dbm: i8) {
             defmt::Debug2Format(&e)
         );
     }
+}
+
+// ── Panic recovery (M7) ─────────────────────────────────────────
+//
+// The panic handler stages the panic into a `.uninit` buffer in
+// the board crate (see `boards/t114/src/panic_record.rs`) and
+// soft-resets.  The next boot reads the staged record before SD
+// enable, copies the message + reset reason into flash via
+// `sequential-storage::queue` (panic-ring region in `storage.rs`),
+// and surfaces a one-line summary on RTT.  The About-screen
+// rendering of the recovered panic is a downstream extension to
+// the UI core.
+
+/// Append a single panic / shutdown record to the panic-ring flash
+/// region.  Format: `[reset_reason: u32 LE][message: UTF-8 bytes]`,
+/// pushed onto a `sequential-storage::queue`.  Pops are not
+/// performed today — the queue auto-overwrites the oldest entry
+/// once it fills (via `push`'s `allow_overwrite=true`), giving us
+/// the last ~30 panics naturally.
+async fn push_panic_record(flash: &mut Flash, reset_reas: u32, message: &[u8]) {
+    use sequential_storage::queue;
+
+    let mut cache = NoCache::new();
+    let mut record = [0u8; 4 + board::panic_record::PANIC_MSG_LEN];
+    record[0..4].copy_from_slice(&reset_reas.to_le_bytes());
+    let msg_len = message.len().min(board::panic_record::PANIC_MSG_LEN);
+    record[4..4 + msg_len].copy_from_slice(&message[..msg_len]);
+
+    if let Err(e) = queue::push(
+        flash,
+        board::storage::PANIC_RING_RANGE,
+        &mut cache,
+        &record[..4 + msg_len],
+        true,
+    )
+    .await
+    {
+        defmt::warn!(
+            "persist: panic-ring push failed: {:?}",
+            defmt::Debug2Format(&e)
+        );
+    }
+}
+
+/// Boot-time check for a staged panic from the prior boot.  If
+/// present: log it, push to the panic-ring flash region, then
+/// return so normal boot continues.  Reset reason is read +
+/// cleared at boot regardless (`RESETREAS` accumulates flags
+/// across resets if we don't clear it).
+async fn recover_pending_panic(flash: &mut Flash) {
+    // SAFETY: called exactly once per boot, from `run()` which is
+    // itself called exactly once per binary lifetime.  No other
+    // code reads the staging buffer.
+    let reset_reas = unsafe { board::panic_record::read_reset_reason() };
+    let staged = unsafe { board::panic_record::take_panic_record() };
+
+    if let Some(record) = staged {
+        let msg_len = (record.message_len as usize).min(board::panic_record::PANIC_MSG_LEN);
+        let msg_bytes = &record.message[..msg_len];
+        let msg_str = core::str::from_utf8(msg_bytes).unwrap_or("(non-utf8 panic message)");
+        defmt::warn!(
+            "recovered panic from prior boot (reset_reas={=u32:#x}): {}",
+            reset_reas,
+            msg_str
+        );
+        push_panic_record(flash, reset_reas, msg_bytes).await;
+    } else if reset_reas != 0 {
+        // No staged panic but RESETREAS has flags.  Distinguish the
+        // common cases for the boot log; flags accumulate (we don't
+        // clear because SD-restricted), so this is "since flash, at
+        // least one reset has been from <X>" rather than per-boot
+        // precise — combined with the panic-magic check above it's
+        // still actionable.
+        let dog = reset_reas & board::panic_record::reset_reason::DOG != 0;
+        let sreq = reset_reas & board::panic_record::reset_reason::SREQ != 0;
+        let pin = reset_reas & board::panic_record::reset_reason::RESETPIN != 0;
+        let lockup = reset_reas & board::panic_record::reset_reason::LOCKUP != 0;
+        defmt::info!(
+            "boot reset_reas={=u32:#x} (no staged panic — dog={} sreq={} pin={} lockup={})",
+            reset_reas,
+            dog,
+            sreq,
+            pin,
+            lockup,
+        );
+        if dog {
+            // Watchdog reset without a staged panic = a task hung
+            // long enough for the WDT to fire on its own.  Persist
+            // a "watchdog-hang" record to the panic ring so the
+            // About screen can surface it the same way it shows
+            // panics.  Message is generic since we don't know
+            // which task hung — diagnosing that would need
+            // per-task counters in the panic ring.
+            push_panic_record(flash, reset_reas, b"watchdog: task hung").await;
+        }
+    }
+}
+
+// ── Panic handler ───────────────────────────────────────────────
+//
+// Production handler: stage the panic into the `.uninit` buffer in
+// the board crate, then trigger a software reset.  The next boot
+// recovers + writes to flash + reports.  Replaces `panic-probe`'s
+// "log + halt forever" pattern so a panic during a gig reboots
+// the unit cleanly instead of bricking it until manual power-cycle.
+//
+// During development (probe attached): the `defmt::error!` call
+// inside this handler emits the panic message via RTT before the
+// reset hits, so dev sessions see the same info `panic-probe`
+// would have printed.
+
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    use core::fmt::Write as _;
+
+    // Mask interrupts so nothing else runs while we're staging.
+    cortex_m::interrupt::disable();
+
+    // Format the panic into a small SliceWriter targeting a stack
+    // buffer.  Truncates silently at PANIC_MSG_LEN — large panic
+    // messages get clipped rather than dropped entirely.
+    let mut buf = [0u8; board::panic_record::PANIC_MSG_LEN];
+    let written = {
+        struct SliceWriter<'a> {
+            buf: &'a mut [u8],
+            n: usize,
+        }
+        impl<'a> core::fmt::Write for SliceWriter<'a> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let bytes = s.as_bytes();
+                let take = bytes.len().min(self.buf.len() - self.n);
+                self.buf[self.n..self.n + take].copy_from_slice(&bytes[..take]);
+                self.n += take;
+                Ok(())
+            }
+        }
+        let mut w = SliceWriter { buf: &mut buf, n: 0 };
+        let _ = write!(&mut w, "{}", info);
+        w.n
+    };
+
+    // Stage the record into the cross-reset buffer.  Direct pointer
+    // writes — the buffer is MaybeUninit, we initialise it here.
+    // SAFETY: panic handler runs to completion; no other code is
+    // executing concurrently (interrupts disabled above).
+    unsafe {
+        let pending_ptr = core::ptr::addr_of_mut!(board::panic_record::PANIC_PENDING)
+            as *mut board::panic_record::PanicStaging;
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*pending_ptr).message_len),
+            written as u32,
+        );
+        core::ptr::copy_nonoverlapping(
+            buf.as_ptr(),
+            core::ptr::addr_of_mut!((*pending_ptr).message) as *mut u8,
+            buf.len(),
+        );
+        // Magic last — readers gate on this, so writing it last
+        // means a partially-staged record is never seen as valid.
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*pending_ptr).magic),
+            board::panic_record::PANIC_MAGIC,
+        );
+    }
+
+    // Emit the panic message via defmt-rtt for any attached probe.
+    // This may or may not actually drain to the host before reset;
+    // we don't depend on it.
+    defmt::error!("PANIC: {}", defmt::Display2Format(info));
+
+    // Tiny delay so the RTT write has a chance to flush.  100k
+    // cycles at 64 MHz = ~1.5 ms, plenty.
+    cortex_m::asm::delay(100_000);
+
+    // Soft reset.  Next boot will recover and persist the staged
+    // record.
+    cortex_m::peripheral::SCB::sys_reset()
 }
 
 async fn save_active_key(flash: &mut Flash, fp: Option<u32>) {
