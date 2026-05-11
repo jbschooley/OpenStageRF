@@ -49,7 +49,7 @@ pub use band_plan::{
 pub use battery::{
     voltage_to_percent, BatteryStatus, CRITICAL_THRESHOLD_PCT, LOW_THRESHOLD_PCT, SHUTDOWN_MV,
 };
-pub use key_store::{KeyEntry, KeyStore, MAX_KEY_NAME, MAX_KEYS};
+pub use key_store::{KeyEntry, KeyRecord, KeyStore, KEY_MATERIAL_LEN, MAX_KEY_NAME, MAX_KEYS};
 pub use render::{render, Renderer};
 
 // ── Settings ────────────────────────────────────────────────────────────────
@@ -224,6 +224,10 @@ pub enum ItemAction {
     /// don't fit the list-or-value mould (LinkStats readout, About,
     /// future status displays).
     Custom(ScreenId),
+    /// Emit a [`Command`] directly without navigating anywhere.  For
+    /// menu items that perform an action (like the diagnostic
+    /// `ForcePanic`) rather than opening a screen.
+    Trigger(Command),
 }
 
 /// A menu — a title (drawn as the screen's title bar) and a
@@ -282,6 +286,8 @@ pub static MAIN_MENU_TX: MenuNode = MenuNode {
         // Key entry hidden until AEAD lands (Stage 3 in ROADMAP.md).
         // MenuItem { label: "Key",        action: ItemAction::List(ListKind::Key) },
         MenuItem { label: "About",      action: ItemAction::Custom(ScreenId::About) },
+        MenuItem { label: "Force panic",action: ItemAction::Trigger(Command::ForcePanic) },
+        MenuItem { label: "Force WDT",  action: ItemAction::Trigger(Command::ForceWdtHang) },
     ],
 };
 
@@ -296,6 +302,8 @@ pub static MAIN_MENU_RX: MenuNode = MenuNode {
         // MenuItem { label: "Key",        action: ItemAction::List(ListKind::Key) },
         MenuItem { label: "Link Stats", action: ItemAction::Custom(ScreenId::LinkStats) },
         MenuItem { label: "About",      action: ItemAction::Custom(ScreenId::About) },
+        MenuItem { label: "Force panic",action: ItemAction::Trigger(Command::ForcePanic) },
+        MenuItem { label: "Force WDT",  action: ItemAction::Trigger(Command::ForceWdtHang) },
     ],
 };
 
@@ -466,6 +474,42 @@ impl UiState {
 /// body rows.  Cursor outside this window scrolls the list.
 pub const VISIBLE_LIST_ROWS: u8 = 5;
 
+/// Read-only context displayed on the About screen.  Populated by the
+/// profile each frame from board / static state; the UI core just
+/// renders it.  Borrowed (not owned) so the profile can hold the
+/// underlying strings as statics and pass references without copies.
+#[derive(Debug, Clone, Copy)]
+pub struct AboutData<'a> {
+    /// User-facing firmware version, e.g. `"v0.1"` (typically
+    /// `env!("CARGO_PKG_VERSION")` from the profile binary's crate).
+    pub firmware_version: &'a str,
+    /// Short git commit hash with optional `*` dirty marker, set by
+    /// the board crate's `build.rs`.
+    pub git_hash: &'a str,
+    /// Random per-boot 16-bit session identifier.  Renders as
+    /// `0xNNNN`.  Same number TX bakes into packet seq high bits so
+    /// the operator can sanity-check "are RX and TX seeing the same
+    /// session ID?" against an RX-side log of accepted-from-session.
+    pub session_id: u16,
+    /// Most recent panic message recovered from the panic ring at
+    /// boot, if any.  `None` means no panic on record.  Length-limited
+    /// at the profile boundary so renders fit in the wrap window.
+    pub last_panic: Option<&'a str>,
+}
+
+impl AboutData<'_> {
+    /// Empty default for profiles that don't yet wire About in.
+    /// Renders as version "?.?" with no other data — handy for
+    /// LinkStats which shares the same `build_screen` plumbing but
+    /// doesn't care.
+    pub const EMPTY: Self = Self {
+        firmware_version: "?.?",
+        git_hash: "?",
+        session_id: 0,
+        last_panic: None,
+    };
+}
+
 /// Side-effect command emitted by [`UiState::handle_event`] when a
 /// setting change should be propagated to the host (live-applied to
 /// the link runtime, persisted, etc.).  The UI itself never
@@ -486,6 +530,26 @@ pub enum Command {
     /// emits `key_fp = 0`); `Some(fp)` = use the key with that
     /// fingerprint (host looks it up in [`KeyStore`]).
     ApplySetActiveKey(Option<u32>),
+    /// Operator acknowledged the "Last panic" line on the About
+    /// screen and wants the panic ring erased.  Host clears the
+    /// flash region and reloads the cached last-panic message so
+    /// the next frame re-renders About with "No prior panic".
+    ClearPanicLog,
+    /// Diagnostic: deliberately trigger a panic to exercise the
+    /// staging → reset → recovery → About-screen-display path.
+    /// Profile responds with a `panic!()` call.  Surfaced as a
+    /// menu item so testing is one-handed and doesn't need a
+    /// rebuild.  Cheap to leave in production — operator has to
+    /// navigate two menu levels to reach it.
+    ForcePanic,
+    /// Diagnostic: hang the calling task in a tight no-op loop so
+    /// its watchdog slot stops getting petted.  ~5 s later the
+    /// hardware WDT fires → chip resets → next boot's
+    /// `recover_pending_panic` sees the DOG bit in RESETREAS
+    /// without a staged panic and pushes a "watchdog: task hung"
+    /// record to the panic ring.  Lets the operator confirm the
+    /// WDT path end-to-end without a rebuild.
+    ForceWdtHang,
 }
 
 impl UiState {
@@ -584,6 +648,7 @@ impl UiState {
                         ItemAction::List(kind) => self.enter(kind.screen(), settings, keys),
                         ItemAction::Value(kind) => self.enter(kind.screen(), settings, keys),
                         ItemAction::Custom(s) => self.enter(s, settings, keys),
+                        ItemAction::Trigger(cmd) => return Some(cmd),
                     }
                 }
             }
@@ -746,6 +811,28 @@ impl UiState {
     fn handle_readonly(&mut self, event: JoystickEvent) -> Option<Command> {
         match event {
             JoystickEvent::Press(Direction::Left) => self.pop_nav(),
+            // Scroll support for About — LinkStats is short enough
+            // not to need it, but accepting these events on both
+            // screens is harmless.  build_about clamps overshoot.
+            JoystickEvent::Press(Direction::Up)
+            | JoystickEvent::LongPress(Direction::Up) => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+            }
+            JoystickEvent::Press(Direction::Down)
+            | JoystickEvent::LongPress(Direction::Down) => {
+                self.scroll_offset = self.scroll_offset.saturating_add(1);
+            }
+            // About screen only: long-press Right acknowledges the
+            // "Last panic" line and asks the profile to erase the
+            // panic ring.  Long-press Center is reserved for
+            // go-home, Left is back, so Right is the natural
+            // confirmation gesture.  Scoped to About specifically so
+            // the LinkStats screen doesn't accidentally trip clears.
+            JoystickEvent::LongPress(Direction::Right)
+                if self.screen == ScreenId::About =>
+            {
+                return Some(Command::ClearPanicLog);
+            }
             _ => {}
         }
         None
@@ -1113,10 +1200,11 @@ pub enum Widget {
 /// list; callers that aren't using encryption can pass an empty
 /// store via `&KeyStore::new()`.
 pub fn build_screen(
-    state: &UiState,
+    state: &mut UiState,
     settings: &Settings,
     keys: &KeyStore,
     status: &LinkStatus,
+    about: &AboutData<'_>,
     out: &mut WidgetList,
 ) {
     out.clear();
@@ -1135,7 +1223,7 @@ pub fn build_screen(
         ),
         ScreenId::KeySelect => build_key_select(state, settings, keys, out),
         ScreenId::LinkStats => build_link_stats(settings, status, out),
-        ScreenId::About => build_about(out),
+        ScreenId::About => build_about(state, about, out),
     }
 }
 
@@ -1471,19 +1559,100 @@ fn build_link_stats(settings: &Settings, status: &LinkStatus, out: &mut WidgetLi
     out.push(Widget::Footer(s("Left: back"))).ok();
 }
 
-fn build_about(out: &mut WidgetList) {
+/// About screen — scrollable text view.  Logical line content is
+/// assembled into a small local list, then a window of
+/// `VISIBLE_LIST_ROWS` lines starting at `state.scroll_offset`
+/// (clamped to the last full page) is pushed as `Widget::Text`
+/// rows.  Scroll handling lives in `handle_readonly` — Up/Down
+/// adjust `scroll_offset`.
+///
+/// `state.scroll_offset` may legitimately overshoot the bottom by
+/// one (Down past end produces no new content), at which point Up
+/// brings the user back into view.  Renderer never panics on
+/// overshoot.
+fn build_about(state: &mut UiState, about: &AboutData<'_>, out: &mut WidgetList) {
     out.push(Widget::Title(s("About"))).ok();
-    out.push(Widget::Text {
-        row: 1,
-        text: s("OpenStageRF v0.1"),
-    })
-    .ok();
-    out.push(Widget::Text {
-        row: 2,
-        text: s("github.com/..."),
-    })
-    .ok();
-    out.push(Widget::Footer(s("Left: back"))).ok();
+
+    // Logical content lines.  Bumped to 16 cap to cover the largest
+    // sensible About layout (version + session + 4-line panic +
+    // separators + 3-line URL).
+    let mut lines: Vec<String<24>, 16> = Vec::new();
+
+    // 1. firmware version + git hash (combined, fits 24 chars
+    //    comfortably: e.g. "v0.1 abc1234*" is 13 chars).
+    let mut row0: String<24> = String::new();
+    let _ = write!(row0, "{} {}", about.firmware_version, about.git_hash);
+    let _ = lines.push(row0);
+
+    // 2. session ID, hex-formatted.
+    let mut row1: String<24> = String::new();
+    let _ = write!(row1, "Session 0x{:04X}", about.session_id);
+    let _ = lines.push(row1);
+
+    // 3. blank separator.
+    let _ = lines.push(String::new());
+
+    // 4..N. last panic, wrapped at 24 chars across up to 4 lines.
+    match about.last_panic {
+        Some(msg) => {
+            let _ = lines.push(s("Last panic:"));
+            // Simple char-by-char wrap.  Truncates after 4 wrap lines
+            // (96 chars) — enough for `panicked at src/foo.rs:42:5`
+            // plus an arg list summary.
+            let mut remaining = msg;
+            for _ in 0..4 {
+                if remaining.is_empty() {
+                    break;
+                }
+                let take = remaining.len().min(24);
+                let (head, tail) = remaining.split_at(take);
+                let mut line: String<24> = String::new();
+                let _ = line.push_str(head);
+                let _ = lines.push(line);
+                remaining = tail;
+            }
+        }
+        None => {
+            let _ = lines.push(s("No prior panic"));
+        }
+    }
+
+    // blank separator + GitHub URL split across 3 lines (full URL
+    // doesn't fit in 24 chars).
+    let _ = lines.push(String::new());
+    let _ = lines.push(s("github.com/"));
+    let _ = lines.push(s("jbschooley/"));
+    let _ = lines.push(s("OpenStageRF"));
+
+    // Push the visible window.  Clamp `scroll_offset` against the
+    // last-full-page position and write the clamped value back into
+    // state so a Down-past-end doesn't pile up overshoot that the
+    // user has to undo with Up events before motion resumes.
+    let total = lines.len();
+    let visible = VISIBLE_LIST_ROWS as usize;
+    let max_scroll = total.saturating_sub(visible) as u8;
+    if state.scroll_offset > max_scroll {
+        state.scroll_offset = max_scroll;
+    }
+    let scroll = state.scroll_offset as usize;
+    for i in 0..visible {
+        let line_idx = scroll + i;
+        if line_idx >= total {
+            break;
+        }
+        out.push(Widget::Text {
+            row: (i + 1) as u8,
+            text: lines[line_idx].clone(),
+        })
+        .ok();
+    }
+
+    let footer = if total > visible {
+        s("U/D:scroll L:back")
+    } else {
+        s("Left: back")
+    };
+    out.push(Widget::Footer(footer)).ok();
 }
 
 /// Tiny helper: build a fixed-size [`String`] from a `&'static str`.
@@ -1753,13 +1922,20 @@ mod tests {
 
     #[test]
     fn build_idle_screen_includes_link_status() {
-        let state = UiState::default();
+        let mut state = UiState::default();
         let settings = Settings::default();
         let keys = KeyStore::new();
         let mut status = LinkStatus::default();
         status.up = true;
         let mut widgets: WidgetList = WidgetList::new();
-        build_screen(&state, &settings, &keys, &status, &mut widgets);
+        build_screen(
+            &mut state,
+            &settings,
+            &keys,
+            &status,
+            &AboutData::EMPTY,
+            &mut widgets,
+        );
         assert!(widgets
             .iter()
             .any(|w| matches!(w, Widget::LinkStatus { up: true, .. })));
@@ -1783,7 +1959,14 @@ mod tests {
         let keys = KeyStore::new();
         let status = LinkStatus::default();
         let mut widgets: WidgetList = WidgetList::new();
-        build_screen(&state, &settings, &keys, &status, &mut widgets);
+        build_screen(
+            &mut state,
+            &settings,
+            &keys,
+            &status,
+            &AboutData::EMPTY,
+            &mut widgets,
+        );
         // Selectors should have selected=true exactly once, on row 1+cursor.
         let selected_count = widgets
             .iter()
@@ -1964,16 +2147,30 @@ mod tests {
         let keys = KeyStore::new();
         let status = LinkStatus::default();
 
-        let rx = UiState::with_role(Role::Rx);
-        build_screen(&rx, &settings, &keys, &status, &mut widgets);
+        let mut rx = UiState::with_role(Role::Rx);
+        build_screen(
+            &mut rx,
+            &settings,
+            &keys,
+            &status,
+            &AboutData::EMPTY,
+            &mut widgets,
+        );
         let rx_title = widgets.iter().find_map(|w| match w {
             Widget::Title(t) => Some(t.as_str()),
             _ => None,
         });
         assert_eq!(rx_title, Some("OpenStageRF RX"));
 
-        let tx = UiState::with_role(Role::Tx);
-        build_screen(&tx, &settings, &keys, &status, &mut widgets);
+        let mut tx = UiState::with_role(Role::Tx);
+        build_screen(
+            &mut tx,
+            &settings,
+            &keys,
+            &status,
+            &AboutData::EMPTY,
+            &mut widgets,
+        );
         let tx_title = widgets.iter().find_map(|w| match w {
             Widget::Title(t) => Some(t.as_str()),
             _ => None,

@@ -10,6 +10,7 @@ members = [
     "boards/t114",
     "core/link",
     "core/link_runtime",
+    "core/panic_log",
     "core/ui",
     "crypto",
     "drivers/input/joystick5way",
@@ -54,6 +55,7 @@ default-members = [
     "boards/dx_lr30",
     "core/link",
     "core/link_runtime",
+    "core/panic_log",
     "core/ui",
     "crypto",
     "drivers/input/joystick5way",
@@ -81,6 +83,7 @@ osrf-app-midi-node                = { path = "apps/midi_node" }
 osrf-app-radio-bench              = { path = "apps/radio_bench" }
 osrf-app-ui-bench                 = { path = "apps/ui_bench" }
 osrf-link-runtime                 = { path = "core/link_runtime" }
+osrf-panic-log                    = { path = "core/panic_log" }
 osrf-ui                           = { path = "core/ui" }
 osrf-board-dx-lr30                = { path = "boards/dx_lr30" }
 osrf-board-t114                   = { path = "boards/t114" }

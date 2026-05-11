@@ -61,6 +61,7 @@ log                = { version = "0.4", optional = true }
 # replicate SD's POWER/CLOCK/sleep management by hand).
 nrf-softdevice      = { workspace = true }
 nrf-softdevice-s140 = { workspace = true }
+osrf-panic-log      = { workspace = true }
 
 [lib]
 test    = false
