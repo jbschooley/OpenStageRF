@@ -27,6 +27,7 @@ pub mod clocks;
 pub mod display;
 pub mod framebuffer;
 pub mod softdevice;
+pub mod storage;
 #[cfg(feature = "usb-log")]
 pub mod usb_log;
 

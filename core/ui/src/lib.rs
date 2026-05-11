@@ -862,8 +862,10 @@ fn active_key_cursor(active_fp: Option<u32>, keys: &KeyStore) -> u8 {
 }
 
 /// Find the index of a [`BandPlan`] in [`BAND_PLANS`].  Used by
-/// `enter` to position the cursor on the currently-active plan.
-fn band_plan_index(plan: BandPlan) -> usize {
+/// `enter` to position the cursor on the currently-active plan,
+/// and by the M7 persistence layer to encode a band plan as a
+/// stable u8.
+pub fn band_plan_index(plan: BandPlan) -> usize {
     BAND_PLANS
         .iter()
         .position(|p| *p == plan)

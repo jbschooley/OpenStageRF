@@ -48,12 +48,15 @@ use osrf_app_link_bench::synthetic::ScenarioSource;
 use osrf_app_midi_node::{run_rx, run_tx, LinkConfig, UartMidiSink, UartMidiSource};
 use osrf_board_t114 as board;
 use osrf_driver_input_joystick5way::{Joystick5Way, JoystickEvent};
+use nrf_softdevice::Flash;
 use osrf_link_runtime::{LinkConfigSignal, LinkStatsCell, ScanController};
 use osrf_ui::{
-    band_plan_channel, build_screen, max_channel_index, BandPlan, BatteryStatus, Command,
-    KeyStore, LinkStatus, Renderer, Role, ScanState, ScreenId, Settings, UiState, Widget,
-    WidgetList, MAX_SCAN_CHANNELS,
+    band_plan_channel, band_plan_index, build_screen, max_channel_index, BandPlan, BatteryStatus,
+    Command, KeyStore, LinkStatus, Renderer, Role, ScanState, ScreenId, Settings, UiState, Widget,
+    WidgetList, BAND_PLANS, MAX_SCAN_CHANNELS,
 };
+use sequential_storage::cache::NoCache;
+use sequential_storage::map;
 
 use board::embassy_nrf::gpio::{Input, Output, Pull};
 use board::embassy_nrf::interrupt::{self, InterruptExt, Priority};
@@ -174,6 +177,12 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     let sd = board::softdevice::enable();
     spawner.spawn(board::softdevice::run(sd).expect("alloc softdevice run task"));
 
+    // Brief settling delay so the SD's first event-loop tick has
+    // happened before we take Flash.  Cheap insurance against
+    // taking Flash mid-SD-startup.
+    Timer::after_millis(10).await;
+    let mut flash = board::storage::flash(sd);
+
     // ── Display init + initial paint (synchronous, before split) ──
     //
     // The initial frame is rendered + flushed before we hand the
@@ -187,7 +196,10 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     let fb: &'static mut Framebuffer = unsafe { &mut *core::ptr::addr_of_mut!(FRAMEBUFFER) };
 
     let mut state = UiState::with_role(role);
-    let settings = Settings::default();
+    let mut settings = Settings::default();
+    // Restore persisted setting fields (channel, band plan, tx power,
+    // active key fp).  Fields never written stay at `Default`.
+    load_settings(&mut flash, &mut settings).await;
     let mut keys = KeyStore::new();
     let _ = keys.add("Studio A", 0x111111);
     let _ = keys.add("Backup", 0x222222);
@@ -297,7 +309,15 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     core::mem::forget(r.neopixel_parked);
 
     // ── Main task body = UI state loop ─────────────────────────────
-    ui_state_loop(&mut backlight, &mut state, settings, keys, &mut widgets).await
+    ui_state_loop(
+        &mut backlight,
+        &mut flash,
+        &mut state,
+        settings,
+        keys,
+        &mut widgets,
+    )
+    .await
 }
 
 // ── Tasks ───────────────────────────────────────────────────────
@@ -464,6 +484,7 @@ async fn battery_task(mut monitor: board::battery::BatteryMonitor) {
 /// the wake press.
 async fn ui_state_loop(
     backlight: &mut Output<'static>,
+    flash: &mut Flash,
     state: &mut UiState,
     mut settings: Settings,
     keys: KeyStore,
@@ -496,13 +517,28 @@ async fn ui_state_loop(
                 } else if let Some(cmd) = state.handle_event(&mut settings, &keys, event) {
                     defmt::info!("ui command: {:?}", cmd);
                     match cmd {
-                        Command::ApplyChannel(_)
-                        | Command::ApplyBandPlan(_)
-                        | Command::ApplyTxPower(_) => {
+                        Command::ApplyChannel(ch) => {
                             CONFIG_UPDATES.signal(link_config_from(&settings));
+                            save_channel(flash, ch).await;
                         }
-                        Command::ApplySetActiveKey(_) => {
-                            // No-op until AEAD lands.
+                        Command::ApplyBandPlan(plan) => {
+                            CONFIG_UPDATES.signal(link_config_from(&settings));
+                            save_band_plan(flash, plan).await;
+                            // Band-plan change resets channel to 0; persist the
+                            // new channel too so a reboot in the new plan picks
+                            // up where the user landed instead of jumping back
+                            // to whatever channel the OLD plan had at index 0.
+                            save_channel(flash, settings.channel).await;
+                        }
+                        Command::ApplyTxPower(dbm) => {
+                            CONFIG_UPDATES.signal(link_config_from(&settings));
+                            save_tx_power(flash, dbm).await;
+                        }
+                        Command::ApplySetActiveKey(fp) => {
+                            // No live-config update needed (AEAD not wired into
+                            // LinkConfig yet), but do persist so a reboot
+                            // restores the user's last selection.
+                            save_active_key(flash, fp).await;
                         }
                     }
                 }
@@ -643,4 +679,167 @@ fn collect_scan_frequencies(plan: BandPlan, out: &mut [u32; MAX_SCAN_CHANNELS]) 
         out[i] = band_plan_channel(plan, i as u8).frequency_khz * 1000;
     }
     n
+}
+
+// ── Settings persistence (M7) ───────────────────────────────────
+//
+// Each `Settings` field gets its own [`sequential-storage`] key in
+// the Settings flash region (defined in `boards/t114/src/storage.rs`).
+// Per-field keys mean an Apply* command only rewrites the changed
+// field — the others stay where they are.  That keeps wear-leveling
+// even across rapid same-field edits (e.g. spinning a channel
+// selector through 24 values writes 24 channel records but doesn't
+// touch the band-plan / power / key records).
+//
+// Schema (key → value type):
+//   KEY_CHANNEL       → u32     channel index in the active band plan
+//   KEY_BAND_PLAN     → u32     index into `BAND_PLANS`
+//   KEY_TX_POWER      → i32     dBm, range MIN_TX_POWER_DBM..=MAX_TX_POWER_DBM
+//   KEY_ACTIVE_KEY_FP → u32     fingerprint, 0 = "no key" (== `None`)
+//
+// We use u32/i32 even for fields that fit in a smaller type — it
+// makes the sequential-storage `Value` impl trivial (built in for
+// primitive ints) and the wear cost is negligible at our write rate.
+
+const KEY_CHANNEL: u8 = 0;
+const KEY_BAND_PLAN: u8 = 1;
+const KEY_TX_POWER: u8 = 2;
+const KEY_ACTIVE_KEY_FP: u8 = 3;
+
+/// Scratch buffer size for sequential-storage's record assembly.
+/// 64 B is comfortable for any of our values (max is a u32 ≈ 4 B
+/// payload plus a couple of bytes of overhead).
+const PERSIST_BUF_LEN: usize = 64;
+
+/// Read all `Settings` fields from flash and apply to `settings`.
+/// Fields not present in flash (first-boot case, or partial corruption)
+/// are left at whatever default the caller seeded `settings` with.
+/// Errors are logged but not propagated — we treat persistence
+/// failures as "fall back to defaults," not as fatal.
+async fn load_settings(flash: &mut Flash, settings: &mut Settings) {
+    let mut buf = [0u8; PERSIST_BUF_LEN];
+    let mut cache = NoCache::new();
+    let range = board::storage::SETTINGS_RANGE;
+
+    match map::fetch_item::<u8, u32, _>(flash, range.clone(), &mut cache, &mut buf, &KEY_CHANNEL)
+        .await
+    {
+        Ok(Some(v)) => settings.channel = v as u8,
+        Ok(None) => defmt::info!("persist: no stored channel, using default"),
+        Err(e) => defmt::warn!("persist: load channel failed: {:?}", defmt::Debug2Format(&e)),
+    }
+    match map::fetch_item::<u8, u32, _>(flash, range.clone(), &mut cache, &mut buf, &KEY_BAND_PLAN)
+        .await
+    {
+        Ok(Some(v)) if (v as usize) < BAND_PLANS.len() => {
+            settings.band_plan = BAND_PLANS[v as usize];
+        }
+        Ok(Some(v)) => defmt::warn!(
+            "persist: stored band_plan index {} out of range, using default",
+            v
+        ),
+        Ok(None) => defmt::info!("persist: no stored band_plan, using default"),
+        Err(e) => defmt::warn!("persist: load band_plan failed: {:?}", defmt::Debug2Format(&e)),
+    }
+    match map::fetch_item::<u8, i32, _>(flash, range.clone(), &mut cache, &mut buf, &KEY_TX_POWER)
+        .await
+    {
+        Ok(Some(v)) => settings.tx_power_dbm = v as i8,
+        Ok(None) => defmt::info!("persist: no stored tx_power, using default"),
+        Err(e) => defmt::warn!("persist: load tx_power failed: {:?}", defmt::Debug2Format(&e)),
+    }
+    match map::fetch_item::<u8, u32, _>(flash, range, &mut cache, &mut buf, &KEY_ACTIVE_KEY_FP)
+        .await
+    {
+        Ok(Some(0)) => settings.active_key_fp = None,
+        Ok(Some(v)) => settings.active_key_fp = Some(v),
+        Ok(None) => defmt::info!("persist: no stored active_key_fp, using default"),
+        Err(e) => defmt::warn!("persist: load key_fp failed: {:?}", defmt::Debug2Format(&e)),
+    }
+
+    defmt::info!(
+        "persist: loaded ch={} plan={=usize} pwr={} key_fp={:?}",
+        settings.channel,
+        band_plan_index(settings.band_plan),
+        settings.tx_power_dbm,
+        settings.active_key_fp,
+    );
+}
+
+async fn save_channel(flash: &mut Flash, ch: u8) {
+    let mut buf = [0u8; PERSIST_BUF_LEN];
+    let mut cache = NoCache::new();
+    let v = ch as u32;
+    if let Err(e) = map::store_item::<u8, u32, _>(
+        flash,
+        board::storage::SETTINGS_RANGE,
+        &mut cache,
+        &mut buf,
+        &KEY_CHANNEL,
+        &v,
+    )
+    .await
+    {
+        defmt::warn!("persist: save channel failed: {:?}", defmt::Debug2Format(&e));
+    }
+}
+
+async fn save_band_plan(flash: &mut Flash, plan: BandPlan) {
+    let mut buf = [0u8; PERSIST_BUF_LEN];
+    let mut cache = NoCache::new();
+    let v = band_plan_index(plan) as u32;
+    if let Err(e) = map::store_item::<u8, u32, _>(
+        flash,
+        board::storage::SETTINGS_RANGE,
+        &mut cache,
+        &mut buf,
+        &KEY_BAND_PLAN,
+        &v,
+    )
+    .await
+    {
+        defmt::warn!(
+            "persist: save band_plan failed: {:?}",
+            defmt::Debug2Format(&e)
+        );
+    }
+}
+
+async fn save_tx_power(flash: &mut Flash, dbm: i8) {
+    let mut buf = [0u8; PERSIST_BUF_LEN];
+    let mut cache = NoCache::new();
+    let v = dbm as i32;
+    if let Err(e) = map::store_item::<u8, i32, _>(
+        flash,
+        board::storage::SETTINGS_RANGE,
+        &mut cache,
+        &mut buf,
+        &KEY_TX_POWER,
+        &v,
+    )
+    .await
+    {
+        defmt::warn!(
+            "persist: save tx_power failed: {:?}",
+            defmt::Debug2Format(&e)
+        );
+    }
+}
+
+async fn save_active_key(flash: &mut Flash, fp: Option<u32>) {
+    let mut buf = [0u8; PERSIST_BUF_LEN];
+    let mut cache = NoCache::new();
+    let v = fp.unwrap_or(0);
+    if let Err(e) = map::store_item::<u8, u32, _>(
+        flash,
+        board::storage::SETTINGS_RANGE,
+        &mut cache,
+        &mut buf,
+        &KEY_ACTIVE_KEY_FP,
+        &v,
+    )
+    .await
+    {
+        defmt::warn!("persist: save key_fp failed: {:?}", defmt::Debug2Format(&e));
+    }
 }

@@ -385,19 +385,29 @@ under sustained UI activity stays under 1%.
 
 ### Milestone 7 — persistence + crash safety (3–5 days)
 
-**Goal:** settings survive reboot.  Boot counter increments correctly.  A panic or hardware
-hang reboots the unit and surfaces post-mortem info on the next boot's About screen instead
-of bricking it mid-show.
+**Goal:** settings survive reboot.  A panic or hardware hang reboots the unit and surfaces
+post-mortem info on the next boot's About screen instead of bricking it mid-show.  Low
+battery triggers a clean shutdown with audible-MIDI-quiet rather than a brownout.
 
 - [ ] Flash partition layout per *Confirmed design decisions* above (settings + key store +
       panic-record ring buffer).
 - [ ] `sequential-storage` integration over a defined flash region for the settings page and
-      a separate region for the key store.
-- [ ] Boot counter: read on boot, increment, write back.  One flash write per boot.
-- [ ] Settings (channel, power, active key slot, ui prefs): read on boot, written when UI
-      changes confirm.
+      a separate region for the key store.  Flash access goes through `nrf-softdevice::Flash`
+      (SD owns the flash controller when enabled).
+- [ ] **Settings persisted on-change**, not write-buffered.  Each `Command::Apply*` from the
+      UI triggers a `sequential-storage` write of the relevant `Settings` field (channel,
+      power, active key, UI prefs).  Atomic-write semantics mean a power loss mid-write
+      rolls back to the prior value — worst case is losing the last in-flight setting
+      change.  Read settings on boot, defaults if the storage region is empty / corrupted.
+- [ ] **Boot counter stays random** (`board::softdevice::rand_bytes` → u16) — explicitly
+      *not* flash-persisted.  Used only as a session ID so the RX's replay window detects
+      reboots; collision probability is 1/65536 per reboot, which is well under the
+      probability of the cell BMS misbehaving or a hardware glitch causing a session
+      mismatch by other means.  About screen renders it as `Session: 0xNNNN` for
+      diagnostic value.  No flash writes, no boot-time read latency.
 - [ ] Key store: stub for v1 (only no-encryption mode, `key_fp=0x0000`, used); structure
-      ready for Stage 3 encryption work.
+      ready for Stage 3 encryption work.  Sequential-storage region reserved; format
+      defined; population deferred until AEAD lands.
 - [ ] **Hardware watchdog** (`boards/t114/src/wdt.rs`): arm WDT on boot with a generous
       reload window; single `watchdog_feeder` task awaits a kick `Signal` that every other
       monitored task pulses once per loop.  See [docs/reliability.md](docs/reliability.md)
@@ -409,21 +419,22 @@ of bricking it mid-show.
 - [ ] **Portability + no-alloc CI audit** (`xtask audit`): fail CI if any `core/`,
       `drivers/`, or `protocols/` crate directly depends on an `embassy-*` HAL crate, or if
       any non-board/profile `.rs` imports `alloc`.
-- [ ] **Low-battery save-before-shutdown.**  The battery indicator added in M6 watches Vbat
-      via the T114's P0_04 ADC and warns the UI at < 20 %.  Critical threshold (≤ 3100 mV
-      sustained for N reads at ~5 s cadence) needs to trigger an orderly shutdown:
-      `sink.all_notes_off()`, persist current `Settings` + boot-counter to flash (via the
-      `sequential-storage` paths above), drive the LED to a "shutting down" pattern,
-      then enter `wfi` loop.  Without persistence this can't be a clean shutdown — losing
-      settings every time the battery dies is worse UX than the warning.  Requires the
-      flash-storage layer to be in place, which is why this lands here rather than
-      alongside the M6 battery work.
+- [ ] **Low-battery graceful shutdown.**  Critical threshold (Vbat ≤ 3100 mV sustained for
+      N reads at ~5 s cadence) triggers, in order:
+        1. `sink.all_notes_off()` — silence the synth before TX goes away.
+        2. Append a "low-battery shutdown" record to the panic / shutdown-reason ring
+           buffer so the next boot's About shows "last shutdown: low-battery 2026-05-10
+           02:14" instead of leaving the operator guessing.
+        3. Drive the status LED to a slow blink as visual confirmation.
+        4. Enter `wfi` loop until the cell finishes dying.
+      No explicit settings save — Apply* on-change writes already cover that.  Pending UI
+      edits (edit_buffer values not yet confirmed via Center) are lost by design.
 
-**Exit criteria:** power-cycle the device, settings retained; boot counter visible in
-`[About]` screen and increments on each boot; injected `panic!()` reboots within the WDT
-window and the next About screen shows the panic line; injected infinite-loop in any task
-reboots within the WDT window; pulling battery just under 3.1 V triggers an orderly
-shutdown that retains the previous setting state on next power-up.
+**Exit criteria:** power-cycle the device, settings retained; About screen shows last panic
+line if one occurred; injected `panic!()` reboots within the WDT window and the panic line
+appears on the next About; injected infinite-loop in any task reboots within the WDT window;
+pulling battery just under 3.1 V triggers all-notes-off + shutdown record + LED blink +
+halt; next boot's About shows the low-battery shutdown reason.
 
 ### Milestone 8 — power management + battery chemistry options (3–5 days)
 

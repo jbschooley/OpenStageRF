@@ -1602,6 +1602,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "osrf-profile-t114-storage-smoke"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "defmt 1.0.1",
+ "defmt-rtt",
+ "embassy-executor",
+ "embassy-sync 0.8.0",
+ "embassy-time",
+ "embedded-storage-async",
+ "nrf-softdevice",
+ "osrf-board-t114",
+ "panic-probe",
+ "sequential-storage",
+]
+
+[[package]]
 name = "osrf-profile-t114-tx-basic"
 version = "0.1.0"
 dependencies = [
@@ -1622,6 +1640,7 @@ dependencies = [
  "embassy-sync 0.8.0",
  "embassy-time",
  "embedded-graphics-core",
+ "nrf-softdevice",
  "osrf-app-link-bench",
  "osrf-app-midi-node",
  "osrf-board-t114",
@@ -1629,6 +1648,7 @@ dependencies = [
  "osrf-link-runtime",
  "osrf-ui",
  "panic-probe",
+ "sequential-storage",
 ]
 
 [[package]]
@@ -1865,6 +1885,16 @@ name = "semver-parser"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "388a1df253eca08550bef6c72392cfe7c30914bf41df5269b68cbd6ff8f570a3"
+
+[[package]]
+name = "sequential-storage"
+version = "5.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0779e7aa11fe1e0a6a0bfb6abcdcc8852c6b74e3946d2ce93d24963dafc4a271"
+dependencies = [
+ "defmt 0.3.100",
+ "embedded-storage-async",
+]
 
 [[package]]
 name = "serde"
