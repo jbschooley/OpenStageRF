@@ -389,46 +389,69 @@ under sustained UI activity stays under 1%.
 post-mortem info on the next boot's About screen instead of bricking it mid-show.  Low
 battery triggers a clean shutdown with audible-MIDI-quiet rather than a brownout.
 
-- [ ] Flash partition layout per *Confirmed design decisions* above (settings + key store +
-      panic-record ring buffer).
-- [ ] `sequential-storage` integration over a defined flash region for the settings page and
-      a separate region for the key store.  Flash access goes through `nrf-softdevice::Flash`
-      (SD owns the flash controller when enabled).
-- [ ] **Settings persisted on-change**, not write-buffered.  Each `Command::Apply*` from the
-      UI triggers a `sequential-storage` write of the relevant `Settings` field (channel,
-      power, active key, UI prefs).  Atomic-write semantics mean a power loss mid-write
-      rolls back to the prior value — worst case is losing the last in-flight setting
-      change.  Read settings on boot, defaults if the storage region is empty / corrupted.
-- [ ] **Boot counter stays random** (`board::softdevice::rand_bytes` → u16) — explicitly
-      *not* flash-persisted.  Used only as a session ID so the RX's replay window detects
-      reboots; collision probability is 1/65536 per reboot, which is well under the
-      probability of the cell BMS misbehaving or a hardware glitch causing a session
-      mismatch by other means.  About screen renders it as `Session: 0xNNNN` for
-      diagnostic value.  No flash writes, no boot-time read latency.
+- [x] Flash partition layout.  `boards/t114/memory.x` shrinks FLASH to `0xC1000` to carve
+      24 KB at the top for persistence; `boards/t114/src/storage.rs` exposes `SETTINGS_RANGE`,
+      `KEY_STORE_RANGE`, `PANIC_RING_RANGE` (8 KB / 2 pages each), with compile-time
+      `const _` assertions on alignment + page-size invariants, plus a `flash(sd)` helper
+      wrapping `nrf-softdevice::Flash`.
+- [x] `sequential-storage` integration: `map` for the settings region (per-field keys 0..3),
+      `queue` for the panic ring (auto-overwriting oldest entry on fill).  All flash IO goes
+      through `nrf-softdevice::Flash` so SD's flash-controller ownership is honoured.
+- [x] **Settings persisted on-change.**  `save_channel`, `save_band_plan`, `save_tx_power`,
+      `save_active_key` helpers in `profiles/t114_ui/src/lib.rs` fire from each
+      `Command::Apply*` arm of `ui_state_loop`.  `load_settings` on boot reads what's there
+      and falls back to `Settings::default()` for missing keys.  Per-field keys mean editing
+      one field doesn't rewrite the others — wear-leveling preserved even under rapid
+      same-field edits.
+- [x] **Boot counter stays random** (`board::softdevice::rand_bytes` → u16) — *not*
+      flash-persisted.  About screen extension (below) will render it as `Session: 0xNNNN`.
 - [ ] Key store: stub for v1 (only no-encryption mode, `key_fp=0x0000`, used); structure
       ready for Stage 3 encryption work.  Sequential-storage region reserved; format
       defined; population deferred until AEAD lands.
-- [ ] **Hardware watchdog** (`boards/t114/src/wdt.rs`): arm WDT on boot with a generous
-      reload window; single `watchdog_feeder` task awaits a kick `Signal` that every other
-      monitored task pulses once per loop.  See [docs/reliability.md](docs/reliability.md)
-      § *Hardware watchdog*.
-- [ ] **Panic-to-flash + auto-reset** (`core/panic/`): production builds replace
-      `panic_probe` with a custom handler that captures `PanicInfo` + `RESETREAS` + git hash
-      to a flash ring buffer (8 slots) and triggers `SCB::sys_reset()`.  Boot path reads the
-      ring and surfaces "last panic at <file:line>" on About.
+- [x] **Hardware watchdog.**  `WDT_TIMEOUT_TICKS = 5 s` in `profiles/t114_ui/src/lib.rs`,
+      armed via `Watchdog::try_new` with two slots: `wdt_main` (petted at the top of
+      `ui_state_loop` every ~300 ms) and `wdt_render` (petted in `ui_render_task` after
+      each frame or via a `select(FRAME.wait(), Timer::after_secs(2))` fall-through so
+      WDT keeps eating even when display is off).  Link runtime is intentionally not
+      WDT-monitored — the link-layer 200 ms watchdog handles "link runtime stopped" via
+      RX-side all-notes-off, which is the operationally correct response.
+- [x] **Panic-to-flash + auto-reset.**  Custom `#[panic_handler]` in
+      `profiles/t114_ui/src/lib.rs` stages the panic message into `.uninit` (survives the
+      soft reset since cortex-m-rt's startup doesn't zero `.uninit`), defmt-logs, then
+      `SCB::sys_reset()`.  Boot path's `recover_pending_panic` reads `RESETREAS` (SD-safe
+      read; no clear — bits accumulate), takes the staged record from `.uninit`, persists
+      to the panic ring via `sequential-storage::queue::push`.  Surfaces dog / sreq / pin
+      / lockup bits individually; writes "watchdog: task hung" record on DOG without a
+      staged panic.  Verified end-to-end (injected panic → reboot → next boot reports it).
+- [x] **Dev-workflow fix: clear DEMCR at boot.**  `probe-rs run` defaults to setting
+      `VC_HARDERR` + `VC_CORERESET` in DEMCR, which survive SYSRESETREQ and halt the core
+      forever on the next transient HardFault once STLink is unplugged.  Single mmio
+      write to `0xE000EDFC` at the top of `run()` clears them.  Production boots never
+      see this (no probe → no bits set → no-op write), but it makes dev iteration
+      survivable without NRESET-after-every-cargo-run.  See chat 2026-05-11.
 - [ ] **Portability + no-alloc CI audit** (`xtask audit`): fail CI if any `core/`,
       `drivers/`, or `protocols/` crate directly depends on an `embassy-*` HAL crate, or if
       any non-board/profile `.rs` imports `alloc`.
-- [ ] **Low-battery graceful shutdown.**  Critical threshold (Vbat ≤ 3100 mV sustained for
-      N reads at ~5 s cadence) triggers, in order:
-        1. `sink.all_notes_off()` — silence the synth before TX goes away.
-        2. Append a "low-battery shutdown" record to the panic / shutdown-reason ring
-           buffer so the next boot's About shows "last shutdown: low-battery 2026-05-10
-           02:14" instead of leaving the operator guessing.
-        3. Drive the status LED to a slow blink as visual confirmation.
-        4. Enter `wfi` loop until the cell finishes dying.
+- [x] **Low-battery graceful shutdown — quick version.**  Critical threshold (Vbat ≤
+      `SHUTDOWN_MV`, sustained for 5 reads at 5 s cadence, USB unplugged) triggers, in order:
+        1. `SHUTDOWN.signal()` from `battery_task` → link runtime arm wakes.
+        2. `sink.all_notes_off()` (RX) + `radio.set_standby_rc()` — silence + park radio.
+        3. 6 LED blinks then `set_low`; runtime task idles forever on a 60 s timer.
+        4. UI side picks up `SHUTDOWN_LATCH` next iteration: renders "Shutting down /
+           Battery low / Plug in to charge" frame, pushes a "low-battery shutdown" record
+           to the panic ring, kills the backlight after ~3 s, parks WDT-petting.
+        5. Any joystick event in the park loop triggers `SCB::sys_reset()` → fresh boot.
+           If battery is still below threshold, `battery_task` re-fires shutdown after
+           the 25 s debounce.  USB-plug recovery is implicit: `vbus_present` gates the
+           shutdown predicate, so plugging in keeps subsequent boots alive.
       No explicit settings save — Apply* on-change writes already cover that.  Pending UI
       edits (edit_buffer values not yet confirmed via Center) are lost by design.
+      **NOTE:** this is a "quick" shutdown, not a deep soft-off.  Idle power in the park
+      state is ~2–5 mA (SD idle + ST7789 in normal-mode-with-backlight-off + SX1262 in
+      STBY_RC + joystick poll task + WDT pet).  On a 700 mAh 14500 LiPo this is ~10 days
+      shelf life — adequate for "left on overnight" but not "left in a gig bag for a
+      month."  The real deep soft-off (SLPIN display, SX1262 SLEEP, `sd_softdevice_disable`,
+      `sd_power_system_off` with GPIO-sense wakeup) lives in M8 and gets us to <5 µA.
 
 **Exit criteria:** power-cycle the device, settings retained; About screen shows last panic
 line if one occurred; injected `panic!()` reboots within the WDT window and the panic line
@@ -460,6 +483,16 @@ per-profile.
       - On wake: re-init everything (board::resources, SD, tasks).  This is effectively a
         warm reboot — Settings come back via M7 flash persistence.
       - Target: < 50 µA in sleep.  800 mAh LiPo → > 2 years of standby; 18650 → > 8 years.
+
+- [ ] **Migrate the M7 low-battery auto-shutdown onto the deep soft-off path.**  M7 ships a
+      "quick" auto-shutdown that parks at ~2–5 mA (see M7 entry).  Once the deep soft-off
+      machinery above is in place, route the sustained-low battery trigger through the same
+      power-down sequence: panic-ring record first (so the next boot's About still shows
+      "last shutdown: low-battery"), then the SLPIN / SX1262-SLEEP / SD-disable /
+      `sd_power_system_off` path with joystick-Center as the wake source.  Drops park-state
+      drain from ~3 mA to <5 µA, taking shelf life from days to years.  Behaviorally
+      identical from the user's perspective — press to wake just becomes "the boot is the
+      wake."
 
 - [ ] **USB-plug wake (brief).**  When soft-off, plugging in USB wakes the device just long
       enough to render one frame showing battery charging status (the existing

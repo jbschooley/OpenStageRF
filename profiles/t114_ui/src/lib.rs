@@ -49,9 +49,11 @@ use osrf_app_midi_node::{run_rx, run_tx, LinkConfig, UartMidiSink, UartMidiSourc
 use osrf_board_t114 as board;
 use osrf_driver_input_joystick5way::{Joystick5Way, JoystickEvent};
 use nrf_softdevice::Flash;
-use osrf_link_runtime::{LinkConfigSignal, LinkStatsCell, ScanController};
+use osrf_link_runtime::{LinkConfigSignal, LinkStatsCell, ScanController, ShutdownSignal};
+use osrf_ui::battery::NO_BATTERY_MV;
 use osrf_ui::{
     band_plan_channel, band_plan_index, build_screen, max_channel_index, BandPlan, BatteryStatus,
+    SHUTDOWN_MV,
     Command, KeyStore, LinkStatus, Renderer, Role, ScanState, ScreenId, Settings, UiState, Widget,
     WidgetList, BAND_PLANS, MAX_SCAN_CHANNELS,
 };
@@ -96,6 +98,34 @@ static CONFIG_UPDATES: LinkConfigSignal = LinkConfigSignal::new();
 /// sampling RSSI per channel.  Each render tick the ui_state task
 /// snapshots the results into `state.scan` via `apply_scan_pass`.
 static SCAN: ScanController = ScanController::new();
+
+/// Low-battery shutdown coordinator (link-runtime side).  `battery_task`
+/// fires this after observing `SHUTDOWN_BATTERY_SUSTAINED_SAMPLES`
+/// consecutive sub-`SHUTDOWN_MV` readings.  The link-runtime task
+/// (`run_rx` or `run_tx`) `select`s on it, sinks all-notes-off,
+/// parks the radio, and idles forever.  Single-consumer —
+/// `embassy_sync::Signal` takes-on-wait, so a separate
+/// `SHUTDOWN_LATCH` flag is needed for the ui_state_loop side.
+static SHUTDOWN: ShutdownSignal = ShutdownSignal::new();
+
+/// Latched shutdown flag for the UI side.  Set alongside
+/// [`SHUTDOWN`] in `battery_task`; polled by `ui_state_loop`'s loop
+/// tick.  Separate from `SHUTDOWN` because `Signal::wait` consumes
+/// the value (single-consumer), and we want both runtime and UI to
+/// observe the same shutdown event.  Polling is fine here — the
+/// ui_state_loop tick is 300 ms, which is well within the
+/// shutdown-budget of "user sees goodbye frame before the chip
+/// browns out."  Never cleared.
+static SHUTDOWN_LATCH: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Number of consecutive sub-`SHUTDOWN_MV` battery samples required
+/// before firing [`SHUTDOWN`].  With a 5 s sample interval this is
+/// `5 * 5 = 25 s` of sustained-low — long enough that a transient
+/// dip (TX-burst sag, plug-event transient) doesn't trip shutdown,
+/// short enough that a genuinely dying cell still has run-time left
+/// to do the all-notes-off + radio-park dance.
+const SHUTDOWN_BATTERY_SUSTAINED_SAMPLES: u32 = 5;
 
 /// Latest battery reading.  Written by [`battery_task`] every
 /// [`BATTERY_SAMPLE_INTERVAL_S`] seconds and on every USB-plug
@@ -186,6 +216,20 @@ pub enum TxSource {
 /// Bring up the board, spawn all tasks, run the UI state machine
 /// forever.  Called from each binary's `#[embassy_executor::main]`.
 pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
+    // Clear DEMCR (Debug Exception and Monitor Control Register).
+    // `probe-rs run` defaults to setting `VC_HARDERR` and
+    // `VC_CORERESET` so a debugger can break on crashes; those
+    // bits persist across SYSRESETREQ (ARM debug subsystem isn't
+    // reset by it).  With no debugger attached after STLink is
+    // unplugged, any HardFault halts the core forever instead of
+    // running its handler — looks like a chip-level freeze, only
+    // WDT reset or NRESET escapes it.  Production boots never see
+    // this (no probe → no DEMCR bits → no catch), but during dev
+    // we have to scrub them ourselves.  Cheap (single mmio write)
+    // and harmless if the bits weren't set.
+    const DEMCR: *mut u32 = 0xE000_EDFC as *mut u32;
+    unsafe { core::ptr::write_volatile(DEMCR, 0) };
+
     defmt::info!(
         "ui (T114, {:?}): bringing up SD + display + joystick + link",
         role
@@ -416,6 +460,7 @@ async fn link_rx_task(
         &STATS,
         Some(&CONFIG_UPDATES),
         Some(&SCAN),
+        Some(&SHUTDOWN),
     )
     .await
 }
@@ -439,6 +484,7 @@ async fn link_tx_uart_task(
         &STATS,
         Some(&CONFIG_UPDATES),
         Some(&SCAN),
+        Some(&SHUTDOWN),
     )
     .await
 }
@@ -464,6 +510,7 @@ async fn link_tx_scenario_task(
         &STATS,
         Some(&CONFIG_UPDATES),
         Some(&SCAN),
+        Some(&SHUTDOWN),
     )
     .await
 }
@@ -488,6 +535,14 @@ async fn joystick_task(mut js: Joystick) {
 /// "critical: 0 mV" messages.
 #[embassy_executor::task]
 async fn battery_task(mut monitor: board::battery::BatteryMonitor) {
+    // Consecutive samples that satisfied the shutdown condition.
+    // A debounce against single-sample transients (TX-burst sag, USB
+    // detach glitch).  Reset to 0 on any sample that fails the
+    // condition.  Once it reaches `SHUTDOWN_BATTERY_SUSTAINED_SAMPLES`
+    // we fire [`SHUTDOWN`] and leave it pinned so we don't re-signal
+    // every iteration thereafter.
+    let mut shutdown_run: u32 = 0;
+    let mut shutdown_fired = false;
     loop {
         let mv = monitor.sample().await;
         let plugged_in = board::battery::vbus_present();
@@ -508,6 +563,31 @@ async fn battery_task(mut monitor: board::battery::BatteryMonitor) {
                 status.voltage_mv,
                 status.percent
             );
+        }
+        // Shutdown predicate: real battery present, voltage in the
+        // hard-shutdown zone, USB not plugged in (plugged-in means
+        // user is charging — `vbus_present()` flips on with as little
+        // as ~10 mA into the charger, so any USB connection is
+        // grounds to defer shutdown).  Once fired we latch — a
+        // single low-voltage spike + recovery shouldn't un-shut us
+        // down, because the link tasks have already started parking.
+        let shutdown_eligible = !plugged_in
+            && mv >= NO_BATTERY_MV
+            && mv <= SHUTDOWN_MV;
+        if shutdown_eligible {
+            shutdown_run = shutdown_run.saturating_add(1);
+            if !shutdown_fired && shutdown_run >= SHUTDOWN_BATTERY_SUSTAINED_SAMPLES {
+                defmt::warn!(
+                    "battery shutdown threshold: {=u16} mV sustained for {=u32} samples — signalling SHUTDOWN",
+                    mv,
+                    shutdown_run
+                );
+                SHUTDOWN.signal();
+                SHUTDOWN_LATCH.store(true, core::sync::atomic::Ordering::Release);
+                shutdown_fired = true;
+            }
+        } else {
+            shutdown_run = 0;
         }
         embassy_time::Timer::after_secs(BATTERY_SAMPLE_INTERVAL_S).await;
     }
@@ -564,6 +644,75 @@ async fn ui_state_loop(
         // Apply* command added — comfortably under the 5 s timeout.
         // Bursts of joystick events may pet faster than that.
         wdt.pet();
+
+        // Low-battery shutdown: `battery_task` set the latch after
+        // sustained sub-shutdown voltage.  Render a goodbye frame,
+        // log a "low-battery shutdown" record to the panic ring
+        // (audit trail — useful when the user's first question
+        // after powering on a dead board is "did it crash or just
+        // run out?"), then drop into a WDT-petting park loop.  We
+        // don't `loop {}` outright because the WDT would reset us
+        // back to here on a sustained-low boot — wasted power on
+        // the boot cycle.
+        if SHUTDOWN_LATCH.load(core::sync::atomic::Ordering::Acquire) {
+            defmt::warn!("ui: low-battery shutdown acknowledged — rendering goodbye frame");
+            // Light the panel back up if it had auto-slept, so the
+            // user sees the goodbye.  No need to track `display_on`
+            // afterwards — the park loop never returns to the
+            // top-of-loop policy code.
+            if !display_on {
+                backlight.set_low();
+            }
+            widgets.clear();
+            let _ = widgets.push(Widget::Title(heapless::String::try_from("Shutting down").unwrap_or_default()));
+            let _ = widgets.push(Widget::Text {
+                row: 2,
+                text: heapless::String::try_from("Battery low").unwrap_or_default(),
+            });
+            let _ = widgets.push(Widget::Text {
+                row: 3,
+                text: heapless::String::try_from("Plug in to charge").unwrap_or_default(),
+            });
+            let battery = critical_section::with(|cs| BATTERY.borrow(cs).get());
+            let _ = widgets.push(Widget::BatteryIndicator {
+                voltage_mv: battery.voltage_mv,
+                percent: battery.percent,
+                plugged_in: battery.plugged_in,
+            });
+            FRAME.signal(FrameData {
+                widgets: widgets.clone(),
+                scan: state.scan.clone(),
+            });
+            push_panic_record(flash, 0, b"low-battery shutdown").await;
+            // Show the goodbye for ~3 s before killing the panel.
+            // WDT slot pets the timer in this task, so we use short
+            // sub-pets to keep it fed.
+            for _ in 0..10 {
+                wdt.pet();
+                Timer::after_millis(300).await;
+            }
+            backlight.set_high();
+            // Park loop — pet the WDT, but also consume joystick
+            // events so a deliberate user interaction can recover.
+            // Any event triggers a full reset; if the battery is
+            // still below threshold, `battery_task` re-fires the
+            // shutdown on the next boot.  Acceptable trade: a
+            // briefly-revived UI on a dying cell is better than a
+            // bricked-looking unit that needs NRESET.  Drains the
+            // event channel first so any presses queued during the
+            // goodbye render don't immediately reboot us.
+            while EVENT_CHAN.try_receive().is_ok() {}
+            loop {
+                wdt.pet();
+                match select(EVENT_CHAN.receive(), Timer::after_secs(1)).await {
+                    Either::First(_) => {
+                        defmt::info!("ui: joystick wake from shutdown — rebooting");
+                        cortex_m::peripheral::SCB::sys_reset();
+                    }
+                    Either::Second(()) => {}
+                }
+            }
+        }
 
         let next_tick = Timer::after(scan_tick);
         match select(EVENT_CHAN.receive(), next_tick).await {

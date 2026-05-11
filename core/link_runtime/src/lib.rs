@@ -23,7 +23,7 @@
 //! marked link-down so the next packet (post-restart) triggers a
 //! session reset.
 
-use embassy_futures::select::{select, select4, Either4};
+use embassy_futures::select::{select, select5, Either5};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer};
@@ -152,6 +152,53 @@ impl LinkConfigSignal {
 }
 
 impl Default for LinkConfigSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Shutdown request from outside the link runtime.  Used by the
+/// profile's battery monitor to ask `run_rx` / `run_tx` to wrap up
+/// gracefully on low-battery before the cell finishes dying:
+///
+///   1. `sink.all_notes_off()` (RX-side only — silences the synth
+///      so it doesn't hang notes when TX vanishes).
+///   2. `radio.set_standby_rc()` — stops transmitting and cuts
+///      most of the radio current.
+///   3. LED blink pattern as visual confirmation of the shutdown.
+///   4. Permanent idle (`Timer::after_secs(60)` loop) — keeps the
+///      task alive at zero CPU until the cell finishes draining.
+///
+/// Profiles that don't need shutdown coordination pass `None` for
+/// the `shutdown` parameter and the runtime never checks it.
+pub struct ShutdownSignal {
+    inner: Signal<CriticalSectionRawMutex, ()>,
+}
+
+impl ShutdownSignal {
+    pub const fn new() -> Self {
+        Self {
+            inner: Signal::new(),
+        }
+    }
+    pub fn signal(&self) {
+        self.inner.signal(());
+    }
+    /// Block until the signal fires.  Exposed `pub` (rather than
+    /// crate-private) so a profile can include a `select` arm in its
+    /// own UI loop — e.g. to paint a "shutting down" screen, persist
+    /// last-state, and halt — alongside the radio-park dance the
+    /// link runtime handles internally.  Multiple awaiters are
+    /// supported: the underlying `Signal` re-arms on take, so a
+    /// single `signal()` wakes the first awaiter only.  In practice
+    /// profiles signal exactly once and rely on `Signal::signaled`
+    /// remaining `true` until each waiter has observed it.
+    pub async fn wait(&self) {
+        self.inner.wait().await;
+    }
+}
+
+impl Default for ShutdownSignal {
     fn default() -> Self {
         Self::new()
     }
@@ -596,6 +643,66 @@ where
     Ok(())
 }
 
+// ── Low-battery shutdown helpers ───────────────────────────────────────────
+
+/// Park the radio in standby_rc, blink a recognisable LED pattern, then
+/// idle forever.  Called from both `run_tx` and `run_rx` when the
+/// profile fires its [`ShutdownSignal`].  Returns `!` so the calling
+/// `select` arm can be treated as terminal — the only way out is reset.
+async fn handle_tx_shutdown<Spi, Busy, Dio1, Reset, Switch, Led>(
+    radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
+    led: &mut Led,
+) -> !
+where
+    Spi: SpiDevice,
+    Busy: Wait,
+    Dio1: Wait,
+    Reset: embedded_hal::digital::OutputPin,
+    Switch: RfSwitchControl,
+    Led: StatefulOutputPin,
+{
+    defmt::warn!("link TX: shutdown signal received — parking radio");
+    let _ = radio.set_standby_rc().await;
+    for _ in 0..6 {
+        let _ = led.toggle();
+        Timer::after_millis(120).await;
+    }
+    let _ = led.set_low();
+    loop {
+        Timer::after_secs(60).await;
+    }
+}
+
+/// RX-side counterpart to [`handle_tx_shutdown`].  Adds a final
+/// `sink.all_notes_off()` so a connected synth doesn't hang notes
+/// when the receiver goes dark.
+async fn handle_rx_shutdown<Spi, Busy, Dio1, Reset, Switch, Led, Sink>(
+    radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
+    led: &mut Led,
+    sink: &mut Sink,
+) -> !
+where
+    Spi: SpiDevice,
+    Busy: Wait,
+    Dio1: Wait,
+    Reset: embedded_hal::digital::OutputPin,
+    Switch: RfSwitchControl,
+    Led: StatefulOutputPin,
+    Sink: MidiSink,
+{
+    defmt::warn!("link RX: shutdown signal received — silencing sink + parking radio");
+    let _ = sink.all_notes_off().await;
+    let _ = radio.set_standby_rc().await;
+    for _ in 0..6 {
+        let _ = led.toggle();
+        Timer::after_millis(120).await;
+    }
+    let _ = led.set_low();
+    loop {
+        Timer::after_secs(60).await;
+    }
+}
+
 // ── TX loop ─────────────────────────────────────────────────────────────────
 
 /// Apply a new `LinkConfig` to the radio mid-flight (TX side):
@@ -668,6 +775,7 @@ pub async fn run_tx<Spi, Busy, Dio1, Reset, Switch, Led, Source>(
     stats: &LinkStatsCell,
     config_updates: Option<&LinkConfigSignal>,
     scan: Option<&ScanController>,
+    shutdown: Option<&ShutdownSignal>,
 ) -> !
 where
     Spi: SpiDevice,
@@ -883,22 +991,39 @@ where
                 None => core::future::pending::<()>().await,
             }
         };
-        match select4(source.wait_ready(), hb.wait(), cfg_wait, scan_wait).await {
-            Either4::First(()) => {
+        let shutdown_wait = async {
+            match shutdown {
+                Some(s) => s.wait().await,
+                None => core::future::pending::<()>().await,
+            }
+        };
+        match select5(
+            source.wait_ready(),
+            hb.wait(),
+            cfg_wait,
+            scan_wait,
+            shutdown_wait,
+        )
+        .await
+        {
+            Either5::First(()) => {
                 // Source has an event ready; loop to drain.
                 continue;
             }
-            Either4::Second(()) => {
+            Either5::Second(()) => {
                 // Heartbeat fired — fall through to send one.
             }
-            Either4::Third(new_cfg) => {
+            Either5::Third(new_cfg) => {
                 apply_tx_reconfig(radio, &mut current, &new_cfg, &mut hb).await;
                 continue;
             }
-            Either4::Fourth(()) => {
+            Either5::Fourth(()) => {
                 // Scan-controller state change — top-of-loop reconcile
                 // picks it up.
                 continue;
+            }
+            Either5::Fifth(()) => {
+                handle_tx_shutdown(radio, led).await;
             }
         }
 
@@ -1048,6 +1173,7 @@ pub async fn run_rx<Spi, Busy, Dio1, Reset, Switch, Led, Sink>(
     stats: &LinkStatsCell,
     config_updates: Option<&LinkConfigSignal>,
     scan: Option<&ScanController>,
+    shutdown: Option<&ShutdownSignal>,
 ) -> !
 where
     Spi: SpiDevice,
@@ -1299,15 +1425,25 @@ where
                 None => core::future::pending::<()>().await,
             }
         };
-        match select4(
+        let shutdown_wait = async {
+            match shutdown {
+                Some(s) => s.wait().await,
+                None => core::future::pending::<()>().await,
+            }
+        };
+        match select5(
             radio.rx_recv(&mut radio_buf),
             wd.wait(),
             cfg_wait,
             scan_wait,
+            shutdown_wait,
         )
         .await
         {
-            Either4::First(Ok(pkt)) if pkt.crc_ok => {
+            Either5::Fifth(()) => {
+                handle_rx_shutdown(radio, led, sink).await;
+            }
+            Either5::First(Ok(pkt)) if pkt.crc_ok => {
                 let arrived = Instant::now();
                 bucket_rx_gap(
                     &mut rx_gap_buckets,
@@ -1489,7 +1625,7 @@ where
                     }
                 }
             }
-            Either4::First(Ok(_)) => {
+            Either5::First(Ok(_)) => {
                 // Chip set both `rx_done` and `crc_err` in the IRQ
                 // bitmap — a complete frame arrived but failed CRC.
                 // Counted in the existing `crc_mismatch` field so
@@ -1500,7 +1636,7 @@ where
                     defmt::warn!("RX: CRC mismatch count = {}", crc_mismatch);
                 }
             }
-            Either4::First(Err(e)) => {
+            Either5::First(Err(e)) => {
                 // Bucket by variant — different fingerprints suggest
                 // different root causes.  Throttle the per-variant
                 // log lines so a sustained error stream doesn't
@@ -1547,7 +1683,7 @@ where
                     }
                 }
             }
-            Either4::Second(()) => {
+            Either5::Second(()) => {
                 if link_up {
                     link_up = false;
                     defmt::warn!(
@@ -1569,7 +1705,7 @@ where
                 }
                 wd.kick();
             }
-            Either4::Third(new_cfg) => {
+            Either5::Third(new_cfg) => {
                 apply_rx_reconfig(
                     radio,
                     &mut current,
@@ -1583,7 +1719,7 @@ where
                 .await;
                 continue;
             }
-            Either4::Fourth(()) => {
+            Either5::Fourth(()) => {
                 // Scan controller fired (start / stop / channel-list
                 // change).  Top-of-loop reconcile picks it up — just
                 // restart the iteration so it sees the fresh state
