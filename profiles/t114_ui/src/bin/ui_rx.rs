@@ -10,9 +10,12 @@
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use osrf_board_t114 as board;
+// `osrf_profile_t114_ui` defines our own `#[panic_handler]` —
+// staging the panic to the cross-reset buffer and triggering a
+// soft reset (instead of `panic_probe`'s "log + halt forever").
+// Importing the lib brings that handler into the binary.
 use osrf_profile_t114_ui::{run, TxSource};
 use osrf_ui::Role;
-use panic_probe as _;
 
 #[cortex_m_rt::pre_init]
 unsafe fn pre_init() {

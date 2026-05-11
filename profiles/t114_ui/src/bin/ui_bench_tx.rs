@@ -17,9 +17,9 @@
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use osrf_board_t114 as board;
+// Panic handler lives in `osrf_profile_t114_ui` (lib).
 use osrf_profile_t114_ui::{run, TxSource};
 use osrf_ui::Role;
-use panic_probe as _;
 
 #[cortex_m_rt::pre_init]
 unsafe fn pre_init() {

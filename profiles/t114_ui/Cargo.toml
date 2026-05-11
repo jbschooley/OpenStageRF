@@ -29,7 +29,12 @@ cortex-m    = { version = "0.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"
 defmt       = "1.0"
 defmt-rtt   = "1.1"
-panic-probe = { version = "1.0", features = ["print-defmt"] }
+# We provide our own `#[panic_handler]` in `src/lib.rs` (stages the
+# panic to the cross-reset buffer, then `SCB::sys_reset()`).  No
+# `panic-probe` dep — production builds reboot on panic instead of
+# halting; defmt::error still emits the message before the reset
+# so RTT-attached dev sessions see the same info that `panic-probe`
+# would have printed.
 
 [lib]
 name = "osrf_profile_t114_ui"
