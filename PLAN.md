@@ -405,9 +405,17 @@ battery triggers a clean shutdown with audible-MIDI-quiet rather than a brownout
       same-field edits.
 - [x] **Boot counter stays random** (`board::softdevice::rand_bytes` → u16) — *not*
       flash-persisted.  About screen extension (below) will render it as `Session: 0xNNNN`.
-- [ ] Key store: stub for v1 (only no-encryption mode, `key_fp=0x0000`, used); structure
-      ready for Stage 3 encryption work.  Sequential-storage region reserved; format
-      defined; population deferred until AEAD lands.
+- [x] **Key store: stub for v1.**  Sequential-storage region reserved (`KEY_STORE_RANGE`
+      in board storage).  On-flash record format defined: `KeyRecord` in
+      `core/ui/src/key_store.rs` is a fixed-64-byte `#[repr(C)]` struct
+      (`fingerprint: u32` / `name_len: u8` / `name_bytes: [u8; 16]` / `key_material:
+      [u8; 32]` / `reserved: [u8; 11]`).  `KeyRecord::from_entry` / `to_entry` provide
+      round-trip conversion to/from runtime `KeyEntry`; tests cover roundtrip + bad
+      name_len rejection + fingerprint masking.  v1 status: no UI flow populates the
+      flash region (no add-key screen yet, no AEAD wiring on the link), and
+      `KeyStore::default()` returns empty.  Stage 3 just has to plumb a load+populate
+      path through the existing region — no migration needed since the format is
+      committed.
 - [x] **Hardware watchdog.**  `WDT_TIMEOUT_TICKS = 5 s` in `profiles/t114_ui/src/lib.rs`,
       armed via `Watchdog::try_new` with two slots: `wdt_main` (petted at the top of
       `ui_state_loop` every ~300 ms) and `wdt_render` (petted in `ui_render_task` after
@@ -418,11 +426,36 @@ battery triggers a clean shutdown with audible-MIDI-quiet rather than a brownout
 - [x] **Panic-to-flash + auto-reset.**  Custom `#[panic_handler]` in
       `profiles/t114_ui/src/lib.rs` stages the panic message into `.uninit` (survives the
       soft reset since cortex-m-rt's startup doesn't zero `.uninit`), defmt-logs, then
-      `SCB::sys_reset()`.  Boot path's `recover_pending_panic` reads `RESETREAS` (SD-safe
-      read; no clear — bits accumulate), takes the staged record from `.uninit`, persists
-      to the panic ring via `sequential-storage::queue::push`.  Surfaces dog / sreq / pin
-      / lockup bits individually; writes "watchdog: task hung" record on DOG without a
-      staged panic.  Verified end-to-end (injected panic → reboot → next boot reports it).
+      `SCB::sys_reset()`.  Boot path's `recover_pending_panic` reads + clears `RESETREAS`
+      via `sd_power_reset_reason_get` / `_clr` so each boot's value reflects only that
+      boot's cause (originally we kept the accumulating-flags posture but it broke the
+      DOG-without-staged-panic detector for the watchdog-hang case).  Takes the staged
+      record from `.uninit`, persists to the panic ring; writes "watchdog: task hung"
+      record on DOG without a staged panic.  Verified end-to-end via force-panic and
+      force-WDT menu items (below).
+- [x] **Shared `osrf-panic-log` crate** (`core/panic_log/`): board-agnostic wrapper over
+      `sequential-storage::queue` with a fixed record format (`[reset_reas: u32 LE]
+      [UTF-8 message ≤ PANIC_MSG_LEN]`) and `push` / `read_latest` / `clear` helpers.
+      Profile glues board-specific `PANIC_RING_RANGE` + nrf-softdevice `Flash` to the
+      shared API.  Board crate re-exports `PANIC_MSG_LEN` so the cross-reset staging
+      buffer (board-side, in `.uninit`) and the on-flash records stay locked to the
+      same size.  Pattern is now ready for any future UI-bearing board.
+- [x] **About screen extension** (`core/ui/src/lib.rs::build_about`): scrollable
+      multi-line view with firmware version (`env!("CARGO_PKG_VERSION")` from the
+      profile crate), git hash (set by board `build.rs`; appended `*` when working tree
+      is dirty), session ID (random per-boot u16), last panic message (read at boot
+      from the panic ring via `osrf_panic_log::read_latest`), and a 3-line GitHub URL.
+      Scrolling via Up/Down on the screen; `build_about` clamps overshoot so Down past
+      the bottom doesn't pile up scroll that must be undone with Up.  Long-press Right
+      emits `Command::ClearPanicLog`; profile handles it by `osrf_panic_log::clear`-ing
+      the flash region and zeroing the cached last-panic string.
+- [x] **Diagnostic menu items.**  `Force panic` (emits `Command::ForcePanic` → profile
+      calls `panic!("forced panic from menu (test)")`) and `Force WDT` (emits
+      `Command::ForceWdtHang` → profile busy-spins `ui_state_loop` so its WDT slot
+      stops petting → ~5 s later WDT fires).  Both surface as menu items in
+      `MAIN_MENU_RX` / `MAIN_MENU_TX`; behaviorally identical to a real crash or hang
+      so the recovery path can be exercised one-handed without a rebuild.  Cheap to
+      leave in production — operator has to navigate two menu levels to reach them.
 - [x] **Dev-workflow fix: clear DEMCR at boot.**  `probe-rs run` defaults to setting
       `VC_HARDERR` + `VC_CORERESET` in DEMCR, which survive SYSRESETREQ and halt the core
       forever on the next transient HardFault once STLink is unplugged.  Single mmio
@@ -453,11 +486,22 @@ battery triggers a clean shutdown with audible-MIDI-quiet rather than a brownout
       month."  The real deep soft-off (SLPIN display, SX1262 SLEEP, `sd_softdevice_disable`,
       `sd_power_system_off` with GPIO-sense wakeup) lives in M8 and gets us to <5 µA.
 
-**Exit criteria:** power-cycle the device, settings retained; About screen shows last panic
-line if one occurred; injected `panic!()` reboots within the WDT window and the panic line
-appears on the next About; injected infinite-loop in any task reboots within the WDT window;
-pulling battery just under 3.1 V triggers all-notes-off + shutdown record + LED blink +
-halt; next boot's About shows the low-battery shutdown reason.
+**Exit criteria:** ✅ all of the following verified end-to-end on hardware
+(2026-05-11):
+  - Power-cycle device, settings retained (channel, band plan, TX power persist).
+  - `Force panic` menu item → reboot → About shows `forced panic from menu (test)`.
+  - `Force WDT` menu item → ~5 s hang → reboot via WDT → About shows
+    `watchdog: task hung`.
+  - Low-battery shutdown (testable by bumping `SHUTDOWN_MV` to current Vbat) →
+    goodbye screen → backlight off → About on next boot shows `low-battery shutdown`.
+  - About long-press Right → panic ring cleared → `No prior panic` on next render
+    and across subsequent reboots.
+  - About scroll Up/Down works, with overshoot clamping (Down past end doesn't
+    accumulate scroll the user has to undo).
+
+**Remaining sub-items:** key store stub, portability/no-alloc CI audit (`xtask audit`).
+Both are listed above with `[ ]` and can be picked up independently; everything else
+in this milestone has landed.
 
 ### Milestone 8 — power management + battery chemistry options (3–5 days)
 

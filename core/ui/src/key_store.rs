@@ -42,6 +42,113 @@ pub const MAX_KEYS: usize = 16;
 /// Maximum length of a user-assigned key name.
 pub const MAX_KEY_NAME: usize = 16;
 
+/// Symmetric AEAD key material length in bytes.  256-bit because
+/// that's what ChaCha20-Poly1305 (the Stage-3 candidate) needs;
+/// AES-256-GCM uses the same.  Locked here so the on-flash
+/// [`KeyRecord`] format doesn't shift when AEAD wiring lands.
+pub const KEY_MATERIAL_LEN: usize = 32;
+
+/// On-flash representation of a single key store entry.  Fixed size
+/// + `#[repr(C)]` so the byte layout is stable across firmware
+/// revisions — this is the v1 commitment that Stage 3 AEAD work
+/// won't have to migrate around.  Read / written via
+/// `sequential-storage::map` keyed by the 24-bit fingerprint.
+///
+/// Layout (64 bytes total):
+///
+/// ```text
+///   offset  size  field
+///   ------  ----  -----
+///    0       4    fingerprint (u32 LE; only low 24 bits meaningful, top byte zero)
+///    4       1    name_len (0..=MAX_KEY_NAME)
+///    5      16    name_bytes (UTF-8, zero-padded, not null-terminated)
+///   21      32    key_material (raw symmetric key; zeroed in v1)
+///   53      11    reserved (zero-filled padding for forward compat)
+/// ```
+///
+/// **v1 status:** [`KeyStore`] doesn't expose any way to populate
+/// `key_material` — the UI offers no add-key flow and AEAD isn't
+/// wired into the link layer.  Records are not pushed to flash by
+/// any current code path.  When Stage 3 lands:
+///
+/// 1. UI gains an Add Key flow that generates / imports key
+///    material and pushes a [`KeyRecord`] to flash.
+/// 2. Boot path reads all records via [`KeyStore::load_from_flash`]
+///    (wiring TBD by the profile) and populates a runtime
+///    [`KeyStore`].
+/// 3. The link layer's AEAD step looks up `key_material` by
+///    fingerprint via [`KeyStore::find`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct KeyRecord {
+    /// 24-bit fingerprint in the low bits; top byte zero.  Used as
+    /// the storage key (for `sequential-storage::map`) AND as a
+    /// sanity check inside the value — if the two disagree on
+    /// read, the entry is considered corrupt.
+    pub fingerprint: u32,
+    /// Valid byte count of [`Self::name_bytes`].
+    pub name_len: u8,
+    /// Name as UTF-8 bytes.  Not null-terminated; consume with
+    /// `&name_bytes[..name_len as usize]`.
+    pub name_bytes: [u8; MAX_KEY_NAME],
+    /// Raw symmetric key material.  Zeroed until Stage 3 AEAD
+    /// lands.  The on-wire `key_fp` header field already carries
+    /// the fingerprint; the receiver looks up the material here.
+    pub key_material: [u8; KEY_MATERIAL_LEN],
+    /// Reserved for forward compatibility.  Must be zero on write
+    /// today; future versions may use this region for a
+    /// `key_type` discriminator, KDF salt, etc.
+    pub reserved: [u8; 11],
+}
+
+impl KeyRecord {
+    /// Construct a record from a runtime [`KeyEntry`] with the
+    /// given key material.  v1 callers pass `[0; 32]` — the
+    /// material slot is reserved but unused until AEAD lands.
+    pub fn from_entry(entry: &KeyEntry, material: [u8; KEY_MATERIAL_LEN]) -> Self {
+        let mut name_bytes = [0u8; MAX_KEY_NAME];
+        let bytes = entry.name.as_bytes();
+        let n = bytes.len().min(MAX_KEY_NAME);
+        name_bytes[..n].copy_from_slice(&bytes[..n]);
+        Self {
+            fingerprint: entry.fingerprint & 0x00FF_FFFF,
+            name_len: n as u8,
+            name_bytes,
+            key_material: material,
+            reserved: [0; 11],
+        }
+    }
+
+    /// Lift the name portion back to a [`KeyEntry`].  Drops
+    /// `key_material` since [`KeyEntry`] doesn't carry it — the
+    /// material lives in the on-flash record only and is looked
+    /// up by fingerprint when the link layer needs it.  Returns
+    /// `None` if the name bytes don't decode as UTF-8 or
+    /// `name_len` is out of bounds.
+    pub fn to_entry(&self) -> Option<KeyEntry> {
+        let n = self.name_len as usize;
+        if n > MAX_KEY_NAME {
+            return None;
+        }
+        let s = core::str::from_utf8(&self.name_bytes[..n]).ok()?;
+        let mut name: String<MAX_KEY_NAME> = String::new();
+        for c in s.chars().take(MAX_KEY_NAME) {
+            let _ = name.push(c);
+        }
+        Some(KeyEntry {
+            fingerprint: self.fingerprint & 0x00FF_FFFF,
+            name,
+        })
+    }
+}
+
+/// Compile-time check that the [`KeyRecord`] size matches the
+/// documented 64-byte layout.  Bumping any field size / count
+/// here without updating the doc comment is a build error.
+const _: () = {
+    assert!(core::mem::size_of::<KeyRecord>() == 64);
+};
+
 /// One key in the runtime store.  Cloned around the UI; the
 /// canonical `key_material` lives in a separate secure store
 /// (flash region with read-protect bits set), accessed by
@@ -224,5 +331,49 @@ mod tests {
             name: String::new(),
         };
         assert_eq!(e.format_fingerprint().as_str(), "a3f9c1");
+    }
+
+    #[test]
+    fn key_record_roundtrip() {
+        let mut name: String<MAX_KEY_NAME> = String::new();
+        name.push_str("Stage Left").unwrap();
+        let entry = KeyEntry {
+            fingerprint: 0x12_3456,
+            name,
+        };
+        let material = [0xAB; KEY_MATERIAL_LEN];
+        let record = KeyRecord::from_entry(&entry, material);
+        assert_eq!(record.fingerprint, 0x12_3456);
+        assert_eq!(record.name_len, "Stage Left".len() as u8);
+        assert_eq!(record.key_material, material);
+        assert_eq!(record.reserved, [0; 11]);
+
+        let back = record.to_entry().expect("round trips");
+        assert_eq!(back.fingerprint, 0x12_3456);
+        assert_eq!(back.name.as_str(), "Stage Left");
+    }
+
+    #[test]
+    fn key_record_rejects_bad_name_len() {
+        let record = KeyRecord {
+            fingerprint: 0xAABBCC,
+            name_len: 99, // > MAX_KEY_NAME
+            name_bytes: [0; MAX_KEY_NAME],
+            key_material: [0; KEY_MATERIAL_LEN],
+            reserved: [0; 11],
+        };
+        assert!(record.to_entry().is_none());
+    }
+
+    #[test]
+    fn key_record_strips_high_byte_of_fingerprint() {
+        let mut name: String<MAX_KEY_NAME> = String::new();
+        name.push_str("X").unwrap();
+        let entry = KeyEntry {
+            fingerprint: 0xFF_12_3456,
+            name,
+        };
+        let record = KeyRecord::from_entry(&entry, [0; KEY_MATERIAL_LEN]);
+        assert_eq!(record.fingerprint, 0x12_3456);
     }
 }

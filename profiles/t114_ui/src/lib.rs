@@ -52,8 +52,8 @@ use nrf_softdevice::Flash;
 use osrf_link_runtime::{LinkConfigSignal, LinkStatsCell, ScanController, ShutdownSignal};
 use osrf_ui::battery::NO_BATTERY_MV;
 use osrf_ui::{
-    band_plan_channel, band_plan_index, build_screen, max_channel_index, BandPlan, BatteryStatus,
-    SHUTDOWN_MV,
+    band_plan_channel, band_plan_index, build_screen, max_channel_index, AboutData, BandPlan,
+    BatteryStatus, SHUTDOWN_MV,
     Command, KeyStore, LinkStatus, Renderer, Role, ScanState, ScreenId, Settings, UiState, Widget,
     WidgetList, BAND_PLANS, MAX_SCAN_CHANNELS,
 };
@@ -255,6 +255,15 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     // a clean cold boot here is a no-op.
     recover_pending_panic(&mut flash).await;
 
+    // Read the most-recent panic from the ring for the About screen.
+    // Only happens once at boot — the value is then constant for the
+    // session.  Empty `String` if the ring has no entries.
+    let mut last_panic_msg = osrf_panic_log::read_latest(
+        &mut flash,
+        board::storage::PANIC_RING_RANGE,
+    )
+    .await;
+
     // ── Display init + initial paint (synchronous, before split) ──
     //
     // The initial frame is rendered + flushed before we hand the
@@ -278,8 +287,23 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     let mut widgets: WidgetList = WidgetList::new();
     let mut renderer = Renderer::new();
 
+    // Random per-boot 16-bit ID — surfaces on About as `Session
+    // 0xNNNN` for both roles, and gets reused as the TX-side
+    // `boot_counter` below.  Generated here so the initial frame
+    // can render it.
+    let session_id = read_random_u16();
+    defmt::info!("session_id = 0x{=u16:04X} (random per-boot)", session_id);
+
     let initial_status = link_status_from_stats(&STATS.get());
-    build_screen(&state, &settings, &keys, &initial_status, &mut widgets);
+    let initial_about = about_data(session_id, &last_panic_msg);
+    build_screen(
+        &mut state,
+        &settings,
+        &keys,
+        &initial_status,
+        &initial_about,
+        &mut widgets,
+    );
     // Include the (still-unknown) battery indicator on the initial
     // paint so the title bar's right side is properly themed from
     // frame zero rather than briefly showing whatever was beneath.
@@ -350,13 +374,7 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
             );
         }
         Role::Tx => {
-            // Boot counter goes into the high 16 bits of the link-
-            // layer `seq` and MUST change across resets so RX's replay
-            // window doesn't reject post-reboot low-seq packets as
-            // ancient duplicates.  Pull via SD's RNG SVC; flash-
-            // persisted in M7.
-            let boot_counter = read_random_u16();
-            defmt::info!("boot_counter = {} (random per-boot)", boot_counter);
+            let boot_counter = session_id;
             match tx_source {
                 TxSource::Uart => {
                     let source = UartMidiSource::new(r.midi_uart);
@@ -401,8 +419,27 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
         settings,
         keys,
         &mut widgets,
+        session_id,
+        &mut last_panic_msg,
     )
     .await
+}
+
+/// Construct an [`AboutData`] borrowing the long-lived
+/// `last_panic_msg` buffer that lives on `run()`'s stack.  Empty
+/// panic message → `None`.  `firmware_version` baked at compile
+/// time from this crate's Cargo.toml.
+fn about_data<'a>(session_id: u16, last_panic_msg: &'a heapless::String<96>) -> AboutData<'a> {
+    AboutData {
+        firmware_version: concat!("v", env!("CARGO_PKG_VERSION")),
+        git_hash: board::GIT_HASH,
+        session_id,
+        last_panic: if last_panic_msg.is_empty() {
+            None
+        } else {
+            Some(last_panic_msg.as_str())
+        },
+    }
 }
 
 // ── Tasks ───────────────────────────────────────────────────────
@@ -624,6 +661,8 @@ async fn ui_state_loop(
     mut settings: Settings,
     keys: KeyStore,
     widgets: &mut WidgetList,
+    session_id: u16,
+    last_panic_msg: &mut heapless::String<96>,
 ) -> ! {
     /// Idle screen → backlight off when this long with no input.
     const IDLE_OFF_TIMEOUT: Duration = Duration::from_secs(15);
@@ -683,7 +722,7 @@ async fn ui_state_loop(
                 widgets: widgets.clone(),
                 scan: state.scan.clone(),
             });
-            push_panic_record(flash, 0, b"low-battery shutdown").await;
+            osrf_panic_log::push(flash, board::storage::PANIC_RING_RANGE, 0, b"low-battery shutdown").await;
             // Show the goodbye for ~3 s before killing the panel.
             // WDT slot pets the timer in this task, so we use short
             // sub-pets to keep it fed.
@@ -749,6 +788,54 @@ async fn ui_state_loop(
                             // LinkConfig yet), but do persist so a reboot
                             // restores the user's last selection.
                             save_active_key(flash, fp).await;
+                        }
+                        Command::ForcePanic => {
+                            // Diagnostic — fires the production
+                            // panic handler so the staging →
+                            // sys_reset → recovery → About flow can
+                            // be exercised end-to-end without a
+                            // rebuild.  Message is distinctive so
+                            // it's obvious on About that this came
+                            // from the menu rather than a real bug.
+                            panic!("forced panic from menu (test)");
+                        }
+                        Command::ForceWdtHang => {
+                            // Diagnostic — busy-spin so wdt_main
+                            // stops getting petted at the top of
+                            // ui_state_loop.  After WDT_TIMEOUT_TICKS
+                            // (5 s) the hardware WDT fires, chip
+                            // resets, next boot's
+                            // `recover_pending_panic` sees DOG in
+                            // RESETREAS without a staged panic and
+                            // pushes "watchdog: task hung" to the
+                            // panic ring.  The other tasks
+                            // (ui_render with its own WDT slot,
+                            // joystick, battery, link runtime)
+                            // continue running for those ~5 s; only
+                            // ui_state_loop hangs.
+                            defmt::warn!("ui: forced WDT hang — chip will reset in ~5s");
+                            loop {
+                                cortex_m::asm::nop();
+                            }
+                        }
+                        Command::ClearPanicLog => {
+                            match osrf_panic_log::clear(
+                                flash,
+                                board::storage::PANIC_RING_RANGE,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    last_panic_msg.clear();
+                                    defmt::info!("ui: panic ring cleared");
+                                }
+                                Err(_e) => {
+                                    defmt::warn!(
+                                        "ui: panic-ring clear failed: {:?}",
+                                        defmt::Debug2Format(&_e)
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -820,7 +907,8 @@ async fn ui_state_loop(
         // (which doesn't matter because the backlight is off).
         if display_on {
             let status = link_status_from_stats(&STATS.get());
-            build_screen(state, &settings, &keys, &status, widgets);
+            let about = about_data(session_id, last_panic_msg);
+            build_screen(state, &settings, &keys, &status, &about, widgets);
             // Top-bar battery indicator — pushed by the profile (not
             // by `build_screen`) so every screen gets it without each
             // `build_*` having to opt in.  Renderer paints over the
@@ -1047,37 +1135,6 @@ async fn save_tx_power(flash: &mut Flash, dbm: i8) {
 // rendering of the recovered panic is a downstream extension to
 // the UI core.
 
-/// Append a single panic / shutdown record to the panic-ring flash
-/// region.  Format: `[reset_reason: u32 LE][message: UTF-8 bytes]`,
-/// pushed onto a `sequential-storage::queue`.  Pops are not
-/// performed today — the queue auto-overwrites the oldest entry
-/// once it fills (via `push`'s `allow_overwrite=true`), giving us
-/// the last ~30 panics naturally.
-async fn push_panic_record(flash: &mut Flash, reset_reas: u32, message: &[u8]) {
-    use sequential_storage::queue;
-
-    let mut cache = NoCache::new();
-    let mut record = [0u8; 4 + board::panic_record::PANIC_MSG_LEN];
-    record[0..4].copy_from_slice(&reset_reas.to_le_bytes());
-    let msg_len = message.len().min(board::panic_record::PANIC_MSG_LEN);
-    record[4..4 + msg_len].copy_from_slice(&message[..msg_len]);
-
-    if let Err(e) = queue::push(
-        flash,
-        board::storage::PANIC_RING_RANGE,
-        &mut cache,
-        &record[..4 + msg_len],
-        true,
-    )
-    .await
-    {
-        defmt::warn!(
-            "persist: panic-ring push failed: {:?}",
-            defmt::Debug2Format(&e)
-        );
-    }
-}
-
 /// Boot-time check for a staged panic from the prior boot.  If
 /// present: log it, push to the panic-ring flash region, then
 /// return so normal boot continues.  Reset reason is read +
@@ -1087,7 +1144,15 @@ async fn recover_pending_panic(flash: &mut Flash) {
     // SAFETY: called exactly once per boot, from `run()` which is
     // itself called exactly once per binary lifetime.  No other
     // code reads the staging buffer.
-    let reset_reas = unsafe { board::panic_record::read_reset_reason() };
+    //
+    // `take_reset_reason` reads-and-clears via SD so each boot's
+    // value reflects only that boot's reset cause.  Without the
+    // clear, DOG / SREQ etc accumulate across boots and the
+    // post-WDT-fire "dog && !staged → log task hang" branch would
+    // either fire spuriously (DOG bit set from a prior boot, this
+    // boot was clean) or never (DOG bit already set and we don't
+    // know if it's new).
+    let reset_reas = board::panic_record::take_reset_reason();
     let staged = unsafe { board::panic_record::take_panic_record() };
 
     if let Some(record) = staged {
@@ -1099,7 +1164,7 @@ async fn recover_pending_panic(flash: &mut Flash) {
             reset_reas,
             msg_str
         );
-        push_panic_record(flash, reset_reas, msg_bytes).await;
+        osrf_panic_log::push(flash, board::storage::PANIC_RING_RANGE, reset_reas, msg_bytes).await;
     } else if reset_reas != 0 {
         // No staged panic but RESETREAS has flags.  Distinguish the
         // common cases for the boot log; flags accumulate (we don't
@@ -1127,7 +1192,13 @@ async fn recover_pending_panic(flash: &mut Flash) {
             // panics.  Message is generic since we don't know
             // which task hung — diagnosing that would need
             // per-task counters in the panic ring.
-            push_panic_record(flash, reset_reas, b"watchdog: task hung").await;
+            osrf_panic_log::push(
+                flash,
+                board::storage::PANIC_RING_RANGE,
+                reset_reas,
+                b"watchdog: task hung",
+            )
+            .await;
         }
     }
 }

@@ -15,6 +15,7 @@ osrf-ui                        = { workspace = true, features = ["defmt"] }
 osrf-app-midi-node             = { workspace = true }
 osrf-app-link-bench            = { workspace = true }
 osrf-link-runtime              = { workspace = true }
+osrf-panic-log                 = { workspace = true, features = ["defmt"] }
 
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
 embassy-time     = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }

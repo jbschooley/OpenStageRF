@@ -22,6 +22,14 @@ pub use embassy_nrf;
 pub use embedded_hal;
 pub use embedded_hal_bus;
 
+/// Short git commit hash for this build, with a trailing `*` when the
+/// working tree had uncommitted changes at build time.  Set by
+/// `build.rs`; falls back to `"unknown"` when git isn't available
+/// (release tarballs, CI without `.git`).  Surfaced on the About
+/// screen so a field-debug session can correlate symptoms with the
+/// exact source revision.
+pub const GIT_HASH: &str = env!("OSRF_GIT_HASH");
+
 pub mod battery;
 pub mod clocks;
 pub mod display;

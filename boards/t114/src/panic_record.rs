@@ -29,8 +29,10 @@ pub const PANIC_MAGIC: u32 = 0x5041_4E49; // "PANI"
 /// Capacity of the staged panic message (bytes).  Format is plain
 /// UTF-8 text from `core::panic::PanicInfo`'s Display impl —
 /// typically `"src/foo.rs:42:5: panicked at 'unreachable'"` plus
-/// any user-supplied format args, truncated to fit.
-pub const PANIC_MSG_LEN: usize = 192;
+/// any user-supplied format args, truncated to fit.  Re-exported
+/// from `osrf-panic-log` so the staging buffer (RAM) and the ring
+/// records (flash) stay locked to the same size.
+pub use osrf_panic_log::PANIC_MSG_LEN;
 
 /// Cross-reset panic record.  Layout pinned with `repr(C)` so the
 /// in-memory representation is stable across firmware revisions
@@ -75,16 +77,13 @@ pub mod reset_reason {
     pub const LOCKUP: u32 = 1 << 3;
 }
 
-/// Read `POWER->RESETREAS` (does **not** clear).
+/// Read `POWER->RESETREAS` via the direct register address.
+/// Does **not** clear — see [`take_reset_reason`] for a
+/// read-and-clear that gives this-boot-only semantics.
 ///
 /// SD-safe.  SoftDevice restricts *writes* to peripheral 0 (POWER)
 /// but reads of the status register are unrestricted — same trick
-/// we use in `battery::vbus_present()`.  Clearing the register
-/// from app code requires going through SD's `sd_power_reset_reason_clr`
-/// SVC, which we don't wire up because flags accumulating across
-/// boots is fine for our purposes: we use the cross-reset panic
-/// magic as the primary "was this boot a panic recovery?" signal,
-/// and treat `RESETREAS` as informational.
+/// we use in `battery::vbus_present()`.
 ///
 /// # Safety
 ///
@@ -93,6 +92,36 @@ pub mod reset_reason {
 pub unsafe fn read_reset_reason() -> u32 {
     const RESETREAS: *const u32 = 0x4000_0400 as *const u32;
     core::ptr::read_volatile(RESETREAS)
+}
+
+/// Read `POWER->RESETREAS` via SD's `sd_power_reset_reason_get` SVC
+/// and clear every set bit via `sd_power_reset_reason_clr` so the
+/// next boot's read reflects only that boot's reset cause.
+///
+/// Without the clear, RESETREAS accumulates — a single watchdog
+/// reset anywhere in a session leaves DOG set forever (until
+/// POR / battery cycle), defeating per-boot diagnostics like the
+/// `recover_pending_panic` DOG-without-staged-panic detector.
+///
+/// Must be called after the SoftDevice is enabled — the clr SVC
+/// requires SD to be running.  Returns the value read before the
+/// clear; logs and returns `0` if either SVC fails.
+pub fn take_reset_reason() -> u32 {
+    let mut value: u32 = 0;
+    let get_ret = unsafe { nrf_softdevice::raw::sd_power_reset_reason_get(&mut value as *mut u32) };
+    if get_ret != 0 {
+        #[cfg(feature = "defmt")]
+        defmt::warn!("sd_power_reset_reason_get returned {=u32}", get_ret);
+        return 0;
+    }
+    if value != 0 {
+        let clr_ret = unsafe { nrf_softdevice::raw::sd_power_reset_reason_clr(value) };
+        #[cfg(feature = "defmt")]
+        if clr_ret != 0 {
+            defmt::warn!("sd_power_reset_reason_clr returned {=u32}", clr_ret);
+        }
+    }
+    value
 }
 
 /// Recover any pending panic record from the prior boot.  Returns
