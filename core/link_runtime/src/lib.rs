@@ -942,12 +942,38 @@ where
 // ── RX loop ─────────────────────────────────────────────────────────────────
 
 /// One observable RX event ready to be delivered to the sink.  We buffer
-/// these inside `process()`'s callback and drain them after the call so
-/// the async sink can be awaited without holding the receiver borrow.
-enum BufferedEvent {
-    Midi(heapless::Vec<u8, 8>),
-    SysEx(heapless::Vec<u8, { osrf_link::MAX_SYSEX_BYTES }>),
-}
+/// these and drain them after the call so the async sink can be
+/// awaited without holding the receiver borrow.
+///
+/// We keep MIDI and SysEx buffers separate — earlier this was a
+/// single `Vec<BufferedEvent, 32>` enum, but Rust sized every slot
+/// to the largest variant (`SysEx`, 1572 B) and the buffer alone
+/// burned ~50 KB of RAM for a vec that almost always holds 1-5
+/// small MIDI events.  Per-iteration we only ever produce events
+/// of *one* kind (a packet body is either ChannelVoice OR
+/// SysExFragment; recovery only fires from Heartbeat → MIDI
+/// NoteOffs), so the two vecs never carry events that need
+/// preserving in interleave order.
+type MidiBuf = heapless::Vec<u8, 8>;
+type SysExBuf = heapless::Vec<u8, { osrf_link::MAX_SYSEX_BYTES }>;
+/// Max queued MIDI events per RX loop iteration.  Has to cover the
+/// stuck-note-recovery worst case: a sustain-heavy passage across
+/// multiple MIDI channels where every channel diverges
+/// simultaneously and each has many pressed notes.  Realistic max
+/// is ~60-100 events (sustain pedal + chord-heavy playing on 2-3
+/// layered channels); 128 leaves comfortable margin.  Cost is
+/// 128 × 12 B ≈ 1.5 KB BSS, well worth the robustness — overflow
+/// here would mean silently-dropped NoteOffs and permanently stuck
+/// notes on the synth side.  Recovery loop also handles overflow
+/// defensively (see `try_recovery_for_channel` below) so even at
+/// max capacity an over-budget recovery is split across heartbeats
+/// rather than lost.
+const MIDI_EVENTS_CAPACITY: usize = 128;
+/// Max queued SysEx events per iteration.  One packet body
+/// produces at most one SysEx completion event; sized to
+/// `MAX_CONCURRENT_SYSEX` so a future protocol revision that
+/// allows interleaved bodies wouldn't need to revisit this.
+const SYSEX_EVENTS_CAPACITY: usize = osrf_link::MAX_CONCURRENT_SYSEX;
 
 /// Apply a new `LinkConfig` to the radio mid-flight (RX side):
 /// re-`configure_radio` and re-`rx_start`, then reset the watchdog
@@ -1074,7 +1100,8 @@ where
     let mut prev_dropped: u32 = 0;
     let mut prev_crc: u32 = 0;
     let mut link_up = false;
-    let mut events: heapless::Vec<BufferedEvent, 32> = heapless::Vec::new();
+    let mut midi_events: heapless::Vec<MidiBuf, MIDI_EVENTS_CAPACITY> = heapless::Vec::new();
+    let mut sysex_events: heapless::Vec<SysExBuf, SYSEX_EVENTS_CAPACITY> = heapless::Vec::new();
     // Local pressed-notes tracker for the heartbeat-state failsafe.
     // Updated on every accepted ChannelVoice; checked on each
     // Heartbeat carrying an active-channel mask.
@@ -1150,7 +1177,12 @@ where
     let mut scan_idx: u8 = 0;
 
     loop {
-        events.clear();
+        // Clear both event buffers at the top of every iteration —
+        // we never want events from a prior packet (e.g. yesterday's
+        // stuck-note recovery NoteOffs) to replay.
+        midi_events.clear();
+        sysex_events.clear();
+        debug_assert!(midi_events.is_empty() && sysex_events.is_empty());
 
         // Reconcile our local `scanning` flag against the controller's
         // public `enabled`.  This is the single point where we walk the
@@ -1305,16 +1337,15 @@ where
                             // Track local pressed-notes state so we can
                             // detect divergence from TX's heartbeat mask.
                             rx_state.observe(midi);
-                            let mut v: heapless::Vec<u8, 8> = heapless::Vec::new();
+                            let mut v: MidiBuf = heapless::Vec::new();
                             let _ = v.extend_from_slice(midi);
-                            let _ = events.push(BufferedEvent::Midi(v));
+                            let _ = midi_events.push(v);
                         }
                         RxEvent::SysExComplete(body) => {
                             accepted_sysex = accepted_sysex.wrapping_add(1);
-                            let mut v: heapless::Vec<u8, { osrf_link::MAX_SYSEX_BYTES }> =
-                                heapless::Vec::new();
+                            let mut v: SysExBuf = heapless::Vec::new();
                             let _ = v.extend_from_slice(body);
-                            let _ = events.push(BufferedEvent::SysEx(v));
+                            let _ = sysex_events.push(v);
                         }
                     }
                 });
@@ -1356,32 +1387,58 @@ where
                                     continue;
                                 }
                                 // Persisted long enough — recover.
+                                // Push selective NoteOffs for every
+                                // pressed note in this channel.  If
+                                // `midi_events` runs out of capacity
+                                // mid-loop, *don't* clear `rx_state`
+                                // for this channel — leave the
+                                // divergence timer set so the next
+                                // heartbeat retries the leftover
+                                // notes.  Sending duplicate NoteOffs
+                                // for notes the synth has already
+                                // silenced is a no-op; missing
+                                // NoteOffs leave permanently stuck
+                                // notes.  We optimise for the latter.
                                 let pressed = rx_state.pressed_on(ch);
                                 let mut count = 0u32;
+                                let mut overflowed = false;
                                 for note in 0..128u8 {
                                     if pressed & (1u128 << note) != 0 {
-                                        let mut noteoff: heapless::Vec<u8, 8> =
-                                            heapless::Vec::new();
+                                        let mut noteoff: MidiBuf = heapless::Vec::new();
                                         let _ = noteoff.extend_from_slice(&[
                                             0x80 | ch,
                                             note,
                                             0,
                                         ]);
-                                        let _ = events
-                                            .push(BufferedEvent::Midi(noteoff));
+                                        if midi_events.push(noteoff).is_err() {
+                                            overflowed = true;
+                                            break;
+                                        }
                                         count += 1;
                                     }
                                 }
-                                rx_state.clear_channel(ch);
-                                divergence_since[ch as usize] = None;
-                                stuck_recoveries =
-                                    stuck_recoveries.wrapping_add(1);
-                                defmt::warn!(
-                                    "RX stuck-note recovery: ch {} → {} selective NoteOff(s) (total recoveries={})",
-                                    ch,
-                                    count,
-                                    stuck_recoveries
-                                );
+                                if overflowed {
+                                    // Partial recovery — leave divergence
+                                    // timer set, retry next heartbeat.
+                                    // We don't touch `rx_state` so the
+                                    // still-stuck notes get retried.
+                                    defmt::warn!(
+                                        "RX stuck-note recovery: ch {} → midi_events full after {} NoteOff(s); retrying next heartbeat",
+                                        ch,
+                                        count
+                                    );
+                                } else {
+                                    rx_state.clear_channel(ch);
+                                    divergence_since[ch as usize] = None;
+                                    stuck_recoveries =
+                                        stuck_recoveries.wrapping_add(1);
+                                    defmt::warn!(
+                                        "RX stuck-note recovery: ch {} → {} selective NoteOff(s) (total recoveries={})",
+                                        ch,
+                                        count,
+                                        stuck_recoveries
+                                    );
+                                }
                             }
                         }
                         None => {
@@ -1414,21 +1471,21 @@ where
                     }
                 }
 
-                // Drain buffered events to the sink.
-                for ev in events.iter() {
-                    match ev {
-                        BufferedEvent::Midi(bytes) => {
-                            defmt::info!("RX MIDI: {=[u8]:#x}", bytes.as_slice());
-                            if let Err(_) = sink.write_message(bytes).await {
-                                defmt::error!("sink write_message failed");
-                            }
-                        }
-                        BufferedEvent::SysEx(bytes) => {
-                            defmt::info!("RX SysEx: {} bytes", bytes.len());
-                            if let Err(_) = sink.write_message(bytes).await {
-                                defmt::error!("sink SysEx write failed");
-                            }
-                        }
+                // Drain buffered events to the sink.  MIDI events
+                // first, then SysEx — within any single iteration a
+                // packet produces events of one kind only (see the
+                // `BufferedEvent` comment above), so the order
+                // between the two vecs is never observable.
+                for bytes in midi_events.iter() {
+                    defmt::info!("RX MIDI: {=[u8]:#x}", bytes.as_slice());
+                    if let Err(_) = sink.write_message(bytes).await {
+                        defmt::error!("sink write_message failed");
+                    }
+                }
+                for bytes in sysex_events.iter() {
+                    defmt::info!("RX SysEx: {} bytes", bytes.len());
+                    if let Err(_) = sink.write_message(bytes).await {
+                        defmt::error!("sink SysEx write failed");
                     }
                 }
             }

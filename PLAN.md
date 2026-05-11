@@ -425,6 +425,82 @@ window and the next About screen shows the panic line; injected infinite-loop in
 reboots within the WDT window; pulling battery just under 3.1 V triggers an orderly
 shutdown that retains the previous setting state on next power-up.
 
+### Milestone 8 — power management + battery chemistry options (3–5 days)
+
+**Goal:** the device powers down cleanly to a sub-50 µA standby state on operator command,
+wakes on joystick or USB-plug events, and supports both LiPo and NiMH cell configurations
+per-profile.
+
+- [ ] **Full deep soft-off**.  Long-press Center from any screen → enter deep sleep.
+      Implementation:
+      - Render a "powered off" message + final flush.
+      - Switch off backlight, gate VTFT_CTRL HIGH (TFT VDD off), VEXT LOW (peripheral rail
+        off).
+      - `radio.set_sleep()` — SX1262 to its lowest-current mode.
+      - Cancel link runtime + UI render tasks gracefully (or accept they're stuck in await
+        and rely on `wfi` for power saving).
+      - `nrf_softdevice::Softdevice::disable()` if SD is up — SD's ongoing RTC activity is
+        the dominant residual draw on this chip.  Note: with SD disabled we lose
+        critical-section impl, so we'd want a fallback `cortex-m` critical-section provider
+        active for the wake path.
+      - Configure GPIOTE wake sources (joystick Center + USB-detect line via the POWER
+        peripheral's USBDETECTED event).
+      - `cortex_m::asm::wfe` loop.
+      - On wake: re-init everything (board::resources, SD, tasks).  This is effectively a
+        warm reboot — Settings come back via M7 flash persistence.
+      - Target: < 50 µA in sleep.  800 mAh LiPo → > 2 years of standby; 18650 → > 8 years.
+
+- [ ] **USB-plug wake (brief).**  When soft-off, plugging in USB wakes the device just long
+      enough to render one frame showing battery charging status (the existing
+      `BatteryIndicator` repurposed as a full-screen "Charging…" view).  Auto-sleep after
+      ~5 s or on USB unplug.  Implementation: USBDETECTED interrupt → set a flag → main
+      loop checks flag, runs one render, sleeps again.
+
+- [ ] **Battery chemistry as a per-profile compile-time option.**  Today `core/ui/src/battery.rs`
+      assumes single-cell LiPo with Meshtastic's OCV table.  Add a `BatteryChemistry` enum
+      with at least: `LiPoSingle`, `NimhPack { cells: u8 }`.  Each variant carries an OCV
+      table (3-cell NiMH: ~3.0-4.2 V range, but flatter discharge curve with sharp knee
+      around 3.3 V; 2-cell NiMH would need boost so probably not viable; 4-cell NiMH ≈
+      4.0-5.6 V, exceeds LiPo regulator input range so also not viable without a buck).
+      Profile picks via Cargo feature or const associated with the board crate.
+
+- [ ] **Document the external-charging story for NiMH.**  Decision: **no on-board NiMH
+      charging.**  TP4054 is LiPo-only and overcharging NiMH at 4.2 V CV would damage cells.
+      Users running NiMH packs use an off-board smart charger and swap cells between gigs.
+      The T114's `vbus_present()` still works for showing the lightning bolt during USB
+      operation, but no automatic charging happens — clearly labelled in the About screen
+      / docs so users don't expect it.
+
+- [ ] **Document removable-LiPo workflow.**  Recommended path for fast battery swaps:
+      **14500 LiPo cells** (AA form factor, 14×50 mm, ~800 mAh) in an AA-style holder
+      (Keystone 79 series, ~$1) connected to the existing JST-PH battery port.  Same LiPo
+      chemistry → same TP4054 path → same firmware OCV table → zero board or firmware
+      changes beyond the swap mechanism itself.  Carry charged spares in a pocket, swap in
+      ~5 seconds on stage.  External charging via a single-bay LiPo charger that handles
+      14500 (Nitecore F1, XTAR MC1 — $10-15 each).  Same active runtime as the current
+      800 mAh pouch cell but with a meaningful "dead-battery-on-stage" recovery story.
+
+      Larger swappable options if capacity matters more than form-factor:
+        - **18350** (18×35 mm, ~1000 mAh): slight capacity bump.
+        - **18650** (18×65 mm, ~3000 mAh): the bulk-charge / long-set option, 4× capacity.
+      Both use the same charging story (LiPo, external multi-bay smart charger).  Update
+      the hardware-guide doc in `docs/`.
+
+- [ ] **Optional: route TP4054 STAT to a GPIO.**  The T114's CHG LED is hardwired to the
+      charger IC's STAT pin (active-low while charging, released at full).  Currently
+      firmware can't distinguish "charging" from "charge done" — both show as
+      `vbus_present == true`.  Wiring STAT to a free GPIO (P0_05 is unclaimed) lets the
+      UI render "Charging…" vs "Charged" vs "Powered" states distinctly.  Small hardware
+      mod (one wire-tack), nice-to-have not required.
+
+**Exit criteria:** long-press Center on any screen powers down the unit cleanly; current
+draw in soft-off measures < 100 µA on a multimeter; joystick press wakes the device with
+settings intact (post-M7); USB plug while off shows one charging frame; battery indicator
+correctly reflects voltage for both LiPo and (eventually) NiMH chemistries.
+
+**Out of scope:** on-board NiMH charging circuit (covered above — external charger only);
+hardware-switch design (revisit if soft-off proves unreliable in practice).
+
 ## Total estimate
 
 **Single-developer first prototype: 4–6 weeks**, plus 1–2 weeks if `osrf-radio-sx126x` is written from scratch instead of integrating an existing crate.
