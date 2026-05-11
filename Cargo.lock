@@ -1640,6 +1640,7 @@ dependencies = [
  "embassy-sync 0.8.0",
  "embassy-time",
  "embedded-graphics-core",
+ "heapless 0.9.2",
  "nrf-softdevice",
  "osrf-app-link-bench",
  "osrf-app-midi-node",

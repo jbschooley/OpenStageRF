@@ -24,6 +24,7 @@ critical-section = "1"
 sequential-storage = { workspace = true }
 nrf-softdevice     = { workspace = true }
 embedded-graphics-core = "0.4"
+heapless = { workspace = true }
 
 cortex-m    = { version = "0.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"
