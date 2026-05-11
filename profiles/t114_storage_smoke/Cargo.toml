@@ -1,0 +1,32 @@
+[package]
+name        = "osrf-profile-t114-storage-smoke"
+version     = "0.1.0"
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "Milestone 7 smoke test — verifies flash persistence via nrf-softdevice + sequential-storage on the T114.  Reads a boot-count integer from the Settings region, increments it, writes back.  Power-cycle (probe-rs reset, hardware reset, or battery pull) and the next boot should report n+1."
+
+[package.metadata.osrf]
+board = "t114"
+
+[dependencies]
+osrf-board-t114 = { workspace = true, features = ["defmt"] }
+
+embassy-executor       = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-time           = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-sync           = { version = "0.8" }
+embedded-storage-async = { workspace = true }
+sequential-storage     = { workspace = true }
+
+nrf-softdevice = { workspace = true }
+
+cortex-m    = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+defmt       = "1.0"
+defmt-rtt   = "1.1"
+panic-probe = { version = "1.0", features = ["print-defmt"] }
+
+[[bin]]
+name  = "storage_smoke"
+path  = "src/main.rs"
+test  = false
+bench = false

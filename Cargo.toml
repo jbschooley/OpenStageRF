@@ -36,6 +36,7 @@ members = [
     "profiles/t114_radio_tx",
     "profiles/t114_rx_basic",
     "profiles/t114_rx_diversity",
+    "profiles/t114_storage_smoke",
     "profiles/t114_tx_basic",
     "profiles/t114_ui",
     "profiles/t114_ui_demo",
@@ -113,7 +114,10 @@ defmt                             = "1.0"
 embedded-hal                      = "1.0"
 embedded-hal-async                = "1.0"
 embedded-hal-bus                  = { version = "0.3", features = ["async"] }
+embedded-storage                  = "0.3"
+embedded-storage-async            = "0.4"
 heapless                          = { version = "0.9", default-features = false }
+sequential-storage                = { version = "5.0", features = ["defmt-03"] }
 
 # nRF SoftDevice (BLE stack).  Pinned to git master because crates.io
 # 0.1.x still depends on the legacy `nrf52840-pac` and link-collides

@@ -21,6 +21,8 @@ embassy-time     = { version = "0.5", features = ["defmt", "defmt-timestamp-upti
 embassy-sync     = { version = "0.8" }
 embassy-futures  = "0.1"
 critical-section = "1"
+sequential-storage = { workspace = true }
+nrf-softdevice     = { workspace = true }
 embedded-graphics-core = "0.4"
 
 cortex-m    = { version = "0.7", features = ["inline-asm"] }
