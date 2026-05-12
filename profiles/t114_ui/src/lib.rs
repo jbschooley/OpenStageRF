@@ -105,19 +105,51 @@ static SCAN: ScanController = ScanController::new();
 /// (`run_rx` or `run_tx`) `select`s on it, sinks all-notes-off,
 /// parks the radio, and idles forever.  Single-consumer —
 /// `embassy_sync::Signal` takes-on-wait, so a separate
-/// `SHUTDOWN_LATCH` flag is needed for the ui_state_loop side.
+/// [`POWEROFF_REASON`] latch is needed for the ui_state_loop side.
 static SHUTDOWN: ShutdownSignal = ShutdownSignal::new();
 
-/// Latched shutdown flag for the UI side.  Set alongside
-/// [`SHUTDOWN`] in `battery_task`; polled by `ui_state_loop`'s loop
-/// tick.  Separate from `SHUTDOWN` because `Signal::wait` consumes
-/// the value (single-consumer), and we want both runtime and UI to
-/// observe the same shutdown event.  Polling is fine here — the
-/// ui_state_loop tick is 300 ms, which is well within the
-/// shutdown-budget of "user sees goodbye frame before the chip
-/// browns out."  Never cleared.
-static SHUTDOWN_LATCH: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+/// Latched soft-off reason.  Set alongside [`SHUTDOWN`] by either
+/// `battery_task` (sustained low-battery) or the UI's
+/// [`Command::PowerOff`] handler (long-press Center → confirm).
+/// Polled by `ui_state_loop`'s loop tick, which dispatches to
+/// `enter_soft_off()` on any non-zero value.
+///
+/// Separate from `SHUTDOWN` because `Signal::wait` consumes the
+/// value (single-consumer) and we want both the link runtime and
+/// the UI to observe the same event.  Polling at the 300 ms
+/// scan-tick cadence is fine — the soft-off budget is "user sees
+/// goodbye, peripherals quiesce, chip enters System OFF," all on
+/// the order of seconds.
+///
+/// Values: see [`PowerOffReason`] constants below.  `u8` instead
+/// of a real enum so the static is `AtomicU8` — `core` has no
+/// `AtomicEnum`.  Never cleared once set.
+static POWEROFF_REASON: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(POWEROFF_REASON_NONE);
+
+/// Atomic-friendly encoding of the soft-off reason latched in
+/// [`POWEROFF_REASON`].  `None` is the default zero so a fresh boot
+/// is implicitly "no soft-off requested."
+const POWEROFF_REASON_NONE: u8 = 0;
+/// Operator chose `Settings → Power off → Confirm` (long-press
+/// Center from Idle followed by Center on the confirm screen).
+/// Normal-user-flow soft-off; not logged to the panic ring.
+const POWEROFF_REASON_OPERATOR: u8 = 1;
+/// `battery_task` saw [`SHUTDOWN_BATTERY_SUSTAINED_SAMPLES`]
+/// consecutive sub-`SHUTDOWN_MV` readings with USB unplugged.
+/// `enter_soft_off()` pushes a `low-battery shutdown` panic-ring
+/// record before the System OFF call so next boot's About screen
+/// surfaces the cause.
+const POWEROFF_REASON_LOW_BATTERY: u8 = 2;
+
+/// "Power off the display" handshake from `ui_state_loop` to
+/// `ui_render_task`.  The render task owns the display and we need
+/// `display.power_off()` (DISPOFF + SLPIN + VTFT high) to run before
+/// the chip enters System OFF — otherwise the panel sits in normal
+/// mode with VDD on through sleep, defeating the soft-off current
+/// target.  Fired exactly once per deep-soft-off entry; after
+/// handling it, the render task drops into a WDT-pet idle loop.
+static POWER_OFF_DISPLAY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Number of consecutive sub-`SHUTDOWN_MV` battery samples required
 /// before firing [`SHUTDOWN`].  With a 5 s sample interval this is
@@ -455,6 +487,14 @@ fn about_data<'a>(session_id: u16, last_panic_msg: &'a heapless::String<96>) -> 
 /// matters when the panel is off (auto-off or pre-soft-on-boot):
 /// `ui_state` stops signalling frames, so without the timer fallback
 /// the slot would go stale and the chip would reset every 5 s.
+///
+/// Deep soft-off path: a [`POWER_OFF_DISPLAY`] signal from
+/// `ui_state_loop` triggers `display.power_off()` (DISPOFF + SLPIN +
+/// VTFT gate high) so the panel is in its lowest-power state before
+/// the chip enters System OFF.  After that the task transitions to a
+/// pet-only loop — frames stop coming, the display is dead, and we
+/// just keep `wdt_render` fed until `sd_power_system_off` halts
+/// everything.
 #[embassy_executor::task]
 async fn ui_render_task(
     mut display: board::Display,
@@ -462,16 +502,38 @@ async fn ui_render_task(
     mut renderer: Renderer,
     mut wdt: WatchdogHandle,
 ) -> ! {
+    use embassy_futures::select::{select3, Either3};
     loop {
-        match select(FRAME.wait(), Timer::after_secs(WDT_RENDER_IDLE_PET_S)).await {
-            Either::First(frame) => {
+        match select3(
+            FRAME.wait(),
+            Timer::after_secs(WDT_RENDER_IDLE_PET_S),
+            POWER_OFF_DISPLAY.wait(),
+        )
+        .await
+        {
+            Either3::First(frame) => {
                 let _ = renderer.render(&frame.widgets, &frame.scan, fb);
                 display.flush(fb).await;
             }
-            Either::Second(()) => {
+            Either3::Second(()) => {
                 // No frame arrived in the idle-pet window — display
                 // is off or ui_state is quiet.  Nothing to render;
                 // just fall through to pet the WDT and re-wait.
+            }
+            Either3::Third(()) => {
+                // Deep soft-off: put the panel to sleep + gate VDD,
+                // then spin pet-only until the chip enters System OFF.
+                // We don't `return` because the task has a WDT slot
+                // (`wdt_render`); leaving the task would stop pets
+                // and the chip would reset every 5 s, leaving the
+                // user staring at a never-quite-off-but-also-doesn't-
+                // boot brick.
+                display.power_off().await;
+                defmt::info!("ui_render: display powered off — entering pet-only idle");
+                loop {
+                    wdt.pet();
+                    Timer::after_secs(WDT_RENDER_IDLE_PET_S).await;
+                }
             }
         }
         wdt.pet();
@@ -620,7 +682,10 @@ async fn battery_task(mut monitor: board::battery::BatteryMonitor) {
                     shutdown_run
                 );
                 SHUTDOWN.signal();
-                SHUTDOWN_LATCH.store(true, core::sync::atomic::Ordering::Release);
+                POWEROFF_REASON.store(
+                    POWEROFF_REASON_LOW_BATTERY,
+                    core::sync::atomic::Ordering::Release,
+                );
                 shutdown_fired = true;
             }
         } else {
@@ -684,73 +749,24 @@ async fn ui_state_loop(
         // Bursts of joystick events may pet faster than that.
         wdt.pet();
 
-        // Low-battery shutdown: `battery_task` set the latch after
-        // sustained sub-shutdown voltage.  Render a goodbye frame,
-        // log a "low-battery shutdown" record to the panic ring
-        // (audit trail — useful when the user's first question
-        // after powering on a dead board is "did it crash or just
-        // run out?"), then drop into a WDT-petting park loop.  We
-        // don't `loop {}` outright because the WDT would reset us
-        // back to here on a sustained-low boot — wasted power on
-        // the boot cycle.
-        if SHUTDOWN_LATCH.load(core::sync::atomic::Ordering::Acquire) {
-            defmt::warn!("ui: low-battery shutdown acknowledged — rendering goodbye frame");
-            // Light the panel back up if it had auto-slept, so the
-            // user sees the goodbye.  No need to track `display_on`
-            // afterwards — the park loop never returns to the
-            // top-of-loop policy code.
-            if !display_on {
-                backlight.set_low();
-            }
-            widgets.clear();
-            let _ = widgets.push(Widget::Title(heapless::String::try_from("Shutting down").unwrap_or_default()));
-            let _ = widgets.push(Widget::Text {
-                row: 2,
-                text: heapless::String::try_from("Battery low").unwrap_or_default(),
-            });
-            let _ = widgets.push(Widget::Text {
-                row: 3,
-                text: heapless::String::try_from("Plug in to charge").unwrap_or_default(),
-            });
-            let battery = critical_section::with(|cs| BATTERY.borrow(cs).get());
-            let _ = widgets.push(Widget::BatteryIndicator {
-                voltage_mv: battery.voltage_mv,
-                percent: battery.percent,
-                plugged_in: battery.plugged_in,
-            });
-            FRAME.signal(FrameData {
-                widgets: widgets.clone(),
-                scan: state.scan.clone(),
-            });
-            osrf_panic_log::push(flash, board::storage::PANIC_RING_RANGE, 0, b"low-battery shutdown").await;
-            // Show the goodbye for ~3 s before killing the panel.
-            // WDT slot pets the timer in this task, so we use short
-            // sub-pets to keep it fed.
-            for _ in 0..10 {
-                wdt.pet();
-                Timer::after_millis(300).await;
-            }
-            backlight.set_high();
-            // Park loop — pet the WDT, but also consume joystick
-            // events so a deliberate user interaction can recover.
-            // Any event triggers a full reset; if the battery is
-            // still below threshold, `battery_task` re-fires the
-            // shutdown on the next boot.  Acceptable trade: a
-            // briefly-revived UI on a dying cell is better than a
-            // bricked-looking unit that needs NRESET.  Drains the
-            // event channel first so any presses queued during the
-            // goodbye render don't immediately reboot us.
-            while EVENT_CHAN.try_receive().is_ok() {}
-            loop {
-                wdt.pet();
-                match select(EVENT_CHAN.receive(), Timer::after_secs(1)).await {
-                    Either::First(_) => {
-                        defmt::info!("ui: joystick wake from shutdown — rebooting");
-                        cortex_m::peripheral::SCB::sys_reset();
-                    }
-                    Either::Second(()) => {}
-                }
-            }
+        // Deep soft-off: either `battery_task` latched
+        // `POWEROFF_REASON_LOW_BATTERY` (sustained low Vbat) or the
+        // operator confirmed `Command::PowerOff`.  Both reasons run
+        // the same teardown — radio to SLEEP, display SLPIN + VDD
+        // gate, VEXT off, GPIO SENSE wake on Center, System OFF —
+        // and the helper diverges so we never re-enter this loop.
+        let reason = POWEROFF_REASON.load(core::sync::atomic::Ordering::Acquire);
+        if reason != POWEROFF_REASON_NONE {
+            enter_soft_off(
+                reason,
+                backlight,
+                &mut wdt,
+                flash,
+                widgets,
+                state,
+                display_on,
+            )
+            .await;
         }
 
         let next_tick = Timer::after(scan_tick);
@@ -817,6 +833,23 @@ async fn ui_state_loop(
                             loop {
                                 cortex_m::asm::nop();
                             }
+                        }
+                        Command::PowerOff => {
+                            // Operator-initiated deep soft-off.  Latch
+                            // the reason and let the next loop-top
+                            // poll dispatch into `enter_soft_off`,
+                            // which handles the full teardown +
+                            // System OFF entry.  Going through the
+                            // shared latch (vs. inlining the
+                            // teardown here) means low-battery and
+                            // operator paths share one code path,
+                            // and we honour any pending scan_tick /
+                            // frame work cleanly on the way out.
+                            defmt::info!("ui: operator power-off confirmed");
+                            POWEROFF_REASON.store(
+                                POWEROFF_REASON_OPERATOR,
+                                core::sync::atomic::Ordering::Release,
+                            );
                         }
                         Command::ClearPanicLog => {
                             match osrf_panic_log::clear(
@@ -922,6 +955,159 @@ async fn ui_state_loop(
             FRAME.signal(FrameData {
                 widgets: widgets.clone(),
                 scan: state.scan.clone(),
+            });
+        }
+    }
+}
+
+// ── Deep soft-off ───────────────────────────────────────────────
+
+/// Tear the device down to sub-µA System OFF.  Diverges; the only
+/// path out is the chip resetting via the SENSE wake on the Center
+/// joystick pin (configured by [`board::power::enter_system_off`]).
+///
+/// Order of operations:
+///   1. Light the panel back up if it had auto-slept, so the user
+///      sees the goodbye frame.
+///   2. Render a reason-specific goodbye (`build_power_off_screen`).
+///   3. Hold for ~2 s, petting the WDT through the wait.  Long enough
+///      to read; short enough that low-battery doesn't burn what little
+///      runtime is left.
+///   4. For [`POWEROFF_REASON_LOW_BATTERY`]: push a
+///      `low-battery shutdown` record to the panic ring so next boot's
+///      About shows the cause.  Operator-initiated soft-off is normal
+///      user flow and gets no ring entry — keeping the ring focused on
+///      faults / unexpected exits.
+///   5. Backlight off (active HIGH disables).
+///   6. Signal [`SHUTDOWN`] — the link-runtime task picks it up,
+///      runs `all_notes_off()` (RX), parks the radio, then drops
+///      the SX1262 to SLEEP (~160 nA).
+///   7. Signal [`POWER_OFF_DISPLAY`] — `ui_render_task` runs
+///      `display.power_off()` (DISPOFF + SLPIN + VTFT gate high),
+///      then idles in WDT-pet mode.
+///   8. ~250 ms cooldown so the other tasks land their teardown work
+///      before we cut peripheral power.  Petting the local WDT
+///      through the wait.
+///   9. `board::power::enter_system_off()` — VEXT low, SENSE = Low on
+///      P0_13 (Center), `sd_power_system_off` SVC.  Never returns.
+async fn enter_soft_off(
+    reason: u8,
+    backlight: &mut Output<'static>,
+    wdt: &mut WatchdogHandle,
+    flash: &mut Flash,
+    widgets: &mut WidgetList,
+    state: &UiState,
+    display_on: bool,
+) -> ! {
+    let reason_label = match reason {
+        POWEROFF_REASON_OPERATOR => "operator",
+        POWEROFF_REASON_LOW_BATTERY => "low-battery",
+        _ => "unknown",
+    };
+    defmt::warn!("ui: deep soft-off ({}) — rendering goodbye", reason_label);
+
+    // 1) Wake the panel if it had auto-slept.
+    if !display_on {
+        backlight.set_low();
+    }
+
+    // 2) Goodbye frame.  Different copy per reason — low-battery
+    //    nudges the user toward the charger; operator confirms the
+    //    shutdown happened so they know to stop waiting for it.
+    widgets.clear();
+    build_power_off_goodbye(reason, widgets);
+    let battery = critical_section::with(|cs| BATTERY.borrow(cs).get());
+    let _ = widgets.push(Widget::BatteryIndicator {
+        voltage_mv: battery.voltage_mv,
+        percent: battery.percent,
+        plugged_in: battery.plugged_in,
+    });
+    FRAME.signal(FrameData {
+        widgets: widgets.clone(),
+        scan: state.scan.clone(),
+    });
+
+    // 3) Hold the goodbye visible for ~1 s.  Long enough to register
+    //    visually, short enough not to feel like the unit is stuck —
+    //    the operator already confirmed, they want it to *go off*.
+    //    Pets every 250 ms keep the WDT comfortably fed (5 s
+    //    timeout).
+    for _ in 0..4 {
+        wdt.pet();
+        Timer::after_millis(250).await;
+    }
+
+    // 4) Audit-trail entry for low-battery only.
+    if reason == POWEROFF_REASON_LOW_BATTERY {
+        osrf_panic_log::push(
+            flash,
+            board::storage::PANIC_RING_RANGE,
+            0,
+            b"low-battery shutdown",
+        )
+        .await;
+    }
+
+    // 5) Backlight off — TFT will follow in step 7 when the render
+    //    task gates VDD; backlight first means no brief "lit blank
+    //    panel" flash during the controller's sleep handshake.
+    backlight.set_high();
+
+    // 6) Link runtime teardown.  The link task picks up `SHUTDOWN`,
+    //    runs all-notes-off (RX) / radio park / `set_sleep` and
+    //    finally idles forever.
+    SHUTDOWN.signal();
+
+    // 7) Display teardown.  The render task picks up
+    //    `POWER_OFF_DISPLAY`, runs `display.power_off()`, then sits
+    //    petting `wdt_render`.
+    POWER_OFF_DISPLAY.signal(());
+
+    // 8) Cooldown.  Gives the link + render tasks ~250 ms to land
+    //    their teardown — link runtime's blink alone is ~720 ms
+    //    but we don't need to wait for the LED light show, only for
+    //    the SPI traffic to drain (`set_sleep` is a single 2-byte
+    //    SPI command, ~µs).  The display's SLPIN sequence is ~5 ms
+    //    plus the VTFT-gate raise.  250 ms is generous and still
+    //    well inside the WDT budget.
+    wdt.pet();
+    Timer::after_millis(250).await;
+    wdt.pet();
+
+    // 9) Enter System OFF.  Diverges.
+    defmt::info!("ui: entering System OFF — wake on Center press");
+    board::power::enter_system_off()
+}
+
+/// Push the reason-specific goodbye widgets for [`enter_soft_off`].
+/// Kept out of `enter_soft_off` so the same data flow (Title + two
+/// Text rows + Footer hint) is easy to read in one place.
+fn build_power_off_goodbye(reason: u8, out: &mut WidgetList) {
+    use heapless::String;
+    let title: String<24> = String::try_from("Powering off").unwrap_or_default();
+    let _ = out.push(Widget::Title(title));
+
+    match reason {
+        POWEROFF_REASON_LOW_BATTERY => {
+            let _ = out.push(Widget::Text {
+                row: 2,
+                text: String::try_from("Battery low").unwrap_or_default(),
+            });
+            let _ = out.push(Widget::Text {
+                row: 3,
+                text: String::try_from("Plug in to charge").unwrap_or_default(),
+            });
+        }
+        _ => {
+            // Operator (or any unforeseen value) — the safe default
+            // is "tell the user how to bring it back."
+            let _ = out.push(Widget::Text {
+                row: 2,
+                text: String::try_from("Goodnight").unwrap_or_default(),
+            });
+            let _ = out.push(Widget::Text {
+                row: 3,
+                text: String::try_from("Press Center to wake").unwrap_or_default(),
             });
         }
     }
@@ -1176,13 +1362,15 @@ async fn recover_pending_panic(flash: &mut Flash) {
         let sreq = reset_reas & board::panic_record::reset_reason::SREQ != 0;
         let pin = reset_reas & board::panic_record::reset_reason::RESETPIN != 0;
         let lockup = reset_reas & board::panic_record::reset_reason::LOCKUP != 0;
+        let off = reset_reas & board::panic_record::reset_reason::OFF != 0;
         defmt::info!(
-            "boot reset_reas={=u32:#x} (no staged panic — dog={} sreq={} pin={} lockup={})",
+            "boot reset_reas={=u32:#x} (no staged panic — dog={} sreq={} pin={} lockup={} off={})",
             reset_reas,
             dog,
             sreq,
             pin,
             lockup,
+            off,
         );
         if dog {
             // Watchdog reset without a staged panic = a task hung

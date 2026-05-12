@@ -246,6 +246,7 @@ pub struct RxPacket {
 }
 
 // ---- Command opcodes (datasheet table 12-1) ----
+const CMD_SET_SLEEP: u8 = 0x84;
 const CMD_SET_STANDBY: u8 = 0x80;
 const CMD_SET_TX: u8 = 0x83;
 const CMD_SET_RX: u8 = 0x82;
@@ -788,6 +789,22 @@ where
     pub async fn set_standby_rc(&mut self) -> Result<(), RadioError<Reset, Switch>> {
         self.switch.to_idle().await.map_err(Error::Switch)?;
         self.cmd(CMD_SET_STANDBY, &[0x00]).await
+    }
+
+    /// Move the chip to its lowest-power sleep state (cold start, no
+    /// RTC).  Quiescent draw drops from ~600 µA (STDBY_RC) to ~160 nA
+    /// per the SX1262 datasheet.  Configuration registers ARE lost —
+    /// wake-up via NSS pulse goes through the full init path.  This
+    /// is the correct teardown for deep soft-off where the host CPU
+    /// is about to System OFF: we won't be needing the radio until
+    /// the next cold boot, which re-runs `configure_radio` anyway.
+    ///
+    /// Sleep config byte: bit 0 = `wakeup_rtc` (0 = no RTC),
+    /// bit 2 = `warm_start` (0 = cold start, lose config).  We
+    /// choose cold + no-RTC for minimum current.
+    pub async fn set_sleep(&mut self) -> Result<(), RadioError<Reset, Switch>> {
+        self.switch.to_idle().await.map_err(Error::Switch)?;
+        self.cmd(CMD_SET_SLEEP, &[0x00]).await
     }
 
     /// `SetRfFrequency` only — skips the `CalibrateImage` step that

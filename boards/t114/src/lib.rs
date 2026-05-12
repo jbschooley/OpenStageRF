@@ -35,6 +35,7 @@ pub mod clocks;
 pub mod display;
 pub mod framebuffer;
 pub mod panic_record;
+pub mod power;
 pub mod softdevice;
 pub mod storage;
 #[cfg(feature = "usb-log")]

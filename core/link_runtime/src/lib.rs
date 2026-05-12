@@ -668,6 +668,12 @@ where
         Timer::after_millis(120).await;
     }
     let _ = led.set_low();
+    // After the visual confirmation drop the chip the rest of the way:
+    // SLEEP collapses STDBY_RC's ~600 µA quiescent down to ~160 nA.
+    // Config is lost on SLEEP wake-up, but the only path out of here
+    // is a full chip reset (deep soft-off → System OFF wake → boot →
+    // `configure_radio` again), so the loss is harmless.
+    let _ = radio.set_sleep().await;
     loop {
         Timer::after_secs(60).await;
     }
@@ -698,6 +704,9 @@ where
         Timer::after_millis(120).await;
     }
     let _ = led.set_low();
+    // SLEEP after the blink — matches the TX handler.  See
+    // `handle_tx_shutdown` for the rationale.
+    let _ = radio.set_sleep().await;
     loop {
         Timer::after_secs(60).await;
     }
