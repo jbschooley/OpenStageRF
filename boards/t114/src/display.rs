@@ -85,7 +85,9 @@ const Y_OFFSET: u16 = 53;
 
 // ── ST7789 commands we emit ─────────────────────────────────────────────────
 const CMD_SWRESET: u8 = 0x01;
+const CMD_SLPIN: u8 = 0x10;
 const CMD_SLPOUT: u8 = 0x11;
+const CMD_DISPOFF: u8 = 0x28;
 const CMD_NORON: u8 = 0x13;
 const CMD_INVON: u8 = 0x21;
 const CMD_DISPON: u8 = 0x29;
@@ -279,6 +281,25 @@ impl St7789Display {
     /// smoke test in `t114_ui_demo`; not intended for normal use.
     pub async fn send_raw_command(&mut self, cmd: u8) {
         self.write_command(cmd);
+    }
+
+    /// Put the panel into its lowest-power state.  Sends `DISPOFF`
+    /// + `SLPIN` so the ST7789 enters sleep mode (~10 µA from
+    /// ~1 mA in normal mode), then drives `VTFT_CTRL` high to gate
+    /// the TFT VDD rail entirely — once VDD is off, the panel
+    /// chip itself draws 0.  Called from the deep soft-off path
+    /// just before `sd_power_system_off`.
+    ///
+    /// Datasheet sequence requires SLPIN before cutting power;
+    /// also waits 5 ms after SLPIN for charge-pumps to settle so
+    /// the gate-off step doesn't catch the panel mid-discharge.
+    pub async fn power_off(&mut self) {
+        self.write_command(CMD_DISPOFF);
+        self.write_command(CMD_SLPIN);
+        Timer::after_millis(5).await;
+        // Gate VTFT_CTRL HIGH = TFT VDD off.  Held until the next
+        // boot's `init()` drives it LOW again.
+        self.vtft.set_high();
     }
 
     /// Push the dirty region of a [`Framebuffer`](crate::framebuffer::Framebuffer)

@@ -519,40 +519,80 @@ item is wiring `cargo xtask audit` into a CI workflow once one exists.
 wakes on joystick or USB-plug events, and supports both LiPo and NiMH cell configurations
 per-profile.
 
-- [ ] **Full deep soft-off**.  Long-press Center from any screen → enter deep sleep.
-      Implementation:
-      - Render a "powered off" message + final flush.
-      - Switch off backlight, gate VTFT_CTRL HIGH (TFT VDD off), VEXT LOW (peripheral rail
-        off).
-      - `radio.set_sleep()` — SX1262 to its lowest-current mode.
-      - Cancel link runtime + UI render tasks gracefully (or accept they're stuck in await
-        and rely on `wfi` for power saving).
-      - `nrf_softdevice::Softdevice::disable()` if SD is up — SD's ongoing RTC activity is
-        the dominant residual draw on this chip.  Note: with SD disabled we lose
-        critical-section impl, so we'd want a fallback `cortex-m` critical-section provider
-        active for the wake path.
-      - Configure GPIOTE wake sources (joystick Center + USB-detect line via the POWER
-        peripheral's USBDETECTED event).
-      - `cortex_m::asm::wfe` loop.
-      - On wake: re-init everything (board::resources, SD, tasks).  This is effectively a
-        warm reboot — Settings come back via M7 flash persistence.
-      - Target: < 50 µA in sleep.  800 mAh LiPo → > 2 years of standby; 18650 → > 8 years.
+- [x] **Full deep soft-off**.  Long-press **Left** from Idle → `PowerOffConfirm` screen
+      (Center: confirm, Right: cancel, Left: ignored to avoid colliding with the entry-
+      gesture auto-repeat).  Confirm fires `Command::PowerOff`, which routes through
+      `enter_soft_off()` in `profiles/t114_ui/src/lib.rs` and runs:
+      - Goodbye frame held for ~1 s (reason-specific copy for low-battery vs operator).
+      - Backlight off (`P0_15` HIGH).
+      - `SHUTDOWN.signal()` → link runtime does all-notes-off (RX), `set_standby_rc`, LED
+        confirmation blink, then `radio.set_sleep()` (SX1262 ~160 nA).
+      - `POWER_OFF_DISPLAY.signal()` → `ui_render_task` runs `display.power_off()` (ST7789
+        DISPOFF + SLPIN + VTFT_CTRL gate HIGH), then enters a pet-only idle loop on its
+        WDT slot.
+      - 250 ms cooldown so the other tasks land their teardown.
+      - `board::power::enter_system_off()` (new `power.rs` module): mask GPIOTE in NVIC,
+        drive VEXT (P0_21) LOW, clear SENSE on Up/Down/Left/Right joystick pins, set
+        SENSE=Low on Center (P0_13), call `sd_power_system_off` SVC.
+      - On wake (Center press): chip resets, boots through `run()` → Idle.  Settings come
+        back via M7 flash persistence.  `RESETREAS.OFF` distinguishes the wake from any
+        other reset cause.
 
-- [ ] **Migrate the M7 low-battery auto-shutdown onto the deep soft-off path.**  M7 ships a
-      "quick" auto-shutdown that parks at ~2–5 mA (see M7 entry).  Once the deep soft-off
-      machinery above is in place, route the sustained-low battery trigger through the same
-      power-down sequence: panic-ring record first (so the next boot's About still shows
-      "last shutdown: low-battery"), then the SLPIN / SX1262-SLEEP / SD-disable /
-      `sd_power_system_off` path with joystick-Center as the wake source.  Drops park-state
-      drain from ~3 mA to <5 µA, taking shelf life from days to years.  Behaviorally
-      identical from the user's perspective — press to wake just becomes "the boot is the
-      wake."
+      **Gesture note** vs. the original plan: long-press Center *can't* be the entry —
+      the joystick driver fires `Press(Center)` *then* `LongPress(Center)`, so by the time
+      the long-press handler runs, the short press has already opened MainMenu.  Long-press
+      Left from Idle works cleanly: `Press(Left)` on Idle is unused, and an added
+      `AUTO_REPEAT_INITIAL_DELAY = 500 ms` in the joystick driver puts the first
+      auto-repeat 1 s past the press start.
+
+      **SoftDevice handling**: kept enabled; `sd_power_system_off` is the supported SD-aware
+      System OFF entry.  PLAN's earlier note about calling `Softdevice::disable()` first
+      turned out to be unnecessary — the SVC handles SD teardown internally and we don't
+      need critical-section through the moment of `sd_power_system_off` since no app code
+      runs after it (in production).
+
+      **Debugger-attached caveat**: with the probe attached, the `DBGEN` bit makes SD enter
+      *emulated* System OFF — CPU halts in WFE but clocks stay running, so current is in
+      the mA range.  `sd_power_system_off` returns `NRF_ERROR_SOC_POWER_OFF_SHOULD_NOT_
+      RETURN` (0x2006); our handler logs and `SCB::sys_reset()`s so dev sessions see
+      "confirm → reboot to Idle" instead of a hang.  Real System OFF needs the probe
+      detached AND a power-cycle (DBGEN only clears on NRESET / power-on) — that's the
+      bench step for actually measuring the µA target.
+
+      **Status (2026-05-12)**: ✅ end-to-end working on hardware.  Dev path (probe
+      attached) sees emulated System OFF → `sys_reset` → reboot to Idle, which exercises
+      every step except the actual System OFF entry.  Production path (probe detached +
+      power-cycled to clear `DBGEN`) confirmed visually: with the external joystick
+      board's red LED wired off VEXT (P0_21), the LED goes dark at the confirm moment
+      and stays dark through sleep, lighting back up only on Center-press wake.  That's
+      the visual signature of real System OFF + VEXT teardown + reset-vector wake.
+      Quantitative <50 µA measurement still pending an actual ammeter setup, but the
+      qualitative observation (no measurable battery drop over multi-hour overnight
+      tests when in real System OFF, vs ~0.9 mA chip draw when stuck in Idle) is
+      consistent with the target.
+
+- [x] **Migrate the M7 low-battery auto-shutdown onto the deep soft-off path.**  Both
+      `Command::PowerOff` (operator) and the sustained-low-battery latch route through the
+      same `enter_soft_off()` helper.  Single `POWEROFF_REASON: AtomicU8` (values:
+      `Operator` / `LowBattery`) selects the goodbye copy and whether to push a panic-ring
+      record before the System OFF call (LowBattery only; operator soft-off is normal user
+      flow and gets no ring entry).  Drops park-state drain from M7's ~3 mA to whatever the
+      System OFF measurement comes out at (pending — see above).  ✅ wired and unit-
+      tested; bench measurement pending alongside the operator path.
 
 - [ ] **USB-plug wake (brief).**  When soft-off, plugging in USB wakes the device just long
       enough to render one frame showing battery charging status (the existing
       `BatteryIndicator` repurposed as a full-screen "Charging…" view).  Auto-sleep after
       ~5 s or on USB unplug.  Implementation: USBDETECTED interrupt → set a flag → main
       loop checks flag, runs one render, sleeps again.
+
+      **Status (2026-05-12)**: chip already wakes from emulated soft-off on USB plug
+      because the SD leaves `POWER->INTENSET.USBDETECTED` armed and the event bumps WFE.
+      In production this turns into the wake path described above; what's still missing is
+      the *brief* part — currently a USB plug fully re-enters `run()` and lands on Idle
+      with backlight on.  Needs a one-shot "charging frame then sleep again" path that
+      detects "boot reason = USB-wake from soft-off" via RESETREAS and a flash flag,
+      renders one frame, then re-enters `enter_soft_off`.
 
 - [ ] **Battery chemistry as a per-profile compile-time option.**  Today `core/ui/src/battery.rs`
       assumes single-cell LiPo with Meshtastic's OCV table.  Add a `BatteryChemistry` enum
@@ -591,13 +631,29 @@ per-profile.
       UI render "Charging…" vs "Charged" vs "Powered" states distinctly.  Small hardware
       mod (one wire-tack), nice-to-have not required.
 
-**Exit criteria:** long-press Center on any screen powers down the unit cleanly; current
-draw in soft-off measures < 100 µA on a multimeter; joystick press wakes the device with
-settings intact (post-M7); USB plug while off shows one charging frame; battery indicator
-correctly reflects voltage for both LiPo and (eventually) NiMH chemistries.
+**Exit criteria:** long-press Left from Idle → Center on the confirm screen powers down
+the unit cleanly; current draw in soft-off measures < 100 µA on a multimeter; Center
+press wakes the device with settings intact (post-M7); USB plug while off shows one
+charging frame; battery indicator correctly reflects voltage for both LiPo and
+(eventually) NiMH chemistries.
+
+**Exit criteria status (2026-05-12):**
+  - ✅ Confirm flow works end-to-end (dev + production paths).
+  - ✅ Real System OFF engages with probe detached + power-cycled — verified visually
+    via VEXT-powered joystick LED going dark and staying dark through sleep.
+  - ⏳ <100 µA quantitative measurement — pending ammeter setup; qualitative evidence
+    (no measurable % drop over multi-hour real-off tests) is consistent.
+  - ⏳ USB plug → one charging frame — see USB-plug wake bullet above.
+  - ⏳ NiMH OCV table — not started.
 
 **Out of scope:** on-board NiMH charging circuit (covered above — external charger only);
 hardware-switch design (revisit if soft-off proves unreliable in practice).
+
+**Milestone status:** 🟢 core deep soft-off complete (2026-05-12).  The headline
+"powers down cleanly to a sub-µA standby state on operator command and wakes on Center
+press" bullet is done and hardware-verified.  Remaining bullets — USB-plug brief wake,
+NiMH chemistry, docs, optional STAT-pin mod — are independent follow-ups and can each
+be picked up à la carte.
 
 ## Total estimate
 

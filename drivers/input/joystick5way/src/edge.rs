@@ -57,14 +57,28 @@ use crate::{idx_to_direction, Direction, JoystickEvent, LONG_PRESS_THRESHOLD};
 pub const DEBOUNCE_DURATION: Duration = Duration::from_millis(20);
 
 /// Auto-repeat interval for held directional events.  After the
-/// long-press threshold elapses, holding Up / Down / Left / Right
-/// continues to fire synthetic `Press(dir)` events at this
-/// cadence so list scrolling and the Scan screen's horizontal
-/// cursor feel like a typamatic keyboard.  **Center does not
-/// auto-repeat** — its long-press is the universal "go home"
-/// action and emitting periodic Press(Center) events afterwards
-/// would re-enter MainMenu repeatedly.
+/// initial delay (see [`AUTO_REPEAT_INITIAL_DELAY`]) holding Up /
+/// Down / Left / Right continues to fire synthetic `Press(dir)`
+/// events at this cadence so list scrolling and the Scan screen's
+/// horizontal cursor feel like a typamatic keyboard.  **Center
+/// does not auto-repeat** — its long-press is the universal
+/// "go home" action and emitting periodic Press(Center) events
+/// afterwards would re-enter MainMenu repeatedly.
 pub const AUTO_REPEAT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Grace period between `LongPress(dir)` firing and the **first**
+/// auto-repeat `Press(dir)` tick.  Matches the keyboard-typamatic
+/// convention of "initial delay > inter-repeat interval" so a
+/// long-press that intentionally transitions screens (e.g.
+/// `LongPress(Left)` → `PowerOffConfirm`) doesn't immediately fire
+/// a stray `Press(dir)` on the new screen while the user is still
+/// releasing.  Users who actually want to auto-scroll hold past
+/// this and inter-repeat takes over at [`AUTO_REPEAT_INTERVAL`].
+///
+/// 500 ms matches the long-press threshold itself — total
+/// press-to-first-repeat is 1 s, which is comfortably past any
+/// reasonable "hold to gesture then release" cycle.
+pub const AUTO_REPEAT_INITIAL_DELAY: Duration = Duration::from_millis(500);
 
 /// Internal state machine — see module docs.
 enum InternalState {
@@ -183,7 +197,10 @@ where
                             self.state = InternalState::LongPressed {
                                 idx,
                                 auto_repeat,
-                                next_repeat_at: Instant::now() + AUTO_REPEAT_INTERVAL,
+                                // First repeat is delayed extra-long; subsequent
+                                // ticks use AUTO_REPEAT_INTERVAL (see the LongPressed
+                                // arm below).  See AUTO_REPEAT_INITIAL_DELAY docs.
+                                next_repeat_at: Instant::now() + AUTO_REPEAT_INITIAL_DELAY,
                             };
                             return JoystickEvent::LongPress(idx_to_direction(idx));
                         }

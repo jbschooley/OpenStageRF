@@ -75,6 +75,13 @@ pub mod reset_reason {
     /// CPU lockup reset.  Catastrophic — usually means a fault
     /// handler itself faulted.
     pub const LOCKUP: u32 = 1 << 3;
+    /// Wake from System OFF via a configured GPIO `SENSE` event.
+    /// Indistinguishable from a normal cold boot from the chip's
+    /// point of view (boot vector + clear RAM-init bits), except
+    /// this bit lets the recovery code surface "shutdown → wake"
+    /// in the boot log instead of treating it as an unexplained
+    /// reset.
+    pub const OFF: u32 = 1 << 16;
 }
 
 /// Read `POWER->RESETREAS` via the direct register address.

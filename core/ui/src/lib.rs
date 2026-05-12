@@ -168,6 +168,11 @@ pub enum ScreenId {
     LinkStats,
     /// Firmware version + boot counter.
     About,
+    /// Power-off confirmation prompt.  Reached via long-press Left
+    /// from Idle; Center confirms (emits [`Command::PowerOff`]),
+    /// Left cancels back to Idle.  Visually a single-question screen
+    /// so the operator can't trigger soft-off accidentally.
+    PowerOffConfirm,
 }
 
 impl ScreenId {
@@ -184,6 +189,7 @@ impl ScreenId {
             ScreenId::PowerSelect => "TX Power",
             ScreenId::LinkStats => "Link Stats",
             ScreenId::About => "About",
+            ScreenId::PowerOffConfirm => "Power off?",
         }
     }
 }
@@ -550,6 +556,13 @@ pub enum Command {
     /// record to the panic ring.  Lets the operator confirm the
     /// WDT path end-to-end without a rebuild.
     ForceWdtHang,
+    /// Operator confirmed a deep soft-off from [`ScreenId::PowerOffConfirm`].
+    /// Host tears down peripherals (display SLPIN, radio SLEEP),
+    /// configures the joystick Center pin as a SENSE wake source,
+    /// then calls `sd_power_system_off`.  Chip enters System OFF
+    /// (~0.4 µA); the next Center press resets the chip and
+    /// boots fresh with Settings restored via M7 persistence.
+    PowerOff,
 }
 
 impl UiState {
@@ -558,9 +571,16 @@ impl UiState {
     /// fired.
     ///
     /// State machine, cross-cutting:
-    /// * Long-press Center from anywhere → Idle (universal "go home").
-    ///   Exception: from Idle, long-press Center → ChannelSelect
-    ///   (per `docs/ui_design.md`'s quick-action shortcut).
+    /// * Long-press **Center** from anywhere → Idle (universal "go home").
+    ///   Can't be used as a screen-specific shortcut: the joystick
+    ///   emits `Press(Center)` *and* `LongPress(Center)` when the user
+    ///   holds Center, so the Press always fires first; any
+    ///   special-case on long-press Center from a specific screen
+    ///   ends up running after the Press already navigated away.
+    /// * Long-press **Left** from Idle → [`ScreenId::PowerOffConfirm`].
+    ///   Picked because `Press(Left)` is unused on Idle (no double-fire
+    ///   collision) and Left is the natural "exit" axis — exiting
+    ///   harder than back, i.e. all the way out.
     /// * Per-screen handling below.
     pub fn handle_event(
         &mut self,
@@ -568,13 +588,28 @@ impl UiState {
         keys: &KeyStore,
         event: JoystickEvent,
     ) -> Option<Command> {
-        // Universal: long-press Center.  Quick-action from Idle goes
-        // to ChannelSelect; from anywhere else goes home.
+        // Universal go-home: long-press Center.  Original semantics
+        // from before the M8 soft-off work — long-press Center is the
+        // catch-all "wherever I am, take me back to Idle."  From Idle
+        // itself it's a no-op (already home).  The deep soft-off
+        // entry now lives on long-press Left (below).
         if matches!(event, JoystickEvent::LongPress(Direction::Center)) {
-            if self.screen == ScreenId::Idle {
-                self.enter(ScreenId::ChannelSelect, settings, keys);
-            } else {
-                self.go_home();
+            self.go_home();
+            return None;
+        }
+
+        // Deep soft-off entry: long-press Left from Idle.  From
+        // PowerOffConfirm it also cancels (mirrors the short-press
+        // Left cancel — a stuck-held Left during the confirm prompt
+        // should never *confirm*, and pop_nav is the safe direction).
+        // From anywhere else: ignore — long-press Left has no other
+        // assigned meaning today, and silently doing nothing keeps
+        // the gesture safe to fat-finger from any menu.
+        if matches!(event, JoystickEvent::LongPress(Direction::Left)) {
+            match self.screen {
+                ScreenId::Idle => self.enter(ScreenId::PowerOffConfirm, settings, keys),
+                ScreenId::PowerOffConfirm => self.pop_nav(),
+                _ => {}
             }
             return None;
         }
@@ -593,6 +628,29 @@ impl UiState {
             }
             ScreenId::KeySelect => self.handle_list_select(event, settings, keys, ListKind::Key),
             ScreenId::LinkStats | ScreenId::About => self.handle_readonly(event),
+            ScreenId::PowerOffConfirm => self.handle_power_off_confirm(event),
+        }
+    }
+
+    /// Center confirms (emits [`Command::PowerOff`]); Right cancels
+    /// (pops back to Idle).  **Left is deliberately ignored** — the
+    /// entry gesture is long-press Left, and the joystick driver's
+    /// auto-repeat fires synthetic `Press(Left)` events for as long
+    /// as the user holds.  Treating those as a cancel would dismiss
+    /// the screen out from under the entry hold; treating them as
+    /// confirm would be worse.  Ignoring them entirely means the
+    /// user has to release, then deliberately reach for Center
+    /// (power off) or Right (cancel).  Up/Down are also no-ops —
+    /// nothing to scroll, and any binding there would be a fat-
+    /// finger risk.
+    fn handle_power_off_confirm(&mut self, event: JoystickEvent) -> Option<Command> {
+        match event {
+            JoystickEvent::Press(Direction::Center) => Some(Command::PowerOff),
+            JoystickEvent::Press(Direction::Right) => {
+                self.pop_nav();
+                None
+            }
+            _ => None,
         }
     }
 
@@ -1224,6 +1282,7 @@ pub fn build_screen(
         ScreenId::KeySelect => build_key_select(state, settings, keys, out),
         ScreenId::LinkStats => build_link_stats(settings, status, out),
         ScreenId::About => build_about(state, about, out),
+        ScreenId::PowerOffConfirm => build_power_off_confirm(out),
     }
 }
 
@@ -1655,6 +1714,25 @@ fn build_about(state: &mut UiState, about: &AboutData<'_>, out: &mut WidgetList)
     out.push(Widget::Footer(footer)).ok();
 }
 
+/// Power-off confirmation prompt.  Plain informational screen — two
+/// body rows show the choice, footer summarises the controls.  See
+/// [`UiState::handle_power_off_confirm`] for the binding rationale
+/// (notably why Left is unbound rather than acting as cancel).
+fn build_power_off_confirm(out: &mut WidgetList) {
+    out.push(Widget::Title(s("Power off?"))).ok();
+    out.push(Widget::Text {
+        row: 2,
+        text: s("Center: confirm"),
+    })
+    .ok();
+    out.push(Widget::Text {
+        row: 3,
+        text: s("Right:  cancel"),
+    })
+    .ok();
+    out.push(Widget::Footer(s("Hold C: home"))).ok();
+}
+
 /// Tiny helper: build a fixed-size [`String`] from a `&'static str`.
 fn s<const N: usize>(literal: &'static str) -> String<N> {
     let mut out: String<N> = String::new();
@@ -1686,11 +1764,109 @@ mod tests {
     }
 
     #[test]
-    fn idle_long_press_center_jumps_to_channel_select() {
+    fn idle_long_press_left_enters_power_off_confirm() {
         let mut state = UiState::default();
-        let mut settings = Settings::default(); let keys = KeyStore::new();
+        let mut settings = Settings::default();
+        let keys = KeyStore::new();
+        state.handle_event(&mut settings, &keys, long(Direction::Left));
+        assert_eq!(state.screen, ScreenId::PowerOffConfirm);
+    }
+
+    /// The hold-Center gesture used to be the soft-off entry point;
+    /// it isn't any more.  Hold-Center from Idle should be a no-op
+    /// (we're already home), specifically *not* PowerOffConfirm.
+    #[test]
+    fn idle_long_press_center_does_not_enter_power_off_confirm() {
+        let mut state = UiState::default();
+        let mut settings = Settings::default();
+        let keys = KeyStore::new();
         state.handle_event(&mut settings, &keys, long(Direction::Center));
-        assert_eq!(state.screen, ScreenId::ChannelSelect);
+        assert_eq!(state.screen, ScreenId::Idle);
+    }
+
+    /// Center confirms straight away.
+    #[test]
+    fn power_off_confirm_center_emits_command() {
+        let mut state = UiState::default();
+        let mut settings = Settings::default();
+        let keys = KeyStore::new();
+        state.handle_event(&mut settings, &keys, long(Direction::Left));
+        assert_eq!(state.screen, ScreenId::PowerOffConfirm);
+        let cmd = state.handle_event(&mut settings, &keys, press(Direction::Center));
+        assert_eq!(cmd, Some(Command::PowerOff));
+    }
+
+    /// Right is the cancel binding (Left would collide with the
+    /// entry-gesture auto-repeat).
+    #[test]
+    fn power_off_confirm_right_cancels() {
+        let mut state = UiState::default();
+        let mut settings = Settings::default();
+        let keys = KeyStore::new();
+        state.handle_event(&mut settings, &keys, long(Direction::Left));
+        let cmd = state.handle_event(&mut settings, &keys, press(Direction::Right));
+        assert_eq!(cmd, None);
+        assert_eq!(state.screen, ScreenId::Idle);
+    }
+
+    /// Held-Left auto-repeats fire `Press(Left)` events repeatedly
+    /// after entering the screen.  Those must be no-ops — the screen
+    /// must remain visible and the state must remain on
+    /// PowerOffConfirm so the user can decide once they release.
+    #[test]
+    fn power_off_confirm_press_left_is_ignored() {
+        let mut state = UiState::default();
+        let mut settings = Settings::default();
+        let keys = KeyStore::new();
+        state.handle_event(&mut settings, &keys, long(Direction::Left));
+        for _ in 0..5 {
+            let cmd = state.handle_event(&mut settings, &keys, press(Direction::Left));
+            assert_eq!(cmd, None);
+            assert_eq!(state.screen, ScreenId::PowerOffConfirm);
+        }
+    }
+
+    /// Up / Down are also no-ops on this screen — no scrolling, no
+    /// option list, no fat-finger risk.
+    #[test]
+    fn power_off_confirm_up_down_are_ignored() {
+        let mut state = UiState::default();
+        let mut settings = Settings::default();
+        let keys = KeyStore::new();
+        state.handle_event(&mut settings, &keys, long(Direction::Left));
+        for dir in [Direction::Up, Direction::Down] {
+            let cmd = state.handle_event(&mut settings, &keys, press(dir));
+            assert_eq!(cmd, None);
+            assert_eq!(state.screen, ScreenId::PowerOffConfirm);
+        }
+    }
+
+    /// Long-press Left from the confirm screen falls back to the
+    /// universal "pop nav" path in `handle_event` and returns to
+    /// Idle without emitting a command.
+    #[test]
+    fn power_off_confirm_long_left_also_cancels() {
+        let mut state = UiState::default();
+        let mut settings = Settings::default();
+        let keys = KeyStore::new();
+        state.handle_event(&mut settings, &keys, long(Direction::Left));
+        let cmd = state.handle_event(&mut settings, &keys, long(Direction::Left));
+        assert_eq!(cmd, None);
+        assert_eq!(state.screen, ScreenId::Idle);
+    }
+
+    /// Universal go-home (long-press Center) also escapes the
+    /// confirm screen back to Idle — same outcome as the explicit
+    /// cancel.
+    #[test]
+    fn power_off_confirm_long_center_also_cancels() {
+        let mut state = UiState::default();
+        let mut settings = Settings::default();
+        let keys = KeyStore::new();
+        state.handle_event(&mut settings, &keys, long(Direction::Left));
+        let cmd = state.handle_event(&mut settings, &keys, long(Direction::Center));
+        assert_eq!(cmd, None);
+        assert_eq!(state.screen, ScreenId::Idle);
     }
 
     #[test]
