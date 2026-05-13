@@ -262,6 +262,19 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     const DEMCR: *mut u32 = 0xE000_EDFC as *mut u32;
     unsafe { core::ptr::write_volatile(DEMCR, 0) };
 
+    // Note on emulated System OFF after `cargo run`:
+    //
+    // The probe leaves the chip's AHB-AP-level `DBGEN` signal
+    // asserted, which SD reads at every `sd_power_system_off` call.
+    // When set, SD refuses real System OFF and "emulates" it by
+    // parking in WFE; any interrupt wakes the CPU and SVC returns
+    // NRF_ERROR_SOC_POWER_OFF_SHOULD_NOT_RETURN (0x2006).  We
+    // tried clearing `DHCSR.C_DEBUGEN` here — it didn't propagate
+    // to DBGEN.  The signal is reset only by NRESET / POR, so the
+    // dev workflow is "power-cycle once after each flash" before
+    // testing the soft-off → wake flow.  Memorialised in
+    // `t114_emulated_system_off.md`.
+
     defmt::info!(
         "ui (T114, {:?}): bringing up SD + display + joystick + link",
         role
@@ -272,6 +285,17 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     // POWER on activation; embassy can no longer configure those
     // afterwards.
     let r = board::resources();
+
+    // Identify the RAM-side wake signal *before* SD enable — both
+    // sub-signals (Center pin level + LATCH bit 13) are direct
+    // register reads and SD-safe.  Doing it pre-SD keeps the
+    // latency between reset-vector entry and the Center read low,
+    // which matters for the race against the user releasing their
+    // press.  The destructive `wakeflag::take` is done here so
+    // subsequent boots aren't tricked by a stale magic.
+    let early_wake = board::power::detect_wake_source();
+    defmt::info!("ui: early_wake = {:?}", early_wake);
+
     let sd = board::softdevice::enable();
     spawner.spawn(board::softdevice::run(sd).expect("alloc softdevice run task"));
 
@@ -280,6 +304,92 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     // taking Flash mid-SD-startup.
     Timer::after_millis(10).await;
     let mut flash = board::storage::flash(sd);
+
+    // Dispatch the boot path based on three signals:
+    //
+    //   - `early_wake`: live-Center poll caught a press? Or RAM-side
+    //     wakeflag said this was an intentional soft-off?
+    //   - `flash_intent`: flash-backed mirror of "we were soft-off
+    //     when the prior reset happened."  Survives brown-out /
+    //     battery-pull, unlike RAM wakeflag.
+    //   - `vbus_at_boot`: USB voltage detected on the chip's USB
+    //     pins right now.
+    //
+    // Decision matrix:
+    //
+    //   | early_wake   | flash_intent | VBUS | path           |
+    //   |--------------|--------------|------|----------------|
+    //   | CenterPress  | any          | any  | Idle           |
+    //   | UsbPlug      | any          | yes  | charging frame |
+    //   | UsbPlug      | any          | no   | silent re-sleep|
+    //   | ColdBoot     | yes          | yes  | charging frame |
+    //   | ColdBoot     | yes          | no   | silent re-sleep|
+    //   | ColdBoot     | no           | any  | Idle           |
+    //
+    // **Silent re-sleep** covers the cases the user explicitly
+    // doesn't want to wake on: USB-shield ESD touches (intentional
+    // flag set + no sustained VBUS), and battery-pull-after-soft-
+    // off (same signature).  See `unexpected_wake_resleep` docs.
+    //
+    // **Charging frame** is reserved for confirmed USB plug-in
+    // (VBUS present + we know we were soft-off).
+    //
+    // **Idle** for a genuine cold boot (no flash_intent — usually
+    // the very first boot after a firmware install, or a power-on
+    // after the user reached Idle and then power-cycled cleanly).
+    let flash_intent = load_soft_off_intent(&mut flash).await;
+    let vbus_at_boot = board::battery::vbus_present();
+    // Clear the flash flag now.  The two re-sleep paths
+    // (`enter_soft_off`, `usb_wake_charging_frame`,
+    // `unexpected_wake_resleep`) re-set it before their respective
+    // `enter_system_off` calls.  Clearing here handles the
+    // "Center press → Idle" path: their next true cold-power-on
+    // boot won't be misread as USB-wake.
+    save_soft_off_intent(&mut flash, false).await;
+
+    match early_wake {
+        // Live Center press caught — full boot to Idle.
+        board::power::WakeSource::CenterPress => {
+            defmt::info!("ui: wake = CenterPress → Idle");
+        }
+        // Intentional wake with VBUS — confirmed USB plug-in
+        // alongside the prior soft-off.  Brief charging frame
+        // then real System OFF.
+        board::power::WakeSource::UsbPlug if vbus_at_boot => {
+            defmt::info!("ui: wake = UsbPlug + VBUS → charging frame");
+            usb_wake_charging_frame(r.display, r.display_backlight, r.battery, flash)
+                .await;
+        }
+        // Intentional wake without VBUS — most likely a SENSE
+        // event on Center triggered by ESD or a quick press we
+        // missed during the live poll.  Silent re-sleep.
+        board::power::WakeSource::UsbPlug => {
+            unexpected_wake_resleep(flash).await;
+        }
+        // Cold boot + flash_intent + VBUS — brown-out from a USB
+        // plug-in event.  RAM wiped but the cable is plugged in;
+        // show charging frame.
+        board::power::WakeSource::ColdBoot if flash_intent && vbus_at_boot => {
+            defmt::info!(
+                "ui: wake = ColdBoot + flash_intent + VBUS → charging frame \
+                 (probable brown-out from USB plug-in)"
+            );
+            usb_wake_charging_frame(r.display, r.display_backlight, r.battery, flash)
+                .await;
+        }
+        // Cold boot + flash_intent + no VBUS — most likely a USB-
+        // shield ESD event or a battery-pull while soft-off was
+        // active.  Silent re-sleep — neither warrants user-visible
+        // wake activity.
+        board::power::WakeSource::ColdBoot if flash_intent => {
+            unexpected_wake_resleep(flash).await;
+        }
+        // Genuinely cold boot — fresh power-on without a prior
+        // soft-off in the flash flag.  Boot to Idle.
+        board::power::WakeSource::ColdBoot => {
+            defmt::info!("ui: wake = ColdBoot (no flash_intent) → Idle");
+        }
+    }
 
     // Recover any panic staged by the prior boot (if any).  Reads
     // and clears RESETREAS, takes the staged record from .uninit,
@@ -960,6 +1070,141 @@ async fn ui_state_loop(
     }
 }
 
+// ── Unexpected-wake silent re-sleep ─────────────────────────────
+
+/// No-UI re-entry into System OFF for wakes that were neither
+/// a deliberate Center press nor a confirmed USB plug-in (VBUS
+/// sustained at boot).  Covers:
+///
+///   - USB cable shield-touch causing brown-out / NRESET via ESD.
+///   - Battery pull during a soft-off session, then reinsertion.
+///   - Spontaneous SENSE-like events on Center from ESD that
+///     weren't followed by a deliberate hold.
+///
+/// User-facing effect: the chip appears to "stay off."  No display
+/// activity, no backlight, no charging frame.  A brief joystick-
+/// LED flicker is unavoidable while `build_resources` raises VEXT
+/// for the ~half-second of CPU work before `enter_system_off`
+/// gates it back down.  To actually wake to Idle the operator has
+/// to deliberately press Center (the live-poll in
+/// `detect_wake_source` debounces 10 ms of stable LOW, well
+/// outside ESD-pulse territory).
+///
+/// **Why no UI**: rendering anything here turns a noise event into
+/// a noticeable interruption.  Silent re-sleep keeps shield-touch
+/// and battery-pull-after-soft-off feel equivalent to "I didn't
+/// wake the device" — predictable, not surprising.
+async fn unexpected_wake_resleep(mut flash: Flash) -> ! {
+    defmt::info!(
+        "ui: unexpected wake (soft-off intent set, no live press, no VBUS) → silent re-sleep"
+    );
+    save_soft_off_intent(&mut flash, true).await;
+    board::power::enter_system_off()
+}
+
+// ── USB-plug brief wake ─────────────────────────────────────────
+
+/// Boot-time branch for `WakeSource::UsbPlug`.  Renders a single
+/// "Charging" frame using the just-sampled battery state, holds it
+/// for ~2 s, then puts the panel back to sleep and re-enters
+/// `board::power::enter_system_off()`.  Diverges.
+///
+/// What's missing vs. a full boot (intentional):
+///   - SD's `recover_pending_panic` doesn't run.  A panic that
+///     happened in the previous user session was already recorded
+///     to the panic ring on the way down; this path doesn't need
+///     to log anything new and the About screen the user *will*
+///     see (next time they wake with Center) handles it.
+///   - No flash setup, no settings restore, no task spawning.  We
+///     have ~2 s of work to do and then the chip goes back to
+///     sleep — keeping the boot lean is what makes "USB plug → 2 s
+///     frame → off" cheap in terms of average current.
+///   - No `ui_render_task` / `ui_state_loop` / link runtime.  Frame
+///     is built + flushed inline; the joystick stays unread
+///     because input has no role on this path.
+///
+/// The radio is left in whatever state the prior soft-off landed
+/// it in — `link_runtime::handle_*_shutdown` puts it in SLEEP
+/// (~160 nA) before parking, and the SX1262 retains state across
+/// the MCU's System OFF wake (shared 3.3 V rail, no reset pulse
+/// from `build_resources`'s `Level::High` NRESET init).
+async fn usb_wake_charging_frame(
+    mut display: board::Display,
+    mut backlight: Output<'static>,
+    mut battery_mon: board::battery::BatteryMonitor,
+    mut flash: Flash,
+) -> ! {
+    // Sample once so the frame shows actual mV / %.  Single SAADC
+    // round is ~200 µs.
+    let mv = battery_mon.sample().await;
+    let status = osrf_ui::BatteryStatus::from_reading(mv, true);
+    defmt::info!(
+        "usb-wake: battery {=u16} mV ({=u8} %)",
+        status.voltage_mv,
+        status.percent
+    );
+
+    display.init().await;
+
+    // Build the frame.  Title + a centred reading + the standard
+    // BatteryIndicator widget so the operator's eye lands on the
+    // same icon they're used to from the title-bar.
+    let mut widgets: WidgetList = WidgetList::new();
+    let _ = widgets.push(Widget::Title(short_str::<24>("Charging")));
+    let mut mv_text: heapless::String<24> = heapless::String::new();
+    use core::fmt::Write as _;
+    let _ = write!(&mut mv_text, "{} mV", status.voltage_mv);
+    let _ = widgets.push(Widget::Text { row: 2, text: mv_text });
+    let mut pct_text: heapless::String<24> = heapless::String::new();
+    let _ = write!(&mut pct_text, "{}%", status.percent);
+    let _ = widgets.push(Widget::Text { row: 3, text: pct_text });
+    let _ = widgets.push(Widget::BatteryIndicator {
+        voltage_mv: status.voltage_mv,
+        percent: status.percent,
+        plugged_in: true,
+    });
+
+    let mut renderer = osrf_ui::Renderer::new();
+    // SAFETY: same FRAMEBUFFER borrow as the normal-boot path, but
+    // we're on the USB-wake branch so the normal path's own borrow
+    // never runs.  Single-owner across this boot.
+    let fb: &'static mut board::framebuffer::Framebuffer =
+        unsafe { &mut *core::ptr::addr_of_mut!(FRAMEBUFFER) };
+    let scan = osrf_ui::ScanState::default();
+    let _ = renderer.render(&widgets, &scan, fb);
+    display.flush(fb).await;
+    backlight.set_low(); // active-LOW = on
+
+    // Hold the frame visible.
+    Timer::after_secs(2).await;
+
+    // Teardown: same order as `enter_soft_off`, minus the
+    // SHUTDOWN-to-link-runtime + POWER_OFF_DISPLAY signals (no
+    // tasks running on this path).  Backlight first, then panel
+    // VDD gate, then System OFF.
+    backlight.set_high();
+    display.power_off().await;
+
+    // Re-set the flash-backed intent so the *next* boot (whether
+    // via clean SENSE wake, USB plug, or brown-out) is recognised
+    // as "we meant to be off."  enter_system_off itself also sets
+    // the RAM wakeflag — flash + RAM together cover both clean
+    // and brown-out wake paths.
+    save_soft_off_intent(&mut flash, true).await;
+    defmt::info!("usb-wake: charging frame done — re-entering System OFF");
+    board::power::enter_system_off()
+}
+
+/// Tiny helper: build a fixed-size `heapless::String` from a
+/// `&'static str`.  Copy of the `s()` helper used elsewhere in the
+/// renderer, scoped to this module to avoid leaking it through
+/// `core/ui`'s public surface.
+fn short_str<const N: usize>(literal: &'static str) -> heapless::String<N> {
+    let mut out = heapless::String::new();
+    let _ = out.push_str(literal);
+    out
+}
+
 // ── Deep soft-off ───────────────────────────────────────────────
 
 /// Tear the device down to sub-µA System OFF.  Diverges; the only
@@ -1074,7 +1319,16 @@ async fn enter_soft_off(
     Timer::after_millis(250).await;
     wdt.pet();
 
-    // 9) Enter System OFF.  Diverges.
+    // 9) Persist the soft-off intent.  RAM wakeflag (set inside
+    //    enter_system_off) handles clean SENSE wakes; this flash
+    //    flag handles wakes-via-brown-out where RAM is wiped (USB
+    //    plug-in events have been observed to trigger this on the
+    //    T114 — TP4054 charging-mode transient and/or shield ESD).
+    //    Flash write is ~30 ms; fits comfortably in the WDT budget.
+    save_soft_off_intent(flash, true).await;
+    wdt.pet();
+
+    // 10) Enter System OFF.  Diverges.
     defmt::info!("ui: entering System OFF — wake on Center press");
     board::power::enter_system_off()
 }
@@ -1180,6 +1434,13 @@ fn collect_scan_frequencies(plan: BandPlan, out: &mut [u32; MAX_SCAN_CHANNELS]) 
 //   KEY_BAND_PLAN     → u32     index into `BAND_PLANS`
 //   KEY_TX_POWER      → i32     dBm, range MIN_TX_POWER_DBM..=MAX_TX_POWER_DBM
 //   KEY_ACTIVE_KEY_FP → u32     fingerprint, 0 = "no key" (== `None`)
+//   KEY_SOFT_OFF_INTENT → u32   1 if the last UI tick before this boot
+//                               called enter_soft_off; 0 otherwise.
+//                               Survives brown-out + battery-pull (unlike
+//                               the RAM-based wakeflag), which is what
+//                               makes the brief-charging-frame work when
+//                               USB plug causes an ESD-or-brownout reset
+//                               instead of a clean SENSE wake.
 //
 // We use u32/i32 even for fields that fit in a smaller type — it
 // makes the sequential-storage `Value` impl trivial (built in for
@@ -1189,6 +1450,7 @@ const KEY_CHANNEL: u8 = 0;
 const KEY_BAND_PLAN: u8 = 1;
 const KEY_TX_POWER: u8 = 2;
 const KEY_ACTIVE_KEY_FP: u8 = 3;
+const KEY_SOFT_OFF_INTENT: u8 = 4;
 
 /// Scratch buffer size for sequential-storage's record assembly.
 /// 64 B is comfortable for any of our values (max is a u32 ≈ 4 B
@@ -1487,5 +1749,63 @@ async fn save_active_key(flash: &mut Flash, fp: Option<u32>) {
     .await
     {
         defmt::warn!("persist: save key_fp failed: {:?}", defmt::Debug2Format(&e));
+    }
+}
+
+/// Persist the "we are about to enter (or just entered) soft-off"
+/// intent.  Written from `enter_soft_off` + `usb_wake_charging_frame`
+/// just before `board::power::enter_system_off`, cleared at boot
+/// after `detect_wake_source` has had a chance to read it.  Flash-
+/// backed instead of RAM-backed because USB-plug events sometimes
+/// brown-out the chip on this hardware (Vbat sag as TP4054 switches
+/// charging modes, or ESD on the shield) — RAM wakeflag is wiped,
+/// but flash survives, so the boot still recognises "we meant to be
+/// off and there's a USB present" and lands on the charging frame
+/// instead of a full Idle boot.
+async fn save_soft_off_intent(flash: &mut Flash, intent: bool) {
+    let mut buf = [0u8; PERSIST_BUF_LEN];
+    let mut cache = NoCache::new();
+    let v: u32 = if intent { 1 } else { 0 };
+    if let Err(e) = map::store_item::<u8, u32, _>(
+        flash,
+        board::storage::SETTINGS_RANGE,
+        &mut cache,
+        &mut buf,
+        &KEY_SOFT_OFF_INTENT,
+        &v,
+    )
+    .await
+    {
+        defmt::warn!(
+            "persist: save soft_off_intent failed: {:?}",
+            defmt::Debug2Format(&e)
+        );
+    }
+}
+
+/// Read the persisted soft-off intent flag.  Returns `false` on
+/// missing / corrupt records — safer to drop into a normal boot than
+/// to falsely re-sleep on first-ever boot.
+async fn load_soft_off_intent(flash: &mut Flash) -> bool {
+    let mut buf = [0u8; PERSIST_BUF_LEN];
+    let mut cache = NoCache::new();
+    match map::fetch_item::<u8, u32, _>(
+        flash,
+        board::storage::SETTINGS_RANGE,
+        &mut cache,
+        &mut buf,
+        &KEY_SOFT_OFF_INTENT,
+    )
+    .await
+    {
+        Ok(Some(v)) => v == 1,
+        Ok(None) => false,
+        Err(e) => {
+            defmt::warn!(
+                "persist: load soft_off_intent failed: {:?}",
+                defmt::Debug2Format(&e)
+            );
+            false
+        }
     }
 }

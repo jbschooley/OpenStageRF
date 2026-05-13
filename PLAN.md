@@ -580,19 +580,31 @@ per-profile.
       System OFF measurement comes out at (pending — see above).  ✅ wired and unit-
       tested; bench measurement pending alongside the operator path.
 
-- [ ] **USB-plug wake (brief).**  When soft-off, plugging in USB wakes the device just long
-      enough to render one frame showing battery charging status (the existing
-      `BatteryIndicator` repurposed as a full-screen "Charging…" view).  Auto-sleep after
-      ~5 s or on USB unplug.  Implementation: USBDETECTED interrupt → set a flag → main
-      loop checks flag, runs one render, sleeps again.
+- [x] **USB-plug wake (brief).**  When soft-off, plugging in USB wakes the device just
+      long enough to render one frame showing battery charging status, then re-enters
+      System OFF.  Hold-time set at 2 s (PLAN originally said ~5 s; 2 s reads cleanly
+      without feeling like the device decided to stay on).
 
-      **Status (2026-05-12)**: chip already wakes from emulated soft-off on USB plug
-      because the SD leaves `POWER->INTENSET.USBDETECTED` armed and the event bumps WFE.
-      In production this turns into the wake path described above; what's still missing is
-      the *brief* part — currently a USB plug fully re-enters `run()` and lands on Idle
-      with backlight on.  Needs a one-shot "charging frame then sleep again" path that
-      detects "boot reason = USB-wake from soft-off" via RESETREAS and a flash flag,
-      renders one frame, then re-enters `enter_soft_off`.
+      **Mechanism**: a `.uninit` magic byte in `board::wakeflag` is set just before the
+      `sd_power_system_off` SVC.  Next boot's `board::power::detect_wake_source()`
+      reads the magic + clears it, reads the Center pin level via raw P0.IN, and reads
+      VBUS via `battery::vbus_present()`.  The three signals combine to return a
+      `WakeSource` enum: `ColdBoot` / `CenterPress` / `UsbPlug`.  Detection runs *before*
+      SD enable so the latency between reset vector and the Center read is minimal —
+      the press signal is only present while the user is still holding, ~hundreds of ms.
+
+      `profiles/t114_ui::run` branches on the wake source.  On `UsbPlug` it calls
+      `usb_wake_charging_frame()` instead of spawning the full UI: that helper inits
+      the display, samples the battery once, builds a "Charging / N mV / N %" frame
+      with the existing widgets, holds it for 2 s, runs the same display teardown as
+      `enter_soft_off`, and re-enters `board::power::enter_system_off()`.  No flash,
+      no tasks, no settings restore — minimum work for the brief-frame budget.
+
+      **Status (2026-05-12)**: ✅ implemented and unit-tested (existing UI tests cover
+      the un-changed normal-boot path; the USB-wake branch is one-shot async code that
+      exercises in-tree types but doesn't lend itself to host tests).  Hardware
+      verification still pending — needs probe-detached + power-cycled bench session
+      (same as core soft-off verification).
 
 - [ ] **Battery chemistry as a per-profile compile-time option.**  Today `core/ui/src/battery.rs`
       assumes single-cell LiPo with Meshtastic's OCV table.  Add a `BatteryChemistry` enum
@@ -643,7 +655,8 @@ charging frame; battery indicator correctly reflects voltage for both LiPo and
     via VEXT-powered joystick LED going dark and staying dark through sleep.
   - ⏳ <100 µA quantitative measurement — pending ammeter setup; qualitative evidence
     (no measurable % drop over multi-hour real-off tests) is consistent.
-  - ⏳ USB plug → one charging frame — see USB-plug wake bullet above.
+  - ✅ USB plug → one charging frame (2 s) → re-sleep — wired; hardware verification
+    pending in the same bench session as the µA measurement.
   - ⏳ NiMH OCV table — not started.
 
 **Out of scope:** on-board NiMH charging circuit (covered above — external charger only);
