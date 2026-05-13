@@ -87,6 +87,7 @@ osrf-app-midi-node                = { path = "apps/midi_node" }
 osrf-app-radio-bench              = { path = "apps/radio_bench" }
 osrf-app-ui-bench                 = { path = "apps/ui_bench" }
 osrf-app-ui-runtime               = { path = "apps/ui_runtime" }
+osrf-crypto                       = { path = "crypto" }
 osrf-link-runtime                 = { path = "core/link_runtime" }
 osrf-panic-log                    = { path = "core/panic_log" }
 osrf-ui                           = { path = "core/ui" }
@@ -127,6 +128,17 @@ embedded-storage                  = "0.3"
 embedded-storage-async            = "0.4"
 heapless                          = { version = "0.9", default-features = false }
 sequential-storage                = { version = "5.0", features = ["defmt-03"] }
+
+# AEAD primitives for the Stage 3 link-encryption / authentication
+# work.  All `no_std` + `default-features = false` so they sit cleanly
+# on Cortex-M.  ChaCha20-Poly1305 is the default cipher (RFC 8439);
+# AES-128-CCM is the alternative for hardware-AES targets but currently
+# uses the software impl from RustCrypto because the nRF52840 CCM
+# peripheral is BLE-reserved while the SoftDevice is enabled.
+aes                               = { version = "0.8", default-features = false }
+ccm                               = { version = "0.5", default-features = false }
+chacha20poly1305                  = { version = "0.10", default-features = false }
+sha2                              = { version = "0.10", default-features = false }
 
 # nRF SoftDevice (BLE stack).  Pinned to git master because crates.io
 # 0.1.x still depends on the legacy `nrf52840-pac` and link-collides
