@@ -6,5 +6,5 @@
 pub use osrf_board_dx_lr30::{led_status, midi_uart, radio0};
 
 pub const RF_FREQUENCY_HZ: u32 = 915_000_000;
-pub const RF_BITRATE_BPS:  u32 = 300_000;
-pub const RF_TX_POWER_DBM: i8  = 14;
+pub const RF_BITRATE_BPS: u32 = 300_000;
+pub const RF_TX_POWER_DBM: i8 = 14;

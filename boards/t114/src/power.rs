@@ -66,14 +66,22 @@ const SENSE_LOW: u32 = 0b11 << 16;
 /// PIN_CNF[n] address for the given port + pin.  Port must be 0 or 1.
 #[inline(always)]
 const fn pin_cnf_addr(port: u8, pin: u8) -> *mut u32 {
-    let base = if port == 0 { GPIO_P0_BASE } else { GPIO_P1_BASE };
+    let base = if port == 0 {
+        GPIO_P0_BASE
+    } else {
+        GPIO_P1_BASE
+    };
     (base + PIN_CNF_OFFSET + 4 * (pin as usize)) as *mut u32
 }
 
 /// OUTCLR address for the given GPIO port.
 #[inline(always)]
 const fn outclr_addr(port: u8) -> *mut u32 {
-    let base = if port == 0 { GPIO_P0_BASE } else { GPIO_P1_BASE };
+    let base = if port == 0 {
+        GPIO_P0_BASE
+    } else {
+        GPIO_P1_BASE
+    };
     (base + OUTCLR_OFFSET) as *mut u32
 }
 

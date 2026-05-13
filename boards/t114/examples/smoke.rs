@@ -49,7 +49,10 @@ async fn main(_spawner: Spawner) {
     // ── User button (P1_10, pulled high externally) ───────────────────────────
     info!("[BTN] configuring P1_10 user button (active-low when pressed)");
     let button = Input::new(p.P1_10, Pull::Up);
-    info!("[BTN] state at power-on: {} (high = released)", button.is_high());
+    info!(
+        "[BTN] state at power-on: {} (high = released)",
+        button.is_high()
+    );
 
     // ── Display power rail (VEXT_ENABLE on P0_21) ─────────────────────────────
     // VEXT gates the 3.3 V rail to the TFT.  Pulse it once to confirm the FET
@@ -66,12 +69,16 @@ async fn main(_spawner: Spawner) {
     // directly.  CS, NRESET are outputs (idle-high); BUSY, DIO1 are inputs.
     info!("[RADIO] configuring SX1262 GPIO pins");
 
-    let mut cs          = Output::new(p.P0_24, Level::High, OutputDrive::Standard);
+    let mut cs = Output::new(p.P0_24, Level::High, OutputDrive::Standard);
     let mut radio_reset = Output::new(p.P0_25, Level::High, OutputDrive::Standard);
-    let busy            = Input::new(p.P0_17, Pull::None);
-    let dio1            = Input::new(p.P0_20, Pull::Down);
+    let busy = Input::new(p.P0_17, Pull::None);
+    let dio1 = Input::new(p.P0_20, Pull::Down);
 
-    info!("[RADIO] pre-reset  — BUSY={} DIO1={}", busy.is_high(), dio1.is_high());
+    info!(
+        "[RADIO] pre-reset  — BUSY={} DIO1={}",
+        busy.is_high(),
+        dio1.is_high()
+    );
 
     // Hardware reset: hold NRESET low ≥100 µs, release, wait ≥3 ms.
     radio_reset.set_low();
@@ -81,7 +88,10 @@ async fn main(_spawner: Spawner) {
 
     let busy_after = busy.is_high();
     let dio1_after = dio1.is_high();
-    info!("[RADIO] post-reset — BUSY={} DIO1={}", busy_after, dio1_after);
+    info!(
+        "[RADIO] post-reset — BUSY={} DIO1={}",
+        busy_after, dio1_after
+    );
     if busy_after {
         warn!("[RADIO] BUSY still high after reset + 5 ms — SX1262 may be absent or wiring wrong");
     } else {

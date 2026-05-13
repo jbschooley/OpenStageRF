@@ -19,9 +19,8 @@
 //!   - DIN OUT jack and FeatherWing `TX` pin: leave disconnected.
 
 use embassy_executor::Spawner;
-use osrf_app_midi_node::{run_tx, LinkConfig, UartMidiSource, LinkStatsCell};
+use osrf_app_midi_node::{run_tx, LinkConfig, LinkStatsCell, UartMidiSource};
 use osrf_board_t114 as board;
-
 
 /// Cross-task shared link-runtime stats.  Single producer
 /// (`run_rx` / `run_tx` in `main`); no other consumer in this

@@ -170,8 +170,7 @@ where
 
                 InternalState::PressedAwaitingLong { idx, press_start } => {
                     let long_at = press_start + LONG_PRESS_THRESHOLD;
-                    let outcome =
-                        select(self.wait_rising_edge(idx), Timer::at(long_at)).await;
+                    let outcome = select(self.wait_rising_edge(idx), Timer::at(long_at)).await;
                     match outcome {
                         Either::First(_) => {
                             // Released before long-press threshold.
@@ -215,11 +214,8 @@ where
                     if auto_repeat {
                         // Wait for either release OR the next
                         // auto-repeat tick.
-                        let outcome = select(
-                            self.wait_rising_edge(idx),
-                            Timer::at(next_repeat_at),
-                        )
-                        .await;
+                        let outcome =
+                            select(self.wait_rising_edge(idx), Timer::at(next_repeat_at)).await;
                         match outcome {
                             Either::First(_) => {
                                 self.state = InternalState::Idle;
@@ -231,8 +227,7 @@ where
                                 self.state = InternalState::LongPressed {
                                     idx,
                                     auto_repeat,
-                                    next_repeat_at: Instant::now()
-                                        + AUTO_REPEAT_INTERVAL,
+                                    next_repeat_at: Instant::now() + AUTO_REPEAT_INTERVAL,
                                 };
                                 return JoystickEvent::Press(idx_to_direction(idx));
                             }

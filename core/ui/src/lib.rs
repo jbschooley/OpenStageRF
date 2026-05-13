@@ -46,10 +46,8 @@ pub use band_plan::{
     channel as band_plan_channel, max_channel_index, BandPlan, BandPlanInfo, ChannelInfo,
     BAND_PLANS,
 };
-pub use battery::{
-    BatteryChemistry, BatteryStatus, CRITICAL_THRESHOLD_PCT, LOW_THRESHOLD_PCT,
-};
-pub use key_store::{KeyEntry, KeyRecord, KeyStore, KEY_MATERIAL_LEN, MAX_KEY_NAME, MAX_KEYS};
+pub use battery::{BatteryChemistry, BatteryStatus, CRITICAL_THRESHOLD_PCT, LOW_THRESHOLD_PCT};
+pub use key_store::{KeyEntry, KeyRecord, KeyStore, KEY_MATERIAL_LEN, MAX_KEYS, MAX_KEY_NAME};
 pub use render::{render, Renderer};
 // (PowerPolicy + WIRED_USB_LOSS_GRACE_SECS are already public at the
 // module root — listed here for visibility alongside the other
@@ -113,7 +111,7 @@ impl Settings {
 /// Snapshot of the link runtime state for the UI to display.  The
 /// host updates this from the run_tx/run_rx loop and the UI reads
 /// it on every render — no mutation from the UI side.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct LinkStatus {
     /// Watchdog says the peer is alive.
@@ -126,18 +124,6 @@ pub struct LinkStatus {
     pub total_accepted: u32,
     /// Total stuck-note recoveries fired (heartbeat-state failsafe).
     pub stuck_recoveries: u32,
-}
-
-impl Default for LinkStatus {
-    fn default() -> Self {
-        Self {
-            up: false,
-            last_rssi_dbm: None,
-            recent_loss_pct: None,
-            total_accepted: 0,
-            stuck_recoveries: 0,
-        }
-    }
 }
 
 // ── Screen IDs ──────────────────────────────────────────────────────────────
@@ -326,34 +312,36 @@ impl Role {
 /// TX-side top menu: channel + scan + band plan + TX power +
 /// about.  No Link Stats (v1 has no ACK channel; the TX has no
 /// way to observe whether RX is alive).
+#[rustfmt::skip] // Table-driven config; one-line rows read clearer than the default break.
 pub static MAIN_MENU_TX: MenuNode = MenuNode {
     title: "Menu",
     items: &[
-        MenuItem { label: "Channel",    action: ItemAction::List(ListKind::Channel) },
-        MenuItem { label: "Scan",       action: ItemAction::Custom(ScreenId::Scan) },
-        MenuItem { label: "Band Plan",  action: ItemAction::List(ListKind::BandPlan) },
-        MenuItem { label: "TX Power",   action: ItemAction::Value(ValueKind::TxPower) },
+        MenuItem { label: "Channel", action: ItemAction::List(ListKind::Channel) },
+        MenuItem { label: "Scan", action: ItemAction::Custom(ScreenId::Scan) },
+        MenuItem { label: "Band Plan", action: ItemAction::List(ListKind::BandPlan) },
+        MenuItem { label: "TX Power", action: ItemAction::Value(ValueKind::TxPower) },
         // Key entry hidden until AEAD lands (Stage 3 in ROADMAP.md).
         // MenuItem { label: "Key",        action: ItemAction::List(ListKind::Key) },
-        MenuItem { label: "About",      action: ItemAction::Custom(ScreenId::About) },
-        MenuItem { label: "Force panic",action: ItemAction::Trigger(Command::ForcePanic) },
-        MenuItem { label: "Force WDT",  action: ItemAction::Trigger(Command::ForceWdtHang) },
+        MenuItem { label: "About", action: ItemAction::Custom(ScreenId::About) },
+        MenuItem { label: "Force panic", action: ItemAction::Trigger(Command::ForcePanic) },
+        MenuItem { label: "Force WDT", action: ItemAction::Trigger(Command::ForceWdtHang) },
     ],
 };
 
 /// RX-side top menu: channel + scan + band plan + link stats +
 /// about.  No TX Power (RX doesn't transmit).
+#[rustfmt::skip] // Table-driven config; one-line rows read clearer than the default break.
 pub static MAIN_MENU_RX: MenuNode = MenuNode {
     title: "Menu",
     items: &[
-        MenuItem { label: "Channel",    action: ItemAction::List(ListKind::Channel) },
-        MenuItem { label: "Scan",       action: ItemAction::Custom(ScreenId::Scan) },
-        MenuItem { label: "Band Plan",  action: ItemAction::List(ListKind::BandPlan) },
+        MenuItem { label: "Channel", action: ItemAction::List(ListKind::Channel) },
+        MenuItem { label: "Scan", action: ItemAction::Custom(ScreenId::Scan) },
+        MenuItem { label: "Band Plan", action: ItemAction::List(ListKind::BandPlan) },
         // MenuItem { label: "Key",        action: ItemAction::List(ListKind::Key) },
         MenuItem { label: "Link Stats", action: ItemAction::Custom(ScreenId::LinkStats) },
-        MenuItem { label: "About",      action: ItemAction::Custom(ScreenId::About) },
-        MenuItem { label: "Force panic",action: ItemAction::Trigger(Command::ForcePanic) },
-        MenuItem { label: "Force WDT",  action: ItemAction::Trigger(Command::ForceWdtHang) },
+        MenuItem { label: "About", action: ItemAction::Custom(ScreenId::About) },
+        MenuItem { label: "Force panic", action: ItemAction::Trigger(Command::ForcePanic) },
+        MenuItem { label: "Force WDT", action: ItemAction::Trigger(Command::ForceWdtHang) },
     ],
 };
 
@@ -663,13 +651,13 @@ impl UiState {
             ScreenId::Idle => self.handle_idle(event, settings, keys),
             ScreenId::Menu => self.handle_menu(event, settings, keys),
             ScreenId::Scan => self.handle_scan(event, settings),
-            ScreenId::ChannelSelect => self.handle_list_select(event, settings, keys, ListKind::Channel),
+            ScreenId::ChannelSelect => {
+                self.handle_list_select(event, settings, keys, ListKind::Channel)
+            }
             ScreenId::BandPlanSelect => {
                 self.handle_list_select(event, settings, keys, ListKind::BandPlan)
             }
-            ScreenId::PowerSelect => {
-                self.handle_value_select(event, settings, ValueKind::TxPower)
-            }
+            ScreenId::PowerSelect => self.handle_value_select(event, settings, ValueKind::TxPower),
             ScreenId::KeySelect => self.handle_list_select(event, settings, keys, ListKind::Key),
             ScreenId::LinkStats | ScreenId::About => self.handle_readonly(event),
             ScreenId::PowerOffConfirm => self.handle_power_off_confirm(event),
@@ -705,8 +693,7 @@ impl UiState {
         _keys: &KeyStore,
     ) -> Option<Command> {
         match event {
-            JoystickEvent::Press(Direction::Center)
-            | JoystickEvent::Press(Direction::Right) => {
+            JoystickEvent::Press(Direction::Center) | JoystickEvent::Press(Direction::Right) => {
                 self.enter_menu(self.role.main_menu());
             }
             _ => {}
@@ -741,8 +728,7 @@ impl UiState {
             JoystickEvent::Press(Direction::Left) => {
                 self.pop_nav();
             }
-            JoystickEvent::Press(Direction::Right)
-            | JoystickEvent::Press(Direction::Center) => {
+            JoystickEvent::Press(Direction::Right) | JoystickEvent::Press(Direction::Center) => {
                 if let Some(item) = self.current_menu.items.get(self.cursor as usize) {
                     let action = item.action;
                     match action {
@@ -771,11 +757,7 @@ impl UiState {
     /// - **Center** applies the cursor's channel as the new
     ///   active channel and **stays on Scan** so the user can
     ///   keep watching the floor or pick a different channel.
-    fn handle_scan(
-        &mut self,
-        event: JoystickEvent,
-        settings: &mut Settings,
-    ) -> Option<Command> {
+    fn handle_scan(&mut self, event: JoystickEvent, settings: &mut Settings) -> Option<Command> {
         let max_idx = self.scan.channel_count.saturating_sub(1);
         match event {
             JoystickEvent::Press(Direction::Left) => {
@@ -814,7 +796,7 @@ impl UiState {
     /// entry, so this is fine).
     pub fn apply_scan_pass(&mut self, rssi: &[i16]) {
         let n = (rssi.len()).min(self.scan.channel_count as usize);
-        for i in 0..n {
+        for (i, &reading) in rssi.iter().take(n).enumerate() {
             // [`SCAN_NO_DATA`] means "this slot wasn't sampled in
             // this pass" — common with the runtime's incremental
             // scanner where each render-tick reads a partially-
@@ -822,12 +804,12 @@ impl UiState {
             // (and the peak) intact instead of clobbering it with a
             // sentinel that the renderer would interpret as "draw
             // nothing."
-            if rssi[i] == SCAN_NO_DATA {
+            if reading == SCAN_NO_DATA {
                 continue;
             }
-            self.scan.current_dbm[i] = rssi[i];
-            if rssi[i] > self.scan.peak_dbm[i] {
-                self.scan.peak_dbm[i] = rssi[i];
+            self.scan.current_dbm[i] = reading;
+            if reading > self.scan.peak_dbm[i] {
+                self.scan.peak_dbm[i] = reading;
             }
         }
     }
@@ -853,8 +835,7 @@ impl UiState {
                     self.scroll_offset = self.cursor + 1 - VISIBLE_LIST_ROWS;
                 }
             }
-            JoystickEvent::Press(Direction::Center)
-            | JoystickEvent::Press(Direction::Right) => {
+            JoystickEvent::Press(Direction::Center) | JoystickEvent::Press(Direction::Right) => {
                 let cmd = kind.commit(self.cursor, settings, keys);
                 self.pop_nav();
                 return cmd;
@@ -887,15 +868,11 @@ impl UiState {
                     self.edit_buffer = kind.read(settings);
                 }
             }
-            JoystickEvent::Press(Direction::Up) => {
-                if self.edit_mode {
-                    self.edit_buffer = kind.clamp(self.edit_buffer + 1);
-                }
+            JoystickEvent::Press(Direction::Up) if self.edit_mode => {
+                self.edit_buffer = kind.clamp(self.edit_buffer + 1);
             }
-            JoystickEvent::Press(Direction::Down) => {
-                if self.edit_mode {
-                    self.edit_buffer = kind.clamp(self.edit_buffer - 1);
-                }
+            JoystickEvent::Press(Direction::Down) if self.edit_mode => {
+                self.edit_buffer = kind.clamp(self.edit_buffer - 1);
             }
             JoystickEvent::Press(Direction::Left) => {
                 if self.edit_mode {
@@ -916,12 +893,10 @@ impl UiState {
             // Scroll support for About — LinkStats is short enough
             // not to need it, but accepting these events on both
             // screens is harmless.  build_about clamps overshoot.
-            JoystickEvent::Press(Direction::Up)
-            | JoystickEvent::LongPress(Direction::Up) => {
+            JoystickEvent::Press(Direction::Up) | JoystickEvent::LongPress(Direction::Up) => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(1);
             }
-            JoystickEvent::Press(Direction::Down)
-            | JoystickEvent::LongPress(Direction::Down) => {
+            JoystickEvent::Press(Direction::Down) | JoystickEvent::LongPress(Direction::Down) => {
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
             }
             // About screen only: long-press Right acknowledges the
@@ -930,9 +905,7 @@ impl UiState {
             // go-home, Left is back, so Right is the natural
             // confirmation gesture.  Scoped to About specifically so
             // the LinkStats screen doesn't accidentally trip clears.
-            JoystickEvent::LongPress(Direction::Right)
-                if self.screen == ScreenId::About =>
-            {
+            JoystickEvent::LongPress(Direction::Right) if self.screen == ScreenId::About => {
                 return Some(Command::ClearPanicLog);
             }
             _ => {}
@@ -1055,10 +1028,7 @@ fn active_key_cursor(active_fp: Option<u32>, keys: &KeyStore) -> u8 {
 /// and by the M7 persistence layer to encode a band plan as a
 /// stable u8.
 pub fn band_plan_index(plan: BandPlan) -> usize {
-    BAND_PLANS
-        .iter()
-        .position(|p| *p == plan)
-        .unwrap_or(0)
+    BAND_PLANS.iter().position(|p| *p == plan).unwrap_or(0)
 }
 
 /// Which list a list-based screen is selecting from.  Public so
@@ -1316,13 +1286,9 @@ pub fn build_screen(
         ScreenId::Scan => build_scan(state, settings, out),
         ScreenId::ChannelSelect => build_channel_select(state, settings, out),
         ScreenId::BandPlanSelect => build_band_plan_select(state, settings, out),
-        ScreenId::PowerSelect => build_value_select(
-            state,
-            settings,
-            "TX Power",
-            ValueKind::TxPower,
-            out,
-        ),
+        ScreenId::PowerSelect => {
+            build_value_select(state, settings, "TX Power", ValueKind::TxPower, out)
+        }
         ScreenId::KeySelect => build_key_select(state, settings, keys, out),
         ScreenId::LinkStats => build_link_stats(settings, status, out),
         ScreenId::About => build_about(state, about, out),
@@ -1349,7 +1315,11 @@ fn build_idle(
     // see at a glance — dialing it down at FOH is common).
     match state.role {
         Role::Rx => {
-            let link_text = if status.up { s("Link: UP") } else { s("Link: LOST") };
+            let link_text = if status.up {
+                s("Link: UP")
+            } else {
+                s("Link: LOST")
+            };
             out.push(Widget::LinkStatus {
                 row: 1,
                 up: status.up,
@@ -1365,7 +1335,12 @@ fn build_idle(
     }
     // Plan name + channel label.
     let mut row2: String<24> = String::new();
-    let _ = write!(&mut row2, "{} {}", settings.band_plan.info().label, ch.label);
+    let _ = write!(
+        &mut row2,
+        "{} {}",
+        settings.band_plan.info().label,
+        ch.label
+    );
     out.push(Widget::Text { row: 2, text: row2 }).ok();
     // Frequency.
     let mut row3: String<24> = String::new();
@@ -1430,7 +1405,12 @@ fn build_scan(state: &UiState, settings: &Settings, out: &mut WidgetList) {
     let mut title: String<32> = String::new();
     // "Ch01 903.000  -85/-78"  — channel label + freq + cur/peak.
     // SCAN_NO_DATA prints as "--".
-    let _ = write!(&mut title, "{} {} ", cur_ch.label, cur_ch.format_frequency());
+    let _ = write!(
+        &mut title,
+        "{} {} ",
+        cur_ch.label,
+        cur_ch.format_frequency()
+    );
     if cur_rssi == SCAN_NO_DATA {
         let _ = write!(&mut title, "--");
     } else {
@@ -1452,11 +1432,7 @@ fn build_scan(state: &UiState, settings: &Settings, out: &mut WidgetList) {
     .ok();
 }
 
-fn build_channel_select(
-    state: &UiState,
-    settings: &Settings,
-    out: &mut WidgetList,
-) {
+fn build_channel_select(state: &UiState, settings: &Settings, out: &mut WidgetList) {
     let info = settings.band_plan.info();
     out.push(Widget::Title(s("Channel"))).ok();
     let total = info.channels.len() as u8;
@@ -1482,11 +1458,7 @@ fn build_channel_select(
     out.push(Widget::Footer(s("Cen=apply  L=back"))).ok();
 }
 
-fn build_band_plan_select(
-    state: &UiState,
-    settings: &Settings,
-    out: &mut WidgetList,
-) {
+fn build_band_plan_select(state: &UiState, settings: &Settings, out: &mut WidgetList) {
     out.push(Widget::Title(s("Band Plan"))).ok();
     let total = BAND_PLANS.len() as u8;
     let start = state.scroll_offset;
@@ -1509,12 +1481,7 @@ fn build_band_plan_select(
     out.push(Widget::Footer(s("Cen=apply  L=back"))).ok();
 }
 
-fn build_key_select(
-    state: &UiState,
-    settings: &Settings,
-    keys: &KeyStore,
-    out: &mut WidgetList,
-) {
+fn build_key_select(state: &UiState, settings: &Settings, keys: &KeyStore, out: &mut WidgetList) {
     out.push(Widget::Title(s("Key"))).ok();
 
     // Materialise the sorted key list once into a stack buffer.
@@ -1535,13 +1502,12 @@ fn build_key_select(
 
         let mut label: String<16> = String::new();
         let mut value: String<16> = String::new();
-        let is_active;
 
-        if list_idx == 0 {
+        let is_active = if list_idx == 0 {
             // "Open" pseudo-entry — no fingerprint.
             let _ = label.push_str("Open");
             let _ = value.push_str("------");
-            is_active = settings.active_key_fp.is_none();
+            settings.active_key_fp.is_none()
         } else {
             let entry = &sorted[(list_idx - 1) as usize];
             for c in entry.name.chars().take(MAX_KEY_NAME) {
@@ -1549,8 +1515,8 @@ fn build_key_select(
             }
             let fp_str = entry.format_fingerprint();
             let _ = value.push_str(fp_str.as_str());
-            is_active = settings.active_key_fp == Some(entry.fingerprint);
-        }
+            settings.active_key_fp == Some(entry.fingerprint)
+        };
 
         out.push(Widget::Selector {
             row,
@@ -1800,7 +1766,8 @@ mod tests {
     #[test]
     fn idle_to_main_menu_on_center() {
         let mut state = UiState::default();
-        let mut settings = Settings::default(); let keys = KeyStore::new();
+        let mut settings = Settings::default();
+        let keys = KeyStore::new();
         let cmd = state.handle_event(&mut settings, &keys, press(Direction::Center));
         assert_eq!(state.screen, ScreenId::Menu);
         assert_eq!(state.cursor, 0);
@@ -1926,7 +1893,8 @@ mod tests {
             nav_stack: Vec::new(),
             scan: ScanState::default(),
         };
-        let mut settings = Settings::default(); let keys = KeyStore::new();
+        let mut settings = Settings::default();
+        let keys = KeyStore::new();
         state.handle_event(&mut settings, &keys, long(Direction::Center));
         assert_eq!(state.screen, ScreenId::Idle);
     }
@@ -1944,7 +1912,8 @@ mod tests {
             nav_stack: Vec::new(),
             scan: ScanState::default(),
         };
-        let mut settings = Settings::default(); let keys = KeyStore::new();
+        let mut settings = Settings::default();
+        let keys = KeyStore::new();
         state.handle_event(&mut settings, &keys, press(Direction::Down));
         assert_eq!(state.cursor, 1);
         state.handle_event(&mut settings, &keys, press(Direction::Down));
@@ -1970,7 +1939,8 @@ mod tests {
             nav_stack: Vec::new(),
             scan: ScanState::default(),
         };
-        let mut settings = Settings::default(); let keys = KeyStore::new();
+        let mut settings = Settings::default();
+        let keys = KeyStore::new();
         state.handle_event(&mut settings, &keys, press(Direction::Center));
         assert_eq!(state.screen, ScreenId::ChannelSelect);
     }
@@ -1983,7 +1953,8 @@ mod tests {
             cursor: 0, // ChannelSelect (first menu item)
             ..UiState::default()
         };
-        let mut settings = Settings::default(); let keys = KeyStore::new();
+        let mut settings = Settings::default();
+        let keys = KeyStore::new();
         state.handle_event(&mut settings, &keys, press(Direction::Center));
         assert_eq!(state.screen, ScreenId::ChannelSelect);
         // Cursor pre-positioned on currently-selected channel (0).
@@ -2009,7 +1980,10 @@ mod tests {
         // stack records the parent frames; otherwise pop_nav
         // falls all the way back to Idle.
         let mut state = UiState::default();
-        let mut settings = Settings { channel: 0, ..Settings::default() };
+        let mut settings = Settings {
+            channel: 0,
+            ..Settings::default()
+        };
         let keys = KeyStore::new();
         state.handle_event(&mut settings, &keys, press(Direction::Center));
         state.handle_event(&mut settings, &keys, press(Direction::Center));
@@ -2028,7 +2002,8 @@ mod tests {
             cursor: 0,
             ..UiState::default()
         };
-        let mut settings = Settings::default(); let keys = KeyStore::new();
+        let mut settings = Settings::default();
+        let keys = KeyStore::new();
         let max = max_channel_index(settings.band_plan);
         for _ in 0..(max as u32 + 5) {
             state.handle_event(&mut settings, &keys, press(Direction::Down));
@@ -2047,7 +2022,7 @@ mod tests {
             ..UiState::default()
         };
         let mut settings = Settings {
-            band_plan: BandPlan::DenseLo,  // 87 channels
+            band_plan: BandPlan::DenseLo, // 87 channels
             channel: 7,
             ..Settings::default()
         };
@@ -2065,7 +2040,10 @@ mod tests {
         state.handle_event(&mut settings, &keys, press(Direction::Center));
         assert_eq!(state.screen, ScreenId::BandPlanSelect);
         // Find Shure plan (4 channels, index 2).
-        let shure_idx = BAND_PLANS.iter().position(|p| *p == BandPlan::Shure).unwrap() as u8;
+        let shure_idx = BAND_PLANS
+            .iter()
+            .position(|p| *p == BandPlan::Shure)
+            .unwrap() as u8;
         // Move cursor to Shure.
         let cur_plan_idx = band_plan_index(settings.band_plan) as u8;
         if cur_plan_idx < shure_idx {
@@ -2099,7 +2077,11 @@ mod tests {
             nav_stack: Vec::new(),
             scan: ScanState::default(),
         };
-        let mut settings = Settings { tx_power_dbm: 0, ..Settings::default() }; let keys = KeyStore::new();
+        let mut settings = Settings {
+            tx_power_dbm: 0,
+            ..Settings::default()
+        };
+        let keys = KeyStore::new();
         state.handle_event(&mut settings, &keys, press(Direction::Center));
         for _ in 0..15 {
             state.handle_event(&mut settings, &keys, press(Direction::Down));
@@ -2118,7 +2100,11 @@ mod tests {
             screen: ScreenId::PowerSelect,
             ..UiState::default()
         };
-        let mut settings = Settings { tx_power_dbm: 22, ..Settings::default() }; let keys = KeyStore::new();
+        let mut settings = Settings {
+            tx_power_dbm: 22,
+            ..Settings::default()
+        };
+        let keys = KeyStore::new();
         state.handle_event(&mut settings, &keys, press(Direction::Center));
         // Edit-mode now, edit_buffer = 22.  Don't change anything,
         // confirm.
@@ -2133,7 +2119,11 @@ mod tests {
             cursor: 2,
             ..UiState::default()
         };
-        let mut settings = Settings { channel: 2, ..Settings::default() }; let keys = KeyStore::new();
+        let mut settings = Settings {
+            channel: 2,
+            ..Settings::default()
+        };
+        let keys = KeyStore::new();
         // Cursor already on currently-active channel; Center applies
         // but value is unchanged.
         let cmd = state.handle_event(&mut settings, &keys, press(Direction::Center));
@@ -2195,7 +2185,12 @@ mod tests {
         assert_eq!(selected_count, 1);
         // Row of the selected widget should be 1 + cursor.
         for w in widgets.iter() {
-            if let Widget::Selector { row, selected: true, .. } = w {
+            if let Widget::Selector {
+                row,
+                selected: true,
+                ..
+            } = w
+            {
                 assert_eq!(*row, 1 + state.cursor);
             }
         }
@@ -2258,7 +2253,10 @@ mod tests {
         let keys = KeyStore::new();
         let scan_idx = enter_scan(&mut state, &mut settings, &keys);
         assert_eq!(state.cursor, 0);
-        assert_eq!(state.scan.channel_count, max_channel_index(BandPlan::Ism915) + 1);
+        assert_eq!(
+            state.scan.channel_count,
+            max_channel_index(BandPlan::Ism915) + 1
+        );
 
         let pass1: heapless::Vec<i16, MAX_SCAN_CHANNELS> =
             (0..state.scan.channel_count).map(|_| -110i16).collect();
@@ -2291,7 +2289,10 @@ mod tests {
     #[test]
     fn scan_down_cancels_without_applying() {
         let mut state = UiState::default();
-        let mut settings = Settings { channel: 2, ..Settings::default() };
+        let mut settings = Settings {
+            channel: 2,
+            ..Settings::default()
+        };
         let keys = KeyStore::new();
         enter_scan(&mut state, &mut settings, &keys);
         // Cursor on active channel (2).  Scroll right 3, then Down.

@@ -63,10 +63,8 @@ pub enum Error<SwitchErr, ResetErr> {
     Timeout,
 }
 
-pub type RadioError<Reset, Switch> = Error<
-    <Switch as RfSwitchControl>::Error,
-    <Reset as embedded_hal::digital::ErrorType>::Error,
->;
+pub type RadioError<Reset, Switch> =
+    Error<<Switch as RfSwitchControl>::Error, <Reset as embedded_hal::digital::ErrorType>::Error>;
 
 // ---------------------------------------------------------------------------
 // RF switch abstraction (board-specific)
@@ -174,20 +172,20 @@ impl<Txen: OutputPin, Rxen: OutputPin> RfSwitchControl for PinRfSwitch<Txen, Rxe
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum GfskBandwidth {
-    Bw4800   = 0x1F,
-    Bw5800   = 0x17,
-    Bw7300   = 0x0F,
-    Bw9700   = 0x1E,
-    Bw11700  = 0x16,
-    Bw14600  = 0x0E,
-    Bw19500  = 0x1D,
-    Bw23400  = 0x15,
-    Bw29300  = 0x0D,
-    Bw39000  = 0x1C,
-    Bw46900  = 0x14,
-    Bw58600  = 0x0C,
-    Bw78200  = 0x1B,
-    Bw93800  = 0x13,
+    Bw4800 = 0x1F,
+    Bw5800 = 0x17,
+    Bw7300 = 0x0F,
+    Bw9700 = 0x1E,
+    Bw11700 = 0x16,
+    Bw14600 = 0x0E,
+    Bw19500 = 0x1D,
+    Bw23400 = 0x15,
+    Bw29300 = 0x0D,
+    Bw39000 = 0x1C,
+    Bw46900 = 0x14,
+    Bw58600 = 0x0C,
+    Bw78200 = 0x1B,
+    Bw93800 = 0x13,
     Bw117300 = 0x0B,
     Bw156200 = 0x1A,
     Bw187200 = 0x12,
@@ -206,11 +204,11 @@ impl GfskBandwidth {
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum GfskPulseShape {
-    Off  = 0x00,
+    Off = 0x00,
     Bt03 = 0x08,
     Bt05 = 0x09,
     Bt07 = 0x0A,
-    Bt1  = 0x0B,
+    Bt1 = 0x0B,
 }
 
 // ---------------------------------------------------------------------------
@@ -497,11 +495,8 @@ where
         // SetDio3AsTcxoCtrl: voltage = V1_8 (0x02), delay = 320 (5 ms in
         // 15.625 µs steps) — Heltec T114 wires DIO3 to TCXO power.  MUST
         // come before any RF or calibration command.
-        self.cmd(
-            CMD_SET_DIO3_AS_TCXO_CTRL,
-            &[0x02, 0x00, 0x00, 0x01, 0x40],
-        )
-        .await?;
+        self.cmd(CMD_SET_DIO3_AS_TCXO_CTRL, &[0x02, 0x00, 0x00, 0x01, 0x40])
+            .await?;
 
         // SetRxTxFallbackMode(FS = 0x40): after TX_DONE / RX_DONE, chip
         // returns to FS (PLL locked) instead of STBY_RC.  Faster restart
@@ -526,10 +521,7 @@ where
         Ok(())
     }
 
-    pub async fn set_frequency(
-        &mut self,
-        hz: u32,
-    ) -> Result<(), RadioError<Reset, Switch>> {
+    pub async fn set_frequency(&mut self, hz: u32) -> Result<(), RadioError<Reset, Switch>> {
         let (f1, f2) = image_cal_band(hz);
         self.cmd(CMD_CALIBRATE_IMAGE, &[f1, f2]).await?;
         // Calibrate takes a few ms; wait_busy at start of next command will block.
@@ -583,10 +575,7 @@ where
         self.write_packet_params(payload_max_len).await
     }
 
-    pub async fn set_tx_power(
-        &mut self,
-        dbm: i8,
-    ) -> Result<(), RadioError<Reset, Switch>> {
+    pub async fn set_tx_power(&mut self, dbm: i8) -> Result<(), RadioError<Reset, Switch>> {
         let dbm = dbm.clamp(-9, 22);
         // PA preset matched to output level (datasheet table 13-21).
         let (duty_cycle, hp_max) = match dbm {
@@ -652,10 +641,7 @@ where
         self.cmd(CMD_SET_TX_CW, &[]).await
     }
 
-    pub async fn tx(
-        &mut self,
-        payload: &[u8],
-    ) -> Result<(), RadioError<Reset, Switch>> {
+    pub async fn tx(&mut self, payload: &[u8]) -> Result<(), RadioError<Reset, Switch>> {
         if payload.len() > self.payload_max_len as usize || payload.len() > 255 {
             return Err(Error::PayloadTooLarge);
         }
@@ -718,10 +704,7 @@ where
     /// Caller is responsible for `rx_start` once before the loop and
     /// (eventually) calling some other state-changing method (`tx`,
     /// `set_standby`, etc.) to leave RX.
-    pub async fn rx_recv(
-        &mut self,
-        buf: &mut [u8],
-    ) -> Result<RxPacket, RadioError<Reset, Switch>> {
+    pub async fn rx_recv(&mut self, buf: &mut [u8]) -> Result<RxPacket, RadioError<Reset, Switch>> {
         self.dio1.wait_for_high().await.map_err(|_| Error::Bus)?;
 
         let irq = self.get_irq_raw().await?;
@@ -733,7 +716,8 @@ where
         if rx_done {
             // GetRxBufferStatus: returns [status, payload_len, rx_start_buffer_pointer].
             let mut bs = [0u8; 2];
-            self.cmd_read(CMD_GET_RX_BUFFER_STATUS, &[], &mut bs).await?;
+            self.cmd_read(CMD_GET_RX_BUFFER_STATUS, &[], &mut bs)
+                .await?;
             let payload_len = bs[0] as usize;
             let rx_start = bs[1];
             if payload_len > buf.len() {
@@ -768,10 +752,7 @@ where
     /// applying it once at boot are good as long as the chip
     /// stays out of `SLEEP` mode (we never enter it; STBY_RC and
     /// STBY_XOSC preserve the register).
-    pub async fn set_rx_boosted(
-        &mut self,
-        boosted: bool,
-    ) -> Result<(), RadioError<Reset, Switch>> {
+    pub async fn set_rx_boosted(&mut self, boosted: bool) -> Result<(), RadioError<Reset, Switch>> {
         let val = if boosted {
             RX_GAIN_BOOSTED
         } else {
@@ -817,10 +798,7 @@ where
     /// Caller must ensure the chip is in `STDBY_RC` (or
     /// `STDBY_XOSC`) — otherwise the new frequency register write
     /// won't take effect.  Use [`Self::set_standby_rc`] first.
-    pub async fn set_frequency_fast(
-        &mut self,
-        hz: u32,
-    ) -> Result<(), RadioError<Reset, Switch>> {
+    pub async fn set_frequency_fast(&mut self, hz: u32) -> Result<(), RadioError<Reset, Switch>> {
         let reg = (((hz as u64) << 25) / 32_000_000) as u32;
         self.cmd(CMD_SET_RF_FREQ, &reg.to_be_bytes()).await
     }

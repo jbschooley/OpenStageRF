@@ -15,10 +15,9 @@
 use osrf_protocols_midi_v1 as proto;
 
 pub use proto::{
-    ChannelVoiceIter, ChannelVoiceParseError, EventType, Header, KeyFp,
-    PacketReplayWindow32, EventReplayWindow16, CheckOutcome, SysExFragmentParts,
-    SysExParseError, HEADER_LEN, KEY_FP_NONE, MAX_BODY_LEN, MAX_FRAG_DATA_BYTES,
-    SESSION_RESET_GAP, VER_V1,
+    ChannelVoiceIter, ChannelVoiceParseError, CheckOutcome, EventReplayWindow16, EventType, Header,
+    KeyFp, PacketReplayWindow32, SysExFragmentParts, SysExParseError, HEADER_LEN, KEY_FP_NONE,
+    MAX_BODY_LEN, MAX_FRAG_DATA_BYTES, SESSION_RESET_GAP, VER_V1,
 };
 
 pub mod midi_tx;
@@ -26,8 +25,8 @@ pub mod state;
 pub mod sysex;
 
 pub use midi_tx::{
-    MidiTxQueue, PoppedPacket, QueueKind, DEFAULT_CREDITS, QUEUE_CAPACITY,
-    REALTIME_PRIORITY, REGULAR_PRIORITY, SYSEX_PRIORITY,
+    MidiTxQueue, PoppedPacket, QueueKind, DEFAULT_CREDITS, QUEUE_CAPACITY, REALTIME_PRIORITY,
+    REGULAR_PRIORITY, SYSEX_PRIORITY,
 };
 pub use state::{ChannelNoteCounts, PressedNotes};
 pub use sysex::{
@@ -332,12 +331,8 @@ impl LinkReceiver {
                 on_event(RxEvent::Heartbeat(mask));
                 Ok(Ok(()))
             }
-            EventType::ChannelVoice => {
-                self.process_channel_voice(body, &mut on_event)
-            }
-            EventType::SysExFragment => {
-                self.process_sysex(body, now, &mut on_event)
-            }
+            EventType::ChannelVoice => self.process_channel_voice(body, &mut on_event),
+            EventType::SysExFragment => self.process_sysex(body, now, &mut on_event),
             EventType::Unknown(t) => Ok(Err(RxDrop::UnknownEventType(t))),
         }
     }
@@ -553,7 +548,9 @@ mod tests {
             off += midi.len();
         }
         let mut wire = [0u8; 64];
-        let n = s.encode(EventType::ChannelVoice, &body[..off], &mut wire).unwrap();
+        let n = s
+            .encode(EventType::ChannelVoice, &body[..off], &mut wire)
+            .unwrap();
         (wire, n)
     }
 
@@ -578,10 +575,7 @@ mod tests {
         let mut s = LinkSender::no_crypto(0);
         let mut r = LinkReceiver::no_crypto();
         // Same event_seq twice in one packet — second must be dropped.
-        let (wire, n) = encode_cv(&mut s, &[
-            (5, &[0x90, 60, 100]),
-            (5, &[0x90, 60, 100]),
-        ]);
+        let (wire, n) = encode_cv(&mut s, &[(5, &[0x90, 60, 100]), (5, &[0x90, 60, 100])]);
         let mut count = 0;
         r.process(&wire[..n], now(), |ev| {
             if matches!(ev, RxEvent::ChannelVoice(_)) {
@@ -699,7 +693,10 @@ mod tests {
         // Simulate watchdog firing during the TX outage.
         r.mark_link_down();
         let r1 = r.process(&buf[..n], now(), |_| {}).unwrap();
-        assert!(r1.is_ok(), "post-link-down packet should be accepted: {r1:?}");
+        assert!(
+            r1.is_ok(),
+            "post-link-down packet should be accepted: {r1:?}"
+        );
     }
 
     #[test]
@@ -738,7 +735,9 @@ mod tests {
             data: &[0xAA, 0xBB],
         };
         let body_n = proto::encode_sysex_fragment_body(&mut body, &parts0).unwrap();
-        let n = s.encode(EventType::SysExFragment, &body[..body_n], &mut wire).unwrap();
+        let n = s
+            .encode(EventType::SysExFragment, &body[..body_n], &mut wire)
+            .unwrap();
         let mut got: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
         r.process(&wire[..n], now(), |ev| {
             if let RxEvent::SysExComplete(b) = ev {
@@ -757,7 +756,9 @@ mod tests {
             data: &[0xCC, 0xDD],
         };
         let body_n = proto::encode_sysex_fragment_body(&mut body, &parts1).unwrap();
-        let n = s.encode(EventType::SysExFragment, &body[..body_n], &mut wire).unwrap();
+        let n = s
+            .encode(EventType::SysExFragment, &body[..body_n], &mut wire)
+            .unwrap();
         r.process(&wire[..n], now(), |ev| {
             if let RxEvent::SysExComplete(b) = ev {
                 got.push(b.to_vec());

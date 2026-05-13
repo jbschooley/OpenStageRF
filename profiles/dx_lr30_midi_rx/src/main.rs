@@ -10,8 +10,6 @@ use embassy_executor::Spawner;
 use osrf_board_dx_lr30 as board;
 use panic_probe as _;
 
-
-
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     info!("OpenStageRF MIDI bench RX — DX-LR30 starting");

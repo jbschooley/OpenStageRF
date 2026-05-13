@@ -152,7 +152,10 @@ fn main() -> ExitCode {
         // Library-style: build the named app crate with this profile as a feature.
         Some(app) => {
             let package = format!("osrf-app-{}", app.replace('_', "-"));
-            cmd.arg("-p").arg(&package).arg("--features").arg(profile_name);
+            cmd.arg("-p")
+                .arg(&package)
+                .arg("--features")
+                .arg(profile_name);
             if cargo_cmd == "run" {
                 cmd.arg("--bin").arg(format!("embassy_{board}"));
             }
@@ -173,8 +176,8 @@ fn main() -> ExitCode {
 fn read_osrf_metadata(path: &Path) -> Result<Osrf, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let parsed: CargoToml = toml::from_str(&text)
-        .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+    let parsed: CargoToml =
+        toml::from_str(&text).map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
     Ok(parsed.package.metadata.osrf)
 }
 

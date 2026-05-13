@@ -46,8 +46,7 @@ async fn main(spawner: Spawner) {
 
     let _r = board::resources();
     let sd = board::softdevice::enable();
-    spawner
-        .spawn(board::softdevice::run(sd).expect("alloc softdevice run task"));
+    spawner.spawn(board::softdevice::run(sd).expect("alloc softdevice run task"));
 
     // Small settling delay so the SD's first event loop tick has
     // happened before we take Flash.  Empirically not strictly
@@ -77,7 +76,10 @@ async fn main(spawner: Spawner) {
     {
         Ok(v) => v,
         Err(e) => {
-            defmt::error!("storage_smoke: fetch_item failed: {:?}", defmt::Debug2Format(&e));
+            defmt::error!(
+                "storage_smoke: fetch_item failed: {:?}",
+                defmt::Debug2Format(&e)
+            );
             None
         }
     };
@@ -119,11 +121,13 @@ async fn main(spawner: Spawner) {
         Ok(Some(v)) if v == new_count => {
             defmt::info!("storage_smoke: readback confirms new value = {}", v)
         }
-        Ok(v) => defmt::warn!(
-            "storage_smoke: readback mismatch — expected {}, got {:?}",
-            new_count,
-            v
-        ),
+        Ok(v) => {
+            defmt::warn!(
+                "storage_smoke: readback mismatch — expected {}, got {:?}",
+                new_count,
+                v
+            )
+        }
         Err(e) => defmt::error!(
             "storage_smoke: readback failed: {:?}",
             defmt::Debug2Format(&e)
@@ -136,10 +140,6 @@ async fn main(spawner: Spawner) {
     loop {
         Timer::after_secs(5).await;
         tick = tick.wrapping_add(1);
-        defmt::info!(
-            "storage_smoke: alive (boot {} tick {})",
-            new_count,
-            tick
-        );
+        defmt::info!("storage_smoke: alive (boot {} tick {})", new_count, tick);
     }
 }

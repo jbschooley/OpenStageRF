@@ -512,7 +512,10 @@ mod tests {
 
     /// Helper: drain all eligible packets at `now`, returning a Vec of
     /// (kind, body_bytes).
-    fn drain_at(q: &mut MidiTxQueue, now: Instant) -> std::vec::Vec<(QueueKind, std::vec::Vec<u8>)> {
+    fn drain_at(
+        q: &mut MidiTxQueue,
+        now: Instant,
+    ) -> std::vec::Vec<(QueueKind, std::vec::Vec<u8>)> {
         let mut out = std::vec::Vec::new();
         let mut buf = [0u8; 64];
         while let Some(pkt) = q.pop_packet(now, &mut buf) {
@@ -645,7 +648,7 @@ mod tests {
         let mut buf = [0u8; 64];
         let _ = q.pop_packet(T0, &mut buf).unwrap(); // C copy 1, C now at K=2
         q.push_channel_voice(&[0x90, 64, 100], T0); // E, seq=N+1, behind C
-        // Next pop batches both C(K=2) and E(K=3) since same priority+kind.
+                                                    // Next pop batches both C(K=2) and E(K=3) since same priority+kind.
         let pkt = q.pop_packet(T0, &mut buf).unwrap();
         let events = decode_cv(&buf[..pkt.body_len]);
         assert_eq!(events.len(), 2);
@@ -837,7 +840,9 @@ mod tests {
         // Drain first round (one fragment per packet).
         let mut seen_idxs = std::vec::Vec::new();
         loop {
-            let Some(pkt) = q.pop_packet(T0, &mut buf) else { break };
+            let Some(pkt) = q.pop_packet(T0, &mut buf) else {
+                break;
+            };
             assert_eq!(pkt.kind, QueueKind::SysExFragment);
             let parts = parse_sysex_fragment(&buf[..pkt.body_len]).unwrap();
             assert_eq!(parts.sysex_id, id);

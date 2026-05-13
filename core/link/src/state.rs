@@ -307,7 +307,7 @@ mod tests {
     fn missing_clear_detects_stuck_channel() {
         let mut s = PressedNotes::new();
         s.observe(&[0x90, 60, 100]); // ch 0 has note 60
-        // TX claims all silent (mask = 0).
+                                     // TX claims all silent (mask = 0).
         let needed = s.missing_clear(0x0000);
         assert_eq!(needed, 0x0001, "ch 0 should need clearing");
     }
@@ -316,7 +316,7 @@ mod tests {
     fn missing_clear_quiet_when_in_sync() {
         let mut s = PressedNotes::new();
         s.observe(&[0x90, 60, 100]); // ch 0 has note
-        // TX agrees ch 0 has notes.
+                                     // TX agrees ch 0 has notes.
         let needed = s.missing_clear(0x0001);
         assert_eq!(needed, 0, "no recovery needed when TX/RX agree");
     }

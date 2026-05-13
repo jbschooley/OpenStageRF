@@ -128,7 +128,9 @@ pub struct LinkConfigSignal {
 
 impl LinkConfigSignal {
     pub const fn new() -> Self {
-        Self { inner: Signal::new() }
+        Self {
+            inner: Signal::new(),
+        }
     }
     /// Publish a new config.  Latest-wins: a previously signalled
     /// (but not yet consumed) config is dropped.
@@ -736,7 +738,7 @@ async fn apply_tx_reconfig<Spi, Busy, Dio1, Reset, Switch>(
     Reset: embedded_hal::digital::OutputPin,
     Switch: RfSwitchControl,
 {
-    if let Err(_) = configure_radio(radio, new_cfg).await {
+    if configure_radio(radio, new_cfg).await.is_err() {
         defmt::error!("link TX: live reconfigure failed; keeping previous config");
         return;
     }
@@ -775,6 +777,7 @@ async fn apply_tx_reconfig<Spi, Busy, Dio1, Reset, Switch>(
 /// resets on the next packet.  Source events that arrive during the
 /// scan stay in the UART's hardware buffer and drain naturally
 /// once TX resumes (subject to the buffer's depth).
+#[allow(clippy::too_many_arguments)] // Top-level orchestrator: HAL handles + channels are inherent.
 pub async fn run_tx<Spi, Busy, Dio1, Reset, Switch, Led, Source>(
     radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
     led: &mut Led,
@@ -796,7 +799,7 @@ where
     Source: MidiSource,
 {
     let mut current = *config;
-    if let Err(_) = configure_radio(radio, &current).await {
+    if configure_radio(radio, &current).await.is_err() {
         defmt::error!("link TX: radio configure failed; halting");
         loop {
             Timer::after_millis(1000).await;
@@ -836,10 +839,10 @@ where
 
         // Reconcile scan mode.  Single point where the chip transitions
         // between TX/heartbeat duty and channel-sweep duty.
-        let scan_wanted = scan.map_or(false, |s| s.enabled());
+        let scan_wanted = scan.is_some_and(|s| s.enabled());
         match (scanning, scan_wanted) {
             (false, true) => {
-                if let Err(_) = radio.set_standby_rc().await {
+                if radio.set_standby_rc().await.is_err() {
                     defmt::error!("link TX: set_standby_rc failed entering scan");
                 }
                 // Scan reuses the operating IF bandwidth so the
@@ -873,7 +876,10 @@ where
                 // heartbeat on top of any queued events.
                 hb = HeartbeatTimer::new(Duration::from_millis(current.heartbeat_ms));
                 scanning = false;
-                defmt::info!("link TX: scan mode OFF, resuming on {} Hz", current.frequency_hz);
+                defmt::info!(
+                    "link TX: scan mode OFF, resuming on {} Hz",
+                    current.frequency_hz
+                );
             }
             _ => {}
         }
@@ -909,12 +915,7 @@ where
             // out of the source also stops its hardware UART RX
             // buffer from filling and back-pressuring the
             // FeatherWing on long sweeps.
-            loop {
-                match source.try_next(&mut midi_buf) {
-                    Ok(Some(_)) => {}
-                    _ => break,
-                }
-            }
+            while let Ok(Some(_)) = source.try_next(&mut midi_buf) {}
 
             let s = scan.unwrap();
             let count = s.channel_count();
@@ -928,7 +929,7 @@ where
                 s.write_rssi(i, rssi);
             }
             scan_idx = scan_idx.wrapping_add(1);
-            if scan_idx % count == 0 {
+            if scan_idx.is_multiple_of(count) {
                 s.note_pass_complete();
             }
             continue;
@@ -972,7 +973,7 @@ where
             };
             match sender.encode(event_type, &body_buf[..body_len], &mut wire_buf) {
                 Ok(wire_n) => {
-                    if let Err(_) = radio.tx(&wire_buf[..wire_n]).await {
+                    if radio.tx(&wire_buf[..wire_n]).await.is_err() {
                         defmt::error!("link TX: radio.tx() failed");
                     }
                 }
@@ -1043,7 +1044,7 @@ where
         let mask_body = tx_state.active_mask().to_be_bytes();
         match sender.encode(EventType::Heartbeat, &mask_body, &mut wire_buf) {
             Ok(wire_n) => {
-                if let Err(_) = radio.tx(&wire_buf[..wire_n]).await {
+                if radio.tx(&wire_buf[..wire_n]).await.is_err() {
                     defmt::error!("link TX: radio.tx() failed");
                 }
             }
@@ -1053,7 +1054,7 @@ where
         let _ = led.toggle();
         hb_count = hb_count.wrapping_add(1);
 
-        if (tx_count.wrapping_add(hb_count)) % 500 == 0 {
+        if tx_count.wrapping_add(hb_count).is_multiple_of(500) {
             defmt::info!(
                 "link TX: midi_events={} heartbeats={} queue_depth={} overflows={}",
                 tx_count,
@@ -1116,6 +1117,7 @@ const SYSEX_EVENTS_CAPACITY: usize = osrf_link::MAX_CONCURRENT_SYSEX;
 ///
 /// On hard failure the runtime logs and keeps listening on the
 /// previous config — same recoverability stance as TX.
+#[allow(clippy::too_many_arguments)] // Mutable cursors threaded through for reset on reconfig.
 async fn apply_rx_reconfig<Spi, Busy, Dio1, Reset, Switch>(
     radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
     current: &mut LinkConfig,
@@ -1132,14 +1134,14 @@ async fn apply_rx_reconfig<Spi, Busy, Dio1, Reset, Switch>(
     Reset: embedded_hal::digital::OutputPin,
     Switch: RfSwitchControl,
 {
-    if let Err(_) = configure_radio(radio, new_cfg).await {
+    if configure_radio(radio, new_cfg).await.is_err() {
         defmt::error!("link RX: live reconfigure failed; keeping previous config");
         // Try to resume RX on the *previous* config so we don't
         // get stuck in standby after a partially-applied set_*.
         let _ = radio.rx_start().await;
         return;
     }
-    if let Err(_) = radio.rx_start().await {
+    if radio.rx_start().await.is_err() {
         defmt::error!("link RX: rx_start failed after reconfigure");
         return;
     }
@@ -1174,6 +1176,7 @@ async fn apply_rx_reconfig<Spi, Busy, Dio1, Reset, Switch>(
 /// puts the chip in standby and walks its frequency list, sampling
 /// `get_rssi_inst` per channel and writing back results.  `None`
 /// (or "not enabled") keeps the chip in continuous RX as before.
+#[allow(clippy::too_many_arguments)] // Top-level orchestrator: HAL handles + channels are inherent.
 pub async fn run_rx<Spi, Busy, Dio1, Reset, Switch, Led, Sink>(
     radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
     led: &mut Led,
@@ -1194,13 +1197,13 @@ where
     Sink: MidiSink,
 {
     let mut current = *config;
-    if let Err(_) = configure_radio(radio, &current).await {
+    if configure_radio(radio, &current).await.is_err() {
         defmt::error!("link RX: radio configure failed; halting");
         loop {
             Timer::after_millis(1000).await;
         }
     }
-    if let Err(_) = radio.rx_start().await {
+    if radio.rx_start().await.is_err() {
         defmt::error!("link RX: rx_start failed; halting");
         loop {
             Timer::after_millis(1000).await;
@@ -1324,7 +1327,7 @@ where
         // chip between "continuous RX on operating channel" and
         // "standby + per-channel sweep" — keeps the transition logic in
         // one place rather than scattered across event arms.
-        let scan_wanted = scan.map_or(false, |s| s.enabled());
+        let scan_wanted = scan.is_some_and(|s| s.enabled());
         match (scanning, scan_wanted) {
             (false, true) => {
                 // Normal → Scanning: leave continuous RX, drop into
@@ -1332,7 +1335,7 @@ where
                 // take effect.  Walk-back of `link_up`/`receiver` is
                 // deferred until we exit (the receiver may stay up if
                 // the user pops back to the same channel quickly).
-                if let Err(_) = radio.set_standby_rc().await {
+                if radio.set_standby_rc().await.is_err() {
                     defmt::error!("link RX: set_standby_rc failed entering scan");
                 }
                 // Scan keeps the operating IF bandwidth — we want
@@ -1361,7 +1364,10 @@ where
                 divergence_since = [None; 16];
                 wd.kick();
                 scanning = false;
-                defmt::info!("link RX: scan mode OFF, resuming on {} Hz", current.frequency_hz);
+                defmt::info!(
+                    "link RX: scan mode OFF, resuming on {} Hz",
+                    current.frequency_hz
+                );
             }
             _ => {}
         }
@@ -1376,7 +1382,9 @@ where
             if let Some(new_cfg) = sig.try_take() {
                 if scanning {
                     current = new_cfg;
-                    defmt::info!("link RX: deferred reconfigure (scanning); will apply on scan exit");
+                    defmt::info!(
+                        "link RX: deferred reconfigure (scanning); will apply on scan exit"
+                    );
                 } else {
                     apply_rx_reconfig(
                         radio,
@@ -1412,7 +1420,7 @@ where
                 s.write_rssi(i, rssi);
             }
             scan_idx = scan_idx.wrapping_add(1);
-            if scan_idx % count == 0 {
+            if scan_idx.is_multiple_of(count) {
                 s.note_pass_complete();
             }
             // No `stats` push during scan — RX-side counters don't
@@ -1524,8 +1532,7 @@ where
                                 }
                                 // Divergence present.  Start the timer
                                 // if this is the first observation.
-                                let started = divergence_since[ch as usize]
-                                    .get_or_insert(now);
+                                let started = divergence_since[ch as usize].get_or_insert(now);
                                 if now.duration_since(*started)
                                     < Duration::from_millis(STUCK_NOTE_MIN_DIVERGENCE_MS)
                                 {
@@ -1550,11 +1557,7 @@ where
                                 for note in 0..128u8 {
                                     if pressed & (1u128 << note) != 0 {
                                         let mut noteoff: MidiBuf = heapless::Vec::new();
-                                        let _ = noteoff.extend_from_slice(&[
-                                            0x80 | ch,
-                                            note,
-                                            0,
-                                        ]);
+                                        let _ = noteoff.extend_from_slice(&[0x80 | ch, note, 0]);
                                         if midi_events.push(noteoff).is_err() {
                                             overflowed = true;
                                             break;
@@ -1575,8 +1578,7 @@ where
                                 } else {
                                     rx_state.clear_channel(ch);
                                     divergence_since[ch as usize] = None;
-                                    stuck_recoveries =
-                                        stuck_recoveries.wrapping_add(1);
+                                    stuck_recoveries = stuck_recoveries.wrapping_add(1);
                                     defmt::warn!(
                                         "RX stuck-note recovery: ch {} → {} selective NoteOff(s) (total recoveries={})",
                                         ch,
@@ -1612,7 +1614,11 @@ where
                     }
                     Err(_) => {
                         dropped = dropped.wrapping_add(1);
-                        defmt::warn!("RX decode error (accepted={} dropped={})", accepted, dropped);
+                        defmt::warn!(
+                            "RX decode error (accepted={} dropped={})",
+                            accepted,
+                            dropped
+                        );
                     }
                 }
 
@@ -1623,13 +1629,13 @@ where
                 // between the two vecs is never observable.
                 for bytes in midi_events.iter() {
                     defmt::info!("RX MIDI: {=[u8]:#x}", bytes.as_slice());
-                    if let Err(_) = sink.write_message(bytes).await {
+                    if sink.write_message(bytes).await.is_err() {
                         defmt::error!("sink write_message failed");
                     }
                 }
                 for bytes in sysex_events.iter() {
                     defmt::info!("RX SysEx: {} bytes", bytes.len());
-                    if let Err(_) = sink.write_message(bytes).await {
+                    if sink.write_message(bytes).await.is_err() {
                         defmt::error!("sink SysEx write failed");
                     }
                 }
@@ -1641,7 +1647,7 @@ where
                 // `recent_loss_pct` doesn't double-count it as
                 // "lost without trace."
                 crc_mismatch = crc_mismatch.wrapping_add(1);
-                if crc_mismatch % 50 == 0 {
+                if crc_mismatch.is_multiple_of(50) {
                     defmt::warn!("RX: CRC mismatch count = {}", crc_mismatch);
                 }
             }
@@ -1653,16 +1659,13 @@ where
                 match e {
                     RadioErrorKind::CrcMismatch => {
                         err_crc_mismatch = err_crc_mismatch.wrapping_add(1);
-                        if err_crc_mismatch % 50 == 0 {
-                            defmt::warn!(
-                                "RX: early-CRC-fail count = {}",
-                                err_crc_mismatch
-                            );
+                        if err_crc_mismatch.is_multiple_of(50) {
+                            defmt::warn!("RX: early-CRC-fail count = {}", err_crc_mismatch);
                         }
                     }
                     RadioErrorKind::UnexpectedIrq(irq) => {
                         err_unexpected_irq = err_unexpected_irq.wrapping_add(1);
-                        if err_unexpected_irq <= 5 || err_unexpected_irq % 20 == 0 {
+                        if err_unexpected_irq <= 5 || err_unexpected_irq.is_multiple_of(20) {
                             defmt::warn!(
                                 "RX: unexpected IRQ {=u16:#06x} (count {})",
                                 irq,
@@ -1699,7 +1702,7 @@ where
                         "link RX: LINK LOST (no packet for {}ms) → all-notes-off",
                         current.watchdog_ms
                     );
-                    if let Err(_) = sink.all_notes_off().await {
+                    if sink.all_notes_off().await.is_err() {
                         defmt::error!("sink all_notes_off failed");
                     }
                     receiver.mark_link_down();
@@ -1761,11 +1764,11 @@ where
             let (tx_count, loss_x10) = match (prev_packet_seq, cur_packet_seq) {
                 (Some(prev), Some(cur)) => {
                     let n = cur.saturating_sub(prev);
-                    let l = if n > 0 {
-                        n.saturating_sub(d_accepted) * 1000 / n
-                    } else {
-                        0
-                    };
+                    let l = n
+                        .saturating_sub(d_accepted)
+                        .saturating_mul(1000)
+                        .checked_div(n)
+                        .unwrap_or(0);
                     (n, l)
                 }
                 // First-ever observation, or session-reset between

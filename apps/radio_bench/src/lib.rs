@@ -15,9 +15,7 @@
 use embassy_time::Timer;
 use embedded_hal::digital::StatefulOutputPin;
 use embedded_hal_async::{digital::Wait, spi::SpiDevice};
-use osrf_radio_sx126x::{
-    GfskBandwidth, GfskPulseShape, RadioError, RfSwitchControl, Sx1262Radio,
-};
+use osrf_radio_sx126x::{GfskBandwidth, GfskPulseShape, RadioError, RfSwitchControl, Sx1262Radio};
 
 const RF_FREQUENCY_HZ: u32 = 915_000_000;
 const RF_BITRATE_BPS: u32 = 300_000;

@@ -77,20 +77,12 @@ where
     let msg_len = message.len().min(PANIC_MSG_LEN);
     record[4..4 + msg_len].copy_from_slice(&message[..msg_len]);
 
-    if let Err(_e) = sequential_storage::queue::push(
-        flash,
-        range,
-        &mut cache,
-        &record[..4 + msg_len],
-        true,
-    )
-    .await
+    if let Err(_e) =
+        sequential_storage::queue::push(flash, range, &mut cache, &record[..4 + msg_len], true)
+            .await
     {
         #[cfg(feature = "defmt")]
-        defmt::warn!(
-            "panic-log: push failed: {:?}",
-            defmt::Debug2Format(&_e)
-        );
+        defmt::warn!("panic-log: push failed: {:?}", defmt::Debug2Format(&_e));
     }
 }
 
@@ -116,10 +108,7 @@ where
         Ok(i) => i,
         Err(_e) => {
             #[cfg(feature = "defmt")]
-            defmt::warn!(
-                "panic-log: iter failed: {:?}",
-                defmt::Debug2Format(&_e)
-            );
+            defmt::warn!("panic-log: iter failed: {:?}", defmt::Debug2Format(&_e));
             return latest;
         }
     };

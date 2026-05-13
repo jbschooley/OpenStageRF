@@ -28,7 +28,7 @@ pub fn hsi_64mhz_config() -> Config {
         mul: PllMul::MUL16,      // 4 × 16 = 64 MHz
     });
     config.rcc.sys = Sysclk::PLL1_P;
-    config.rcc.ahb_pre = AHBPrescaler::DIV1;  // HCLK  = 64 MHz
+    config.rcc.ahb_pre = AHBPrescaler::DIV1; // HCLK  = 64 MHz
     config.rcc.apb1_pre = APBPrescaler::DIV2; // PCLK1 = 32 MHz (max 36 MHz)
     config.rcc.apb2_pre = APBPrescaler::DIV1; // PCLK2 = 64 MHz
     config

@@ -317,7 +317,14 @@ fn scale_event(step: usize) -> Option<(SynthEvent, u32)> {
         NOTES_UP[NOTES_UP.len() - 1 - (pair - NOTES_UP.len())]
     };
     if step % 2 == 0 {
-        Some((SynthEvent::NoteOn { ch: 0, note, vel: 96 }, 180))
+        Some((
+            SynthEvent::NoteOn {
+                ch: 0,
+                note,
+                vel: 96,
+            },
+            180,
+        ))
     } else {
         Some((SynthEvent::NoteOff { ch: 0, note }, 30))
     }
@@ -342,10 +349,10 @@ fn chord_progression_event(step: usize) -> Option<(SynthEvent, u32)> {
     let (note, is_on, last_in_phase) = match local {
         0 => (chord[0], true, false),
         1 => (chord[1], true, false),
-        2 => (chord[2], true, true),    // last NoteOn — long hold after
+        2 => (chord[2], true, true), // last NoteOn — long hold after
         3 => (chord[0], false, false),
         4 => (chord[1], false, false),
-        5 => (chord[2], false, true),   // last NoteOff — gap before next chord
+        5 => (chord[2], false, true), // last NoteOff — gap before next chord
         _ => unreachable!(),
     };
     let delay_ms = if is_on && last_in_phase {
@@ -353,10 +360,17 @@ fn chord_progression_event(step: usize) -> Option<(SynthEvent, u32)> {
     } else if !is_on && last_in_phase {
         200 // gap between chords
     } else {
-        3   // tight inter-note (within phase)
+        3 // tight inter-note (within phase)
     };
     if is_on {
-        Some((SynthEvent::NoteOn { ch: 0, note, vel: 100 }, delay_ms))
+        Some((
+            SynthEvent::NoteOn {
+                ch: 0,
+                note,
+                vel: 100,
+            },
+            delay_ms,
+        ))
     } else {
         Some((SynthEvent::NoteOff { ch: 0, note }, delay_ms))
     }
@@ -385,7 +399,14 @@ fn glissando_event(step: usize) -> Option<(SynthEvent, u32)> {
         84 - pair as u8
     };
     if is_on {
-        Some((SynthEvent::NoteOn { ch: 0, note, vel: 80 }, 25))
+        Some((
+            SynthEvent::NoteOn {
+                ch: 0,
+                note,
+                vel: 80,
+            },
+            25,
+        ))
     } else {
         Some((SynthEvent::NoteOff { ch: 0, note }, 5))
     }
@@ -400,13 +421,26 @@ fn key_smash_event(step: usize) -> Option<(SynthEvent, u32)> {
     if step < n {
         // Press: each NoteOn is 1 ms apart, last one holds 500 ms.
         let delay = if step == n - 1 { 500 } else { 1 };
-        Some((SynthEvent::NoteOn { ch: 0, note: NOTES[step], vel: 110 }, delay))
+        Some((
+            SynthEvent::NoteOn {
+                ch: 0,
+                note: NOTES[step],
+                vel: 110,
+            },
+            delay,
+        ))
     } else if step < 2 * n {
         // Release: each NoteOff is 1 ms apart, last one is followed by
         // a 200 ms gap.
         let idx = step - n;
         let delay = if idx == n - 1 { 200 } else { 1 };
-        Some((SynthEvent::NoteOff { ch: 0, note: NOTES[idx] }, delay))
+        Some((
+            SynthEvent::NoteOff {
+                ch: 0,
+                note: NOTES[idx],
+            },
+            delay,
+        ))
     } else {
         None
     }
@@ -432,9 +466,30 @@ fn quick_stab_event(step: usize) -> Option<(SynthEvent, u32)> {
     let third: u8 = root + 4;
     let fifth: u8 = root + 7;
     match local {
-        0 => Some((SynthEvent::NoteOn { ch: 0, note: root, vel: 100 }, 1)),
-        1 => Some((SynthEvent::NoteOn { ch: 0, note: third, vel: 100 }, 1)),
-        2 => Some((SynthEvent::NoteOn { ch: 0, note: fifth, vel: 100 }, 50)),
+        0 => Some((
+            SynthEvent::NoteOn {
+                ch: 0,
+                note: root,
+                vel: 100,
+            },
+            1,
+        )),
+        1 => Some((
+            SynthEvent::NoteOn {
+                ch: 0,
+                note: third,
+                vel: 100,
+            },
+            1,
+        )),
+        2 => Some((
+            SynthEvent::NoteOn {
+                ch: 0,
+                note: fifth,
+                vel: 100,
+            },
+            50,
+        )),
         3 => Some((SynthEvent::NoteOff { ch: 0, note: root }, 1)),
         4 => Some((SynthEvent::NoteOff { ch: 0, note: third }, 1)),
         5 => Some((SynthEvent::NoteOff { ch: 0, note: fifth }, 200)),
@@ -446,8 +501,8 @@ fn quick_stab_event(step: usize) -> Option<(SynthEvent, u32)> {
 /// = ~200 events/sec.  Tests the "PB on same channel cancels prior PB"
 /// dedup path under high event rate (queue depth stays ≈ 1).
 fn pitch_wheel_event(step: usize) -> Option<(SynthEvent, u32)> {
-    const STEPS_UP: usize = 80;     // centre (8192) → max (16383)
-    const STEPS_DOWN: usize = 160;  // max → 0
+    const STEPS_UP: usize = 80; // centre (8192) → max (16383)
+    const STEPS_DOWN: usize = 160; // max → 0
     const STEPS_RECOVER: usize = 80; // 0 → centre
     const TOTAL: usize = STEPS_UP + STEPS_DOWN + STEPS_RECOVER;
     if step >= TOTAL {
@@ -483,7 +538,14 @@ fn mod_wheel_event(step: usize) -> Option<(SynthEvent, u32)> {
         let s = step - HALF;
         127u8.saturating_sub((s as u32 * 127 / HALF as u32) as u8)
     };
-    Some((SynthEvent::ControlChange { ch: 0, ctrl: 1, value }, 5))
+    Some((
+        SynthEvent::ControlChange {
+            ch: 0,
+            ctrl: 1,
+            value,
+        },
+        5,
+    ))
 }
 
 /// Concurrent mixer automation: tweens CC#7 (volume) and CC#10 (pan) on
@@ -521,17 +583,45 @@ fn mixer_automation_event(step: usize) -> Option<(SynthEvent, u32)> {
     let last_in_frame = local == EVENTS_PER_FRAME - 1;
     let delay = if last_in_frame { 180 } else { 5 };
     let event = match local {
-        0 => SynthEvent::ControlChange { ch: 0, ctrl: 7, value: vol(0) },
-        1 => SynthEvent::ControlChange { ch: 1, ctrl: 7, value: vol(1) },
-        2 => SynthEvent::ControlChange { ch: 2, ctrl: 7, value: vol(2) },
-        3 => SynthEvent::ControlChange { ch: 0, ctrl: 10, value: pan(0) },
-        4 => SynthEvent::ControlChange { ch: 1, ctrl: 10, value: pan(1) },
-        5 => SynthEvent::ControlChange { ch: 2, ctrl: 10, value: pan(2) },
+        0 => SynthEvent::ControlChange {
+            ch: 0,
+            ctrl: 7,
+            value: vol(0),
+        },
+        1 => SynthEvent::ControlChange {
+            ch: 1,
+            ctrl: 7,
+            value: vol(1),
+        },
+        2 => SynthEvent::ControlChange {
+            ch: 2,
+            ctrl: 7,
+            value: vol(2),
+        },
+        3 => SynthEvent::ControlChange {
+            ch: 0,
+            ctrl: 10,
+            value: pan(0),
+        },
+        4 => SynthEvent::ControlChange {
+            ch: 1,
+            ctrl: 10,
+            value: pan(1),
+        },
+        5 => SynthEvent::ControlChange {
+            ch: 2,
+            ctrl: 10,
+            value: pan(2),
+        },
         // Sustain pedal on ch 0: press for the first half, release the
         // second.  Tests that CC#64 latched-state survives the link.
         6 => {
             let value: u8 = if frame < FRAMES / 2 { 127 } else { 0 };
-            SynthEvent::ControlChange { ch: 0, ctrl: 64, value }
+            SynthEvent::ControlChange {
+                ch: 0,
+                ctrl: 64,
+                value,
+            }
         }
         _ => unreachable!(),
     };
@@ -561,8 +651,22 @@ fn patch_walk_event(step: usize) -> Option<(SynthEvent, u32)> {
     let (ch, msb, lsb, program, note) = PATCHES[step / STEPS_PER_PATCH];
     let local = step % STEPS_PER_PATCH;
     match local {
-        0 => Some((SynthEvent::ControlChange { ch, ctrl: 0, value: msb }, 3)),
-        1 => Some((SynthEvent::ControlChange { ch, ctrl: 32, value: lsb }, 3)),
+        0 => Some((
+            SynthEvent::ControlChange {
+                ch,
+                ctrl: 0,
+                value: msb,
+            },
+            3,
+        )),
+        1 => Some((
+            SynthEvent::ControlChange {
+                ch,
+                ctrl: 32,
+                value: lsb,
+            },
+            3,
+        )),
         2 => Some((SynthEvent::ProgramChange { ch, program }, 50)),
         3 => Some((SynthEvent::NoteOn { ch, note, vel: 100 }, 250)),
         // Hold each patch's test note for 250 ms; gap 250 ms before
@@ -597,7 +701,11 @@ fn aftertouch_sweep_event(step: usize) -> Option<(SynthEvent, u32)> {
         let last = step == PRESS - 1;
         let delay = if last { 50 } else { 3 };
         return Some((
-            SynthEvent::NoteOn { ch: 0, note: CHORD[step], vel: 100 },
+            SynthEvent::NoteOn {
+                ch: 0,
+                note: CHORD[step],
+                vel: 100,
+            },
             delay,
         ));
     }
@@ -632,7 +740,11 @@ fn aftertouch_sweep_event(step: usize) -> Option<(SynthEvent, u32)> {
         let last_in_note = local == PAT_STEPS_PER_NOTE - 1;
         let delay = if last_in_note { 30 } else { 8 };
         return Some((
-            SynthEvent::PolyAftertouch { ch: 0, note: CHORD[note_idx], value },
+            SynthEvent::PolyAftertouch {
+                ch: 0,
+                note: CHORD[note_idx],
+                value,
+            },
             delay,
         ));
     }
@@ -642,7 +754,10 @@ fn aftertouch_sweep_event(step: usize) -> Option<(SynthEvent, u32)> {
     let last = after_pat == RELEASE - 1;
     let delay = if last { 200 } else { 3 };
     Some((
-        SynthEvent::NoteOff { ch: 0, note: CHORD[after_pat] },
+        SynthEvent::NoteOff {
+            ch: 0,
+            note: CHORD[after_pat],
+        },
         delay,
     ))
 }
