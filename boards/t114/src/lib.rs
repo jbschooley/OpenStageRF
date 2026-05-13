@@ -508,8 +508,14 @@ fn build_resources(
     // `init()` can apply the rail + the post-rail-up settling delay
     // before any SPI traffic, matching what Meshtastic / MeshCore do.
     let vtft = Output::new(p.P0_03, Level::High, OutputDrive::Standard);
-    let display =
-        display::St7789Display::new(display_spi, display_cs, display_dc, display_reset, vtft);
+    let display = display::St7789Display::new(
+        display_spi,
+        display_cs,
+        display_dc,
+        display_reset,
+        vtft,
+        embassy_time::Delay,
+    );
     // VEXT (P0_21) — peripheral / GPS rail, active HIGH.  *Not* the
     // TFT power gate (a previous comment claimed it was; that was
     // wrong — verified against Meshtastic + MeshCore variant.h on

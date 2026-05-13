@@ -1293,10 +1293,10 @@ dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-async",
  "embedded-hal-bus",
- "heapless 0.9.2",
  "log",
  "nrf-softdevice",
  "nrf-softdevice-s140",
+ "osrf-driver-display-st7789",
  "osrf-panic-log",
  "osrf-radio-sx126x",
  "panic-probe",
@@ -1307,6 +1307,17 @@ name = "osrf-crypto"
 version = "0.1.0"
 dependencies = [
  "defmt 1.0.1",
+ "heapless 0.9.2",
+]
+
+[[package]]
+name = "osrf-driver-display-st7789"
+version = "0.1.0"
+dependencies = [
+ "defmt 1.0.1",
+ "embedded-graphics-core",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
  "heapless 0.9.2",
 ]
 
