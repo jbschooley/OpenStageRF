@@ -37,6 +37,7 @@ pub mod framebuffer;
 pub mod panic_record;
 pub mod power;
 pub mod softdevice;
+pub mod wakeflag;
 pub mod storage;
 #[cfg(feature = "usb-log")]
 pub mod usb_log;
@@ -236,7 +237,14 @@ pub type MidiUart = embassy_nrf::buffered_uarte::BufferedUarte<'static>;
 /// Eagerly-initialised on-board peripherals.  Apps that just want "the LED"
 /// or "the user button" call `resources()` and read fields off the result.
 pub struct Resources {
-    /// Green status LED (P1_03, active-high).  Implements
+    /// Green status LED on P1_03.  **Active LOW** — drive LOW to
+    /// light, HIGH to turn off.  (Earlier comments here claimed
+    /// active HIGH; verified empirically by observation that
+    /// driving the pin LOW lights the LED.)  Initialised LOW by
+    /// `build_resources` so the LED is on as a "device is awake"
+    /// indicator at boot; the link runtime toggles it on packet
+    /// activity, and `power::enter_system_off` explicitly drives
+    /// it HIGH (LED off) on the way into sleep.  Implements
     /// `embedded_hal::digital::OutputPin`.
     pub status_led: embassy_nrf::gpio::Output<'static>,
 
@@ -339,7 +347,14 @@ fn build_resources(
     // as we only access (not move) the rest of the fields below.
     let usbd = p.USBD;
 
-    // ── Status LED (P1_03, active-high) ─────────────────────────────────────
+    // ── Status LED (P1_03, **active LOW**) ──────────────────────────────────
+    // Drive LOW at boot so the LED is *on* as a "device is awake"
+    // indicator — `core/link_runtime` does `toggle()` on packet
+    // activity but doesn't otherwise drive the LED to any specific
+    // state, so whatever level we init here is the "resting"
+    // appearance during Idle / no-traffic.  `enter_system_off`
+    // explicitly forces the pin HIGH (LED off) on the way into
+    // sleep, so this init only affects awake-state behaviour.
     let status_led = Output::new(p.P1_03, Level::Low, OutputDrive::Standard);
 
     // ── SX1262 SPI bus: SPIM0 @ 8 MHz, MODE_0 ───────────────────────────────
