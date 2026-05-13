@@ -38,7 +38,7 @@ use embedded_graphics::{
 };
 use heapless::{String, Vec as HVec};
 
-use crate::{battery::NO_BATTERY_MV, ScanState, Widget, WidgetList, MAX_WIDGETS, SCAN_NO_DATA};
+use crate::{ScanState, Widget, WidgetList, MAX_WIDGETS, SCAN_NO_DATA};
 
 /// Glyph height + 1 px inter-row gap.
 const ROW_HEIGHT_PX: u32 = 19;
@@ -232,12 +232,14 @@ impl Renderer {
                     // leave trailing pixels.  "—" placeholder when
                     // no reading yet.
                     let mut text_buf: String<12> = String::new();
-                    if *voltage_mv < NO_BATTERY_MV {
+                    if *voltage_mv == 0 {
                         // No battery present (or pre-first-reading).
-                        // A floating divider reads ~0 mV; a partial-
-                        // contact / damaged cell can read intermediate
-                        // junk.  Either way, don't pretend to know
-                        // SoC — show the placeholder.
+                        // `BatteryStatus::from_reading` zeroes
+                        // `voltage_mv` whenever the raw reading
+                        // falls below the active chemistry's no-
+                        // battery floor — so the renderer doesn't
+                        // need to know which chemistry the profile
+                        // is using.  Show a placeholder.
                         let _ = write!(&mut text_buf, " --% ----V");
                     } else {
                         // Voltage rendered as X.XXV (millivolt-rounded

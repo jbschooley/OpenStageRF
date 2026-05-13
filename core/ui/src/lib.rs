@@ -47,7 +47,8 @@ pub use band_plan::{
     BAND_PLANS,
 };
 pub use battery::{
-    voltage_to_percent, BatteryStatus, CRITICAL_THRESHOLD_PCT, LOW_THRESHOLD_PCT, SHUTDOWN_MV,
+    voltage_to_percent, BatteryChemistry, BatteryStatus, CRITICAL_THRESHOLD_PCT,
+    LOW_THRESHOLD_PCT, SHUTDOWN_MV,
 };
 pub use key_store::{KeyEntry, KeyRecord, KeyStore, KEY_MATERIAL_LEN, MAX_KEY_NAME, MAX_KEYS};
 pub use render::{render, Renderer};

@@ -26,6 +26,38 @@
 //!
 //! Don't poll faster than every ~5 s — the divider's settle current
 //! adds up if we hammer it.
+//!
+//! ## Future: pre-boost cell-voltage tap (for `BatteryChemistry::NimhPack`
+//! with 1 / 2 cells via an external boost converter)
+//!
+//! When you wire 1× or 2× AA NiMH through a boost converter to the
+//! JST-PH battery input, the existing AIN2 channel reads the boost
+//! output (regulated ~3.3 V) rather than the cell stack — so the
+//! SoC gauge can't tell anything until the boost completely fails.
+//!
+//! The fix is a second SAADC channel that taps the pre-boost cell
+//! voltage directly:
+//!
+//!   1. Wire a 1 MΩ + 1 MΩ resistor divider from cell `+` to GND;
+//!      tap the midpoint to **AIN3 (P0_05)**.  (For 1× AA you can
+//!      skip the divider, with a 100 kΩ series resistor for ESD
+//!      protection — the 1.0–1.4 V range is inside the SAADC's
+//!      gain-1/6 0–3.6 V window.)
+//!   2. Change [`BatteryMonitor`] to own a `Saadc<'static, 2>` with
+//!      the BAT_ADC channel + a new `cell_adc` channel.  Constructor
+//!      grows a `cell_adc_pin: Peri<'static, peripherals::P0_05>`
+//!      parameter (or `Option<...>` if we want to keep the old API
+//!      working in parallel for the LiPo build).
+//!   3. [`BatteryMonitor::sample`] returns a `BatterySample`
+//!      `{ bus_mv: u16, cell_mv: Option<u16> }` instead of a bare
+//!      `u16`.  The profile's `battery_task` picks which value to
+//!      feed `BatteryStatus::from_reading` based on the active
+//!      chemistry (Regulated → `bus_mv`; `NimhPack { cells: 1 | 2 }`
+//!      → `cell_mv`).
+//!
+//! Not implemented yet — flip when someone actually wires up the
+//! tap.  Memorialised here so future-us doesn't have to re-derive
+//! the plan.
 
 use embassy_nrf::peripherals;
 use embassy_nrf::saadc::{ChannelConfig, Config, Gain, Reference, Resolution, Saadc};
