@@ -22,6 +22,19 @@ defmt = ["dep:defmt", "embassy-nrf/defmt", "osrf-radio-sx126x/defmt"]
 # (which is unreachable without a debug probe).  See README of the bin
 # crates for the full story.
 usb-log = ["dep:embassy-usb", "dep:embassy-usb-logger", "dep:log"]
+# Provide a production-grade `#[panic_handler]` that stages the panic
+# message into a cross-reset `.uninit` buffer, then `SCB::sys_reset()`s.
+# Next boot's `panic_record::recover_pending_panic` reads the staged
+# record and pushes it to the panic-ring flash region.  Replaces
+# `panic-probe`'s "log + halt forever" pattern so a panic during a
+# gig reboots cleanly instead of bricking until manual power-cycle.
+#
+# **Mutually exclusive with `panic-probe`** — Rust forbids more than
+# one `#[panic_handler]` per binary.  Profiles that enable this
+# feature must drop their `panic-probe` dep.  Profiles that prefer
+# panic-probe's halt-on-panic dev behaviour (e.g. blink / smoke
+# tests) leave the feature off.
+panic-stage = []
 
 [dependencies]
 defmt       = { version = "1.0", optional = true }

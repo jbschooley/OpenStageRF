@@ -155,3 +155,142 @@ pub unsafe fn take_panic_record() -> Option<PanicStaging> {
     );
     Some(record)
 }
+
+/// Boot-time check for a staged panic from the prior boot.  If
+/// present: log it via defmt + push to the panic-ring flash region.
+/// Otherwise: read `RESETREAS`, log the bits, and if the watchdog
+/// fired without a staged panic, persist a generic "watchdog: task
+/// hung" record (the WDT path bypasses the staging handler because
+/// the chip resets without running our code).
+///
+/// Reset reason is read + cleared via SD regardless — `RESETREAS`
+/// accumulates flags across resets if we don't clear it, defeating
+/// per-boot diagnostics.
+///
+/// Profile calls this once during boot, after `Softdevice::enable`
+/// and after taking the flash handle.
+pub async fn recover_pending_panic(flash: &mut nrf_softdevice::Flash) {
+    let reset_reas = take_reset_reason();
+    // SAFETY: called exactly once per boot.  No other code reads
+    // the staging buffer.
+    let staged = unsafe { take_panic_record() };
+
+    if let Some(record) = staged {
+        let msg_len = (record.message_len as usize).min(PANIC_MSG_LEN);
+        let msg_bytes = &record.message[..msg_len];
+        #[cfg(feature = "defmt")]
+        {
+            let msg_str = core::str::from_utf8(msg_bytes).unwrap_or("(non-utf8 panic message)");
+            defmt::warn!(
+                "recovered panic from prior boot (reset_reas={=u32:#x}): {}",
+                reset_reas,
+                msg_str
+            );
+        }
+        osrf_panic_log::push(
+            flash,
+            crate::storage::PANIC_RING_RANGE,
+            reset_reas,
+            msg_bytes,
+        )
+        .await;
+    } else if reset_reas != 0 {
+        let dog = reset_reas & reset_reason::DOG != 0;
+        #[cfg(feature = "defmt")]
+        {
+            let sreq = reset_reas & reset_reason::SREQ != 0;
+            let pin = reset_reas & reset_reason::RESETPIN != 0;
+            let lockup = reset_reas & reset_reason::LOCKUP != 0;
+            let off = reset_reas & reset_reason::OFF != 0;
+            defmt::info!(
+                "boot reset_reas={=u32:#x} (no staged panic — dog={} sreq={} pin={} lockup={} off={})",
+                reset_reas,
+                dog,
+                sreq,
+                pin,
+                lockup,
+                off,
+            );
+        }
+        if dog {
+            // Watchdog reset without a staged panic — a task hung
+            // long enough for the WDT to fire on its own.  Persist
+            // a generic record; we don't know which task hung
+            // without per-task counters.
+            osrf_panic_log::push(
+                flash,
+                crate::storage::PANIC_RING_RANGE,
+                reset_reas,
+                b"watchdog: task hung",
+            )
+            .await;
+        }
+    }
+}
+
+// ── Production panic handler (feature-gated) ────────────────────
+//
+// Stages the panic message into the `.uninit` buffer above, then
+// triggers a software reset.  The next boot's `recover_pending_panic`
+// reads the staged record and pushes it to flash.
+//
+// Compile-time gated behind the `panic-stage` Cargo feature so
+// profiles can opt in (dropping their `panic-probe` dep) or stay
+// with the dev-friendly halt-on-panic behaviour for blink / smoke
+// tests.  A binary can only have one `#[panic_handler]` — enabling
+// this feature alongside `panic-probe` is a link error.
+
+#[cfg(feature = "panic-stage")]
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    use core::fmt::Write as _;
+
+    // Mask interrupts so nothing else runs while we're staging.
+    cortex_m::interrupt::disable();
+
+    let mut buf = [0u8; PANIC_MSG_LEN];
+    let written = {
+        struct SliceWriter<'a> {
+            buf: &'a mut [u8],
+            n: usize,
+        }
+        impl core::fmt::Write for SliceWriter<'_> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let bytes = s.as_bytes();
+                let take = bytes.len().min(self.buf.len() - self.n);
+                self.buf[self.n..self.n + take].copy_from_slice(&bytes[..take]);
+                self.n += take;
+                Ok(())
+            }
+        }
+        let mut w = SliceWriter { buf: &mut buf, n: 0 };
+        let _ = write!(&mut w, "{}", info);
+        w.n
+    };
+
+    // SAFETY: panic handler runs to completion; no other code is
+    // executing concurrently (interrupts disabled above).
+    unsafe {
+        let pending_ptr = core::ptr::addr_of_mut!(PANIC_PENDING) as *mut PanicStaging;
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*pending_ptr).message_len),
+            written as u32,
+        );
+        core::ptr::copy_nonoverlapping(
+            buf.as_ptr(),
+            core::ptr::addr_of_mut!((*pending_ptr).message) as *mut u8,
+            buf.len(),
+        );
+        // Magic last — readers gate on this, so a partially-staged
+        // record is never seen as valid.
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*pending_ptr).magic),
+            PANIC_MAGIC,
+        );
+    }
+
+    #[cfg(feature = "defmt")]
+    defmt::error!("PANIC: {}", defmt::Display2Format(info));
+    cortex_m::asm::delay(100_000);
+    cortex_m::peripheral::SCB::sys_reset()
+}
