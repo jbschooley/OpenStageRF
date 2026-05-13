@@ -14,6 +14,7 @@ members = [
     "core/panic_log",
     "core/ui",
     "crypto",
+    "drivers/display/st7789",
     "drivers/input/joystick5way",
     "drivers/midi/din",
     "drivers/radio/sx126x",
@@ -60,6 +61,7 @@ default-members = [
     "core/panic_log",
     "core/ui",
     "crypto",
+    "drivers/display/st7789",
     "drivers/input/joystick5way",
     "drivers/midi/din",
     "drivers/radio/sx126x",
@@ -90,6 +92,7 @@ osrf-panic-log                    = { path = "core/panic_log" }
 osrf-ui                           = { path = "core/ui" }
 osrf-board-dx-lr30                = { path = "boards/dx_lr30" }
 osrf-board-t114                   = { path = "boards/t114" }
+osrf-driver-display-st7789        = { path = "drivers/display/st7789" }
 osrf-driver-input-joystick5way    = { path = "drivers/input/joystick5way" }
 osrf-midi-din                     = { path = "drivers/midi/din" }
 osrf-radio-sx126x                 = { path = "drivers/radio/sx126x" }

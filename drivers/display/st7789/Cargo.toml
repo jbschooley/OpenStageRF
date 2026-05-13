@@ -1,0 +1,21 @@
+[package]
+name        = "osrf-driver-display-st7789"
+version     = "0.1.0"
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "Hand-rolled ST7789 driver tuned for the T114's 1.14″ 240×135 colour TFT.  Generic over embedded-hal SPI / OutputPin / DelayNs.  Bundles an in-RAM 64 KB RGB565 framebuffer with dirty-region tracking for embedded-graphics-compatible UI rendering."
+
+[features]
+defmt = ["dep:defmt"]
+
+[dependencies]
+embedded-hal           = { workspace = true }
+embedded-hal-async     = { workspace = true }
+embedded-graphics-core = "0.4"
+heapless               = { workspace = true }
+defmt                  = { workspace = true, optional = true }
+
+[lib]
+test    = false
+doctest = false
+bench   = false
