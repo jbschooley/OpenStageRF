@@ -6,6 +6,7 @@ members = [
     "apps/midi_node",
     "apps/radio_bench",
     "apps/ui_bench",
+    "apps/ui_runtime",
     "boards/dx_lr30",
     "boards/t114",
     "core/link",
@@ -52,6 +53,7 @@ default-members = [
     "apps/midi_node",
     "apps/radio_bench",
     "apps/ui_bench",
+    "apps/ui_runtime",
     "boards/dx_lr30",
     "core/link",
     "core/link_runtime",
@@ -82,6 +84,7 @@ osrf-app-midi-bench               = { path = "apps/midi_bench" }
 osrf-app-midi-node                = { path = "apps/midi_node" }
 osrf-app-radio-bench              = { path = "apps/radio_bench" }
 osrf-app-ui-bench                 = { path = "apps/ui_bench" }
+osrf-app-ui-runtime               = { path = "apps/ui_runtime" }
 osrf-link-runtime                 = { path = "core/link_runtime" }
 osrf-panic-log                    = { path = "core/panic_log" }
 osrf-ui                           = { path = "core/ui" }

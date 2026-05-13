@@ -739,6 +739,7 @@ Per README Decision #10, the portability boundary must be defended *as code is w
 - Time/delay: never call `embassy_time::Timer` from outside a port crate. Inside `osrf-link`, use a `MonotonicClock` trait.
 - Logging: use `defmt` macros directly during development, gate behind `cfg(feature = "defmt")` for crates intended for both embassy and Zephyr builds.
 - Async runtime entry: `apps/midi_node/src/bin/embassy_dx_lr30.rs` (and similar) is per-platform. Shared async logic lives in `apps/midi_node/src/lib.rs` and is called from each entry binary.
+- **Profiles are wiring shells**, not application logic. Per-deployment configuration (chemistry / power policy / role / TX source), the embassy task wrappers that need concrete types, the `#[panic_handler]`, and the boot-time `recover_pending_panic` call belong in the profile. Everything else — the UI state-machine driver loop, battery monitoring, soft-off coordination, settings persistence, helper functions — belongs in an app crate (`apps/ui_runtime` for the UI deployment, `apps/midi_node` for the link-only deployment).  Use small trait abstractions over concrete board types (`Watchdog`, `BatterySampler`, function pointers for `enter_system_off` / `vbus_present`) so the app crate stays HAL-agnostic.
 
 If a driver or core file ever has to import `embassy-*` directly, that's a portability bug — fix at the trait boundary.
 

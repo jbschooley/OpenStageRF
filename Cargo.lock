@@ -1237,6 +1237,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "osrf-app-ui-runtime"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "defmt 1.0.1",
+ "embassy-futures",
+ "embassy-sync 0.8.0",
+ "embassy-time",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "embedded-storage-async",
+ "heapless 0.9.2",
+ "osrf-app-midi-node",
+ "osrf-driver-input-joystick5way",
+ "osrf-link-runtime",
+ "osrf-panic-log",
+ "osrf-ui",
+ "sequential-storage",
+]
+
+[[package]]
 name = "osrf-board-dx-lr30"
 version = "0.1.0"
 dependencies = [
@@ -1656,9 +1677,9 @@ dependencies = [
  "nrf-softdevice",
  "osrf-app-link-bench",
  "osrf-app-midi-node",
+ "osrf-app-ui-runtime",
  "osrf-board-t114",
  "osrf-driver-input-joystick5way",
- "osrf-link-runtime",
  "osrf-panic-log",
  "osrf-ui",
  "sequential-storage",
