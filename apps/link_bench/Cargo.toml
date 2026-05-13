@@ -1,6 +1,7 @@
 [package]
 name        = "osrf-app-link-bench"
 version     = "0.1.0"
+publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
 description = "Milestone 4 link-layer bench: synthetic MIDI source/sink driving the shared osrf-link-runtime over the SX1262 radio.  Production firmware (osrf-app-midi-node) shares the runtime but plugs in real DIN MIDI I/O instead."

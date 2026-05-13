@@ -1,6 +1,7 @@
 [package]
 name        = "osrf-app-ui-runtime"
 version     = "0.1.0"
+publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
 description = "UI runtime — state-machine driver loop, battery monitor, soft-off coordination, settings persistence.  Board-agnostic; profiles wire the concrete display / flash / watchdog / joystick / radio peripherals via embedded-hal traits + a small set of helper traits."

@@ -1,6 +1,7 @@
 [package]
 name        = "osrf-profile-t114-rx-diversity"
 version     = "0.1.0"
+publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
 description = "Dual-radio diversity receiver — T114 + a second SX1262 on SPI3 via GPIO header"

@@ -1,6 +1,7 @@
 [package]
 name        = "osrf-profile-dx-lr30-rx-basic"
 version     = "0.1.0"
+publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
 description = "First-edition receiver — DX-LR30, single SX1262, US 915 ISM, GFSK MIDI"

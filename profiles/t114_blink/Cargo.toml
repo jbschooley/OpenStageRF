@@ -1,6 +1,7 @@
 [package]
 name        = "osrf-profile-t114-blink"
 version     = "0.1.0"
+publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
 description = "Milestone 0 blink — T114 deployment.  Wires the T114 board's Resources into the board-agnostic blink loop."

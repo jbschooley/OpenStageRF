@@ -1,6 +1,7 @@
 [package]
 name        = "osrf-driver-input-joystick5way"
 version     = "0.1.0"
+publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
 description = "Debounced 5-way joystick driver for OpenStageRF.  Active-low pull-up GPIO inputs; emits press / long-press events.  Generic over `embedded_hal::digital::InputPin` so it works on any board with a 5-way joystick wired to GPIOs."

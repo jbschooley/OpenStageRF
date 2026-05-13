@@ -1,6 +1,7 @@
 [package]
 name        = "osrf-board-dx-lr30"
 version     = "0.1.0"
+publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
 description = "DX-LR30-900M22SP dev board — STM32F103C8T6 + DX-LR30-900M22S (SX1262)"

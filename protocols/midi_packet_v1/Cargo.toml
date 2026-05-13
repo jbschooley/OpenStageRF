@@ -1,6 +1,7 @@
 [package]
 name        = "osrf-protocols-midi-v1"
 version     = "0.1.0"
+publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
 description = "OpenStageRF on-air transport envelope v1 — wire format encode/decode (no crypto yet, key_fp = 0x000000 only)"
