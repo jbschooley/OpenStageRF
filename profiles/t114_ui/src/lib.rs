@@ -118,7 +118,7 @@ static SCAN: ScanController = ScanController::new();
 
 /// Low-battery shutdown coordinator (link-runtime side).  `battery_task`
 /// fires this after observing `SHUTDOWN_BATTERY_SUSTAINED_SAMPLES`
-/// consecutive sub-`SHUTDOWN_MV` readings.  The link-runtime task
+/// consecutive readings at-or-below `CHEMISTRY.shutdown_mv()`.  The link-runtime task
 /// (`run_rx` or `run_tx`) `select`s on it, sinks all-notes-off,
 /// parks the radio, and idles forever.  Single-consumer —
 /// `embassy_sync::Signal` takes-on-wait, so a separate
@@ -153,7 +153,8 @@ const POWEROFF_REASON_NONE: u8 = 0;
 /// Normal-user-flow soft-off; not logged to the panic ring.
 const POWEROFF_REASON_OPERATOR: u8 = 1;
 /// `battery_task` saw [`SHUTDOWN_BATTERY_SUSTAINED_SAMPLES`]
-/// consecutive sub-`SHUTDOWN_MV` readings with USB unplugged.
+/// consecutive readings at-or-below `CHEMISTRY.shutdown_mv()` with
+/// USB unplugged.
 /// `enter_soft_off()` pushes a `low-battery shutdown` panic-ring
 /// record before the System OFF call so next boot's About screen
 /// surfaces the cause.
@@ -176,7 +177,7 @@ const POWEROFF_REASON_WIRED_USB_LOST: u8 = 3;
 /// handling it, the render task drops into a WDT-pet idle loop.
 static POWER_OFF_DISPLAY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
-/// Number of consecutive sub-`SHUTDOWN_MV` battery samples required
+/// Number of consecutive sub-`CHEMISTRY.shutdown_mv()` battery samples required
 /// before firing [`SHUTDOWN`].  With a 5 s sample interval this is
 /// `5 * 5 = 25 s` of sustained-low — long enough that a transient
 /// dip (TX-burst sag, plug-event transient) doesn't trip shutdown,
@@ -364,23 +365,12 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     // after the user reached Idle and then power-cycled cleanly).
     let flash_intent = load_soft_off_intent(&mut flash).await;
     let vbus_at_boot = board::battery::vbus_present();
-    // Clear the flash flag now.  The two re-sleep paths
-    // (`enter_soft_off`, `usb_wake_charging_frame`,
-    // `unexpected_wake_resleep`) re-set it before their respective
-    // `enter_system_off` calls.  Clearing here handles the
-    // "Center press → Idle" path: their next true cold-power-on
-    // boot won't be misread as USB-wake.
-    save_soft_off_intent(&mut flash, false).await;
 
     // Wired mode is its own short-circuit: device should be on
     // whenever USB is present.  Skip the charging-frame and silent-
     // re-sleep paths entirely and boot straight to Idle.  The
     // 10-second USB-loss grace timer in `ui_state_loop` enforces
-    // the rest of the policy (auto-soft-off when USB has been gone
-    // for too long).  This means in Wired mode every wake reason
-    // produces the same user-facing behaviour — VBUS-present at
-    // boot → Idle, VBUS-absent at boot → Idle (and the grace timer
-    // shuts us back down 10 s later if USB doesn't return).
+    // the rest of the policy.
     if matches!(POWER_POLICY, PowerPolicy::Wired) {
         defmt::info!(
             "ui: Wired policy → Idle (VBUS={}, early_wake={:?})",
@@ -389,48 +379,46 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
         );
     } else {
         match early_wake {
-            // Live Center press caught — full boot to Idle.
             board::power::WakeSource::CenterPress => {
                 defmt::info!("ui: wake = CenterPress → Idle");
             }
-            // Intentional wake with VBUS — confirmed USB plug-in
-            // alongside the prior soft-off.  Brief charging frame
-            // then real System OFF.
+            // Confirmed USB plug-in alongside the prior soft-off —
+            // brief charging frame then real System OFF.
             board::power::WakeSource::UsbPlug if vbus_at_boot => {
                 defmt::info!("ui: wake = UsbPlug + VBUS → charging frame");
-                usb_wake_charging_frame(r.display, r.display_backlight, r.battery, flash)
-                    .await;
+                usb_wake_charging_frame(r.display, r.display_backlight, r.battery).await;
             }
-            // Intentional wake without VBUS — most likely a SENSE
-            // event on Center triggered by ESD or a quick press we
-            // missed during the live poll.  Silent re-sleep.
-            board::power::WakeSource::UsbPlug => {
-                unexpected_wake_resleep(flash).await;
-            }
-            // Cold boot + flash_intent + VBUS — brown-out from a USB
-            // plug-in event.  RAM wiped but the cable is plugged in;
-            // show charging frame.
+            // Intentional wake without VBUS — SENSE-on-Center ESD or
+            // a quick press we missed.  Silent re-sleep.
+            board::power::WakeSource::UsbPlug => unexpected_wake_resleep(),
+            // ColdBoot + flash_intent + VBUS — brown-out from USB
+            // plug-in.  RAM wiped, cable still plugged → charging frame.
             board::power::WakeSource::ColdBoot if flash_intent && vbus_at_boot => {
                 defmt::info!(
                     "ui: wake = ColdBoot + flash_intent + VBUS → charging frame \
                      (probable brown-out from USB plug-in)"
                 );
-                usb_wake_charging_frame(r.display, r.display_backlight, r.battery, flash)
-                    .await;
+                usb_wake_charging_frame(r.display, r.display_backlight, r.battery).await;
             }
-            // Cold boot + flash_intent + no VBUS — most likely a USB-
-            // shield ESD event or a battery-pull while soft-off was
-            // active.  Silent re-sleep — neither warrants user-
-            // visible wake activity.
-            board::power::WakeSource::ColdBoot if flash_intent => {
-                unexpected_wake_resleep(flash).await;
-            }
-            // Genuinely cold boot — fresh power-on without a prior
-            // soft-off in the flash flag.  Boot to Idle.
+            // ColdBoot + flash_intent + no VBUS — shield-touch ESD or
+            // battery-pull while soft-off was active.  Silent re-sleep.
+            board::power::WakeSource::ColdBoot if flash_intent => unexpected_wake_resleep(),
             board::power::WakeSource::ColdBoot => {
                 defmt::info!("ui: wake = ColdBoot (no flash_intent) → Idle");
             }
         }
+    }
+
+    // We're committed to the Idle path now.  If the flash flag
+    // was set on entry, clear it — the user has reached a live UI
+    // session and a subsequent fresh power-on shouldn't be misread
+    // as a soft-off wake.  Skipped when `flash_intent` is already
+    // false (cold-boot from a clean Idle-then-power-cycle), saving
+    // ~30 ms of flash latency on the common case.  The helpers above
+    // diverge into `enter_system_off` without touching the flag, so
+    // they leave it true for the next wake to recognise.
+    if flash_intent {
+        save_soft_off_intent(&mut flash, false).await;
     }
 
     // Recover any panic staged by the prior boot (if any).  Reads
@@ -781,9 +769,9 @@ async fn joystick_task(mut js: Joystick) {
 /// [`BATTERY`] cell.
 ///
 /// Low / critical warning logs only fire when an actual battery is
-/// detected (Vbat ≥ `NO_BATTERY_MV`) — a probe-only board with no
-/// cell wired in stays quiet rather than spamming the log with
-/// "critical: 0 mV" messages.
+/// detected (Vbat ≥ `CHEMISTRY.no_battery_mv()`) — a probe-only
+/// board with no cell wired in stays quiet rather than spamming
+/// the log with "critical: 0 mV" messages.
 #[embassy_executor::task]
 async fn battery_task(mut monitor: board::battery::BatteryMonitor) {
     // Consecutive samples that satisfied the shutdown condition.
@@ -916,26 +904,32 @@ async fn ui_state_loop(
         // Bursts of joystick events may pet faster than that.
         wdt.pet();
 
-        // Wired-mode VBUS tracking.  Sample once per loop iteration
-        // (~300 ms).  USB-state change events on the T114 don't have
-        // an interrupt routed (USBDETECTED is consumed by the SD's
-        // POWER handler for wake-from-System-OFF), so we poll.
-        let vbus = board::battery::vbus_present();
-        if vbus {
-            last_vbus_present_at = Instant::now();
-        }
-        if matches!(POWER_POLICY, PowerPolicy::Wired)
-            && !vbus
-            && Instant::now().duration_since(last_vbus_present_at) >= WIRED_GRACE
-        {
-            defmt::warn!(
-                "ui: Wired mode + USB absent > {} s → latching soft-off",
-                WIRED_USB_LOSS_GRACE_SECS,
-            );
-            POWEROFF_REASON.store(
-                POWEROFF_REASON_WIRED_USB_LOST,
-                core::sync::atomic::Ordering::Release,
-            );
+        // Wired-mode VBUS tracking.  In Battery builds the whole
+        // block const-folds away.  USB-state change events on the
+        // T114 don't have an interrupt routed (USBDETECTED is
+        // consumed by the SD's POWER handler for wake-from-System-
+        // OFF), so we poll on each scan_tick.
+        if matches!(POWER_POLICY, PowerPolicy::Wired) {
+            if board::battery::vbus_present() {
+                last_vbus_present_at = Instant::now();
+            } else if Instant::now().duration_since(last_vbus_present_at) >= WIRED_GRACE
+                && POWEROFF_REASON.load(core::sync::atomic::Ordering::Acquire)
+                    == POWEROFF_REASON_NONE
+            {
+                // Latch once.  The reason-poll above the
+                // VBUS-tracking block dispatches into
+                // `enter_soft_off` on the next iteration; guarding
+                // against re-store avoids defmt-spam if any path
+                // ever defers that dispatch.
+                defmt::warn!(
+                    "ui: Wired mode + USB absent > {} s → latching soft-off",
+                    WIRED_USB_LOSS_GRACE_SECS,
+                );
+                POWEROFF_REASON.store(
+                    POWEROFF_REASON_WIRED_USB_LOST,
+                    core::sync::atomic::Ordering::Release,
+                );
+            }
         }
 
         // Deep soft-off: either `battery_task` latched
@@ -1174,11 +1168,15 @@ async fn ui_state_loop(
 /// a noticeable interruption.  Silent re-sleep keeps shield-touch
 /// and battery-pull-after-soft-off feel equivalent to "I didn't
 /// wake the device" — predictable, not surprising.
-async fn unexpected_wake_resleep(mut flash: Flash) -> ! {
+fn unexpected_wake_resleep() -> ! {
     defmt::info!(
         "ui: unexpected wake (soft-off intent set, no live press, no VBUS) → silent re-sleep"
     );
-    save_soft_off_intent(&mut flash, true).await;
+    // No flash write needed: we got here because `flash_intent` was
+    // true on entry to `run()`, and we never cleared it (the
+    // end-of-init clear only runs on the Idle fall-through path).
+    // So the flag is still true in flash — next wake will recognise
+    // the prior soft-off intent.
     board::power::enter_system_off()
 }
 
@@ -1212,7 +1210,6 @@ async fn usb_wake_charging_frame(
     mut display: board::Display,
     mut backlight: Output<'static>,
     mut battery_mon: board::battery::BatteryMonitor,
-    mut flash: Flash,
 ) -> ! {
     // Sample once so the frame shows actual mV / %.  Single SAADC
     // round is ~200 µs.
@@ -1261,16 +1258,12 @@ async fn usb_wake_charging_frame(
     // Teardown: same order as `enter_soft_off`, minus the
     // SHUTDOWN-to-link-runtime + POWER_OFF_DISPLAY signals (no
     // tasks running on this path).  Backlight first, then panel
-    // VDD gate, then System OFF.
+    // VDD gate, then System OFF.  No flash write — `flash_intent`
+    // was true on entry to `run()` (that's how we ended up here)
+    // and we never cleared it, so the flag is still set for the
+    // next wake to recognise.
     backlight.set_high();
     display.power_off().await;
-
-    // Re-set the flash-backed intent so the *next* boot (whether
-    // via clean SENSE wake, USB plug, or brown-out) is recognised
-    // as "we meant to be off."  enter_system_off itself also sets
-    // the RAM wakeflag — flash + RAM together cover both clean
-    // and brown-out wake paths.
-    save_soft_off_intent(&mut flash, true).await;
     defmt::info!("usb-wake: charging frame done — re-entering System OFF");
     board::power::enter_system_off()
 }
@@ -1418,44 +1411,22 @@ async fn enter_soft_off(
 /// Kept out of `enter_soft_off` so the same data flow (Title + two
 /// Text rows + Footer hint) is easy to read in one place.
 fn build_power_off_goodbye(reason: u8, out: &mut WidgetList) {
-    use heapless::String;
-    let title: String<24> = String::try_from("Powering off").unwrap_or_default();
-    let _ = out.push(Widget::Title(title));
-
-    match reason {
-        POWEROFF_REASON_LOW_BATTERY => {
-            let _ = out.push(Widget::Text {
-                row: 2,
-                text: String::try_from("Battery low").unwrap_or_default(),
-            });
-            let _ = out.push(Widget::Text {
-                row: 3,
-                text: String::try_from("Plug in to charge").unwrap_or_default(),
-            });
-        }
-        POWEROFF_REASON_WIRED_USB_LOST => {
-            let _ = out.push(Widget::Text {
-                row: 2,
-                text: String::try_from("USB disconnected").unwrap_or_default(),
-            });
-            let _ = out.push(Widget::Text {
-                row: 3,
-                text: String::try_from("Plug back in to wake").unwrap_or_default(),
-            });
-        }
-        _ => {
-            // Operator (or any unforeseen value) — the safe default
-            // is "tell the user how to bring it back."
-            let _ = out.push(Widget::Text {
-                row: 2,
-                text: String::try_from("Goodnight").unwrap_or_default(),
-            });
-            let _ = out.push(Widget::Text {
-                row: 3,
-                text: String::try_from("Press Center to wake").unwrap_or_default(),
-            });
-        }
-    }
+    let _ = out.push(Widget::Title(short_str::<24>("Powering off")));
+    let (line2, line3) = match reason {
+        POWEROFF_REASON_LOW_BATTERY => ("Battery low", "Plug in to charge"),
+        POWEROFF_REASON_WIRED_USB_LOST => ("USB disconnected", "Plug back in to wake"),
+        // Operator (or any unforeseen value) — safe default is
+        // "tell the user how to bring it back."
+        _ => ("Goodnight", "Press Center to wake"),
+    };
+    let _ = out.push(Widget::Text {
+        row: 2,
+        text: short_str::<24>(line2),
+    });
+    let _ = out.push(Widget::Text {
+        row: 3,
+        text: short_str::<24>(line3),
+    });
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
