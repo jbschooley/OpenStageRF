@@ -1,17 +1,23 @@
 [package]
 name    = "osrf-crypto"
 version = "0.1.0"
+publish     = false
 edition = "2021"
 license = "AGPL-3.0-or-later"
+description = "AEAD primitives + key fingerprinting for the OpenStageRF link layer.  Pure no_std, no alloc, no HAL deps."
 
 [features]
 defmt = ["dep:defmt"]
 
 [dependencies]
-defmt    = { workspace = true, optional = true }
-heapless = { workspace = true }
+defmt            = { workspace = true, optional = true }
+heapless         = { workspace = true }
+aes              = { workspace = true }
+ccm              = { workspace = true }
+chacha20poly1305 = { workspace = true }
+sha2             = { workspace = true }
 
 [lib]
-test    = false
+test    = true
 doctest = false
 bench   = false

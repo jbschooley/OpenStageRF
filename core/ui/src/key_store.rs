@@ -4,34 +4,37 @@
 //!
 //! Variable-length list of named keys.  Empty entries are not
 //! stored — the list is always tightly packed.  Each entry has a
-//! 24-bit fingerprint (the low 3 bytes of `SHA-256(key_material)`,
-//! matching the on-wire `key_fp` header field) and a user-readable
-//! name (≤16 chars).
+//! 24-bit fingerprint (the low 3 bytes of `SHA-256(cipher_id ‖
+//! key_material)`, matching the on-wire `key_fp` header field), a
+//! [`CipherId`] selecting which AEAD this key drives, and a user-
+//! readable name (≤16 chars).
 //!
 //! ## "Open" pseudo-entry
 //!
 //! The UI always shows an extra `"Open"` row at the top of the
 //! key list, representing "no encryption" (`active_key_fp = None`).
 //! It's not stored in the [`KeyStore`] — the renderer synthesises
-//! it.  Users can always pick it; v1 (no AEAD) only ever uses it.
+//! it.
 //!
 //! ## Lookup on RX
 //!
 //! When a packet arrives, the link receiver reads the 24-bit
 //! `key_fp` from the header and calls [`KeyStore::find`] to
-//! resolve it to key material.  If the fingerprint is `0x000000`,
-//! the packet is in the open path; otherwise the receiver looks
-//! up the key and decrypts.
+//! resolve it to a key entry — from which it then loads the
+//! cipher choice + material from the flash record indexed by
+//! the same fingerprint.  If the fingerprint is `0x000000`, the
+//! packet is in the open path.
 //!
-//! ## v1 status
+//! ## Stage 3 status
 //!
-//! Stub.  `KeyStore::default()` is empty, and the UI offers no
-//! way to add keys.  When AEAD lands (Stage 3 in ROADMAP.md),
-//! a "+ Add Key" entry will appear on the KeySelect screen and
-//! invoke a key-generation / -import flow.
+//! Functional but not yet flash-persistent: `KeyStore::default()`
+//! is empty; the boot path will populate it from
+//! `sequential-storage::map` once the persistence wiring in
+//! `apps/ui_runtime` lands (task #17).
 
 use core::fmt::Write as _;
 use heapless::{String, Vec};
+use osrf_crypto::CipherId;
 
 /// Maximum number of keys held in the runtime store.  Beyond this,
 /// [`KeyStore::add`] returns an error.  Sized for plausible
@@ -42,17 +45,16 @@ pub const MAX_KEYS: usize = 16;
 /// Maximum length of a user-assigned key name.
 pub const MAX_KEY_NAME: usize = 16;
 
-/// Symmetric AEAD key material length in bytes.  256-bit because
-/// that's what ChaCha20-Poly1305 (the Stage-3 candidate) needs;
-/// AES-256-GCM uses the same.  Locked here so the on-flash
-/// [`KeyRecord`] format doesn't shift when AEAD wiring lands.
-pub const KEY_MATERIAL_LEN: usize = 32;
+/// Symmetric AEAD key material length in bytes.  Mirrors
+/// [`osrf_crypto::KEY_LEN`] — always 32, even for AES-128 (which
+/// uses the lower 16) so the on-flash [`KeyRecord`] layout stays
+/// uniform across ciphers.
+pub const KEY_MATERIAL_LEN: usize = osrf_crypto::KEY_LEN;
 
 /// On-flash representation of a single key store entry.  Fixed size
 /// with `#[repr(C)]` so the byte layout is stable across firmware
-/// revisions — this is the v1 commitment that Stage 3 AEAD work
-/// won't have to migrate around.  Read / written via
-/// `sequential-storage::map` keyed by the 24-bit fingerprint.
+/// revisions.  Read / written via `sequential-storage::map` keyed
+/// by the 24-bit fingerprint.
 ///
 /// Layout (64 bytes total):
 ///
@@ -60,24 +62,19 @@ pub const KEY_MATERIAL_LEN: usize = 32;
 ///   offset  size  field
 ///   ------  ----  -----
 ///    0       4    fingerprint (u32 LE; only low 24 bits meaningful, top byte zero)
-///    4       1    name_len (0..=MAX_KEY_NAME)
-///    5      16    name_bytes (UTF-8, zero-padded, not null-terminated)
-///   21      32    key_material (raw symmetric key; zeroed in v1)
-///   53      11    reserved (zero-filled padding for forward compat)
+///    4       1    cipher_id (1 = ChaCha20-Poly1305, 2 = AES-128-CCM)
+///    5       1    name_len (0..=MAX_KEY_NAME)
+///    6      16    name_bytes (UTF-8, zero-padded, not null-terminated)
+///   22      32    key_material (raw symmetric key)
+///   54      10    reserved (zero-filled padding for forward compat)
 /// ```
 ///
-/// **v1 status:** [`KeyStore`] doesn't expose any way to populate
-/// `key_material` — the UI offers no add-key flow and AEAD isn't
-/// wired into the link layer.  Records are not pushed to flash by
-/// any current code path.  When Stage 3 lands:
-///
-/// 1. UI gains an Add Key flow that generates / imports key
-///    material and pushes a [`KeyRecord`] to flash.
-/// 2. Boot path reads all records via [`KeyStore::load_from_flash`]
-///    (wiring TBD by the profile) and populates a runtime
-///    [`KeyStore`].
-/// 3. The link layer's AEAD step looks up `key_material` by
-///    fingerprint via [`KeyStore::find`].
+/// **Note:** the 64-byte total was locked in at the v1 commitment;
+/// `cipher_id` was carved out of the original 11-byte reserved
+/// block, so a v1 record read by Stage-3 firmware will deserialize
+/// with `cipher_id = 0` and `to_entry` will reject it — meaning
+/// any pre-Stage-3 keystore record (none in practice; the UI had
+/// no add-key flow before) is treated as corrupt and skipped.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct KeyRecord {
@@ -86,25 +83,30 @@ pub struct KeyRecord {
     /// sanity check inside the value — if the two disagree on
     /// read, the entry is considered corrupt.
     pub fingerprint: u32,
+    /// AEAD cipher discriminator.  Wire-stable u8 — see [`CipherId`].
+    /// `0` means "unknown" / corrupt and triggers rejection in
+    /// [`Self::to_entry`].
+    pub cipher_id: u8,
     /// Valid byte count of [`Self::name_bytes`].
     pub name_len: u8,
     /// Name as UTF-8 bytes.  Not null-terminated; consume with
     /// `&name_bytes[..name_len as usize]`.
     pub name_bytes: [u8; MAX_KEY_NAME],
-    /// Raw symmetric key material.  Zeroed until Stage 3 AEAD
-    /// lands.  The on-wire `key_fp` header field already carries
-    /// the fingerprint; the receiver looks up the material here.
+    /// Raw symmetric key material.  For AES-128-CCM only the lower
+    /// 16 bytes are used by the cipher; upper 16 are reserved for
+    /// a future AES-256 entry without forcing a layout migration.
     pub key_material: [u8; KEY_MATERIAL_LEN],
     /// Reserved for forward compatibility.  Must be zero on write
-    /// today; future versions may use this region for a
-    /// `key_type` discriminator, KDF salt, etc.
-    pub reserved: [u8; 11],
+    /// today; future versions may use this region for KDF salt,
+    /// expiry timestamp, etc.
+    pub reserved: [u8; 10],
 }
 
 impl KeyRecord {
-    /// Construct a record from a runtime [`KeyEntry`] with the
-    /// given key material.  v1 callers pass `[0; 32]` — the
-    /// material slot is reserved but unused until AEAD lands.
+    /// Construct a record from a runtime [`KeyEntry`] and the
+    /// given key material.  The cipher choice comes from the
+    /// entry; the caller is responsible for ensuring the material
+    /// was generated for that cipher.
     pub fn from_entry(entry: &KeyEntry, material: [u8; KEY_MATERIAL_LEN]) -> Self {
         let mut name_bytes = [0u8; MAX_KEY_NAME];
         let bytes = entry.name.as_bytes();
@@ -112,24 +114,28 @@ impl KeyRecord {
         name_bytes[..n].copy_from_slice(&bytes[..n]);
         Self {
             fingerprint: entry.fingerprint & 0x00FF_FFFF,
+            cipher_id: entry.cipher as u8,
             name_len: n as u8,
             name_bytes,
             key_material: material,
-            reserved: [0; 11],
+            reserved: [0; 10],
         }
     }
 
-    /// Lift the name portion back to a [`KeyEntry`].  Drops
+    /// Lift the name + cipher portion back to a [`KeyEntry`].  Drops
     /// `key_material` since [`KeyEntry`] doesn't carry it — the
     /// material lives in the on-flash record only and is looked
     /// up by fingerprint when the link layer needs it.  Returns
-    /// `None` if the name bytes don't decode as UTF-8 or
-    /// `name_len` is out of bounds.
+    /// `None` if the name bytes don't decode as UTF-8, `name_len`
+    /// is out of bounds, or `cipher_id` doesn't match a known
+    /// cipher (treats unknown cipher as corrupt; safer than
+    /// guessing).
     pub fn to_entry(&self) -> Option<KeyEntry> {
         let n = self.name_len as usize;
         if n > MAX_KEY_NAME {
             return None;
         }
+        let cipher = CipherId::from_u8(self.cipher_id)?;
         let s = core::str::from_utf8(&self.name_bytes[..n]).ok()?;
         let mut name: String<MAX_KEY_NAME> = String::new();
         for c in s.chars().take(MAX_KEY_NAME) {
@@ -137,6 +143,7 @@ impl KeyRecord {
         }
         Some(KeyEntry {
             fingerprint: self.fingerprint & 0x00FF_FFFF,
+            cipher,
             name,
         })
     }
@@ -162,6 +169,12 @@ pub struct KeyEntry {
     /// key (the link receiver uses 0 as a sentinel for "no
     /// crypto").
     pub fingerprint: u32,
+    /// AEAD cipher this key drives.  Different ciphers under the
+    /// same raw key bytes produce different fingerprints (the
+    /// `cipher_id` is part of the fingerprint hash) — so the
+    /// runtime never has to disambiguate which cipher to use
+    /// from key_fp alone.
+    pub cipher: CipherId,
     /// User-assigned name.
     pub name: String<MAX_KEY_NAME>,
 }
@@ -176,8 +189,8 @@ impl KeyEntry {
 }
 
 /// Runtime-mutable list of keys.  Held by the host alongside
-/// [`crate::Settings`].  v1 starts empty; future work populates
-/// it via key generation / import / flash-load on boot.
+/// [`crate::Settings`].  Starts empty; the profile boot path
+/// populates it via flash-load (see task #17).
 #[derive(Debug, Clone, Default)]
 pub struct KeyStore {
     entries: Vec<KeyEntry, MAX_KEYS>,
@@ -193,7 +206,7 @@ impl KeyStore {
     /// is `0x000000` (reserved) or already present.  Names need
     /// not be unique.
     #[allow(clippy::result_unit_err)] // Stage 3 will replace with a typed error.
-    pub fn add(&mut self, name: &str, fingerprint: u32) -> Result<u32, ()> {
+    pub fn add(&mut self, name: &str, cipher: CipherId, fingerprint: u32) -> Result<u32, ()> {
         let fp = fingerprint & 0x00FF_FFFF;
         if fp == 0 {
             return Err(());
@@ -208,6 +221,7 @@ impl KeyStore {
         self.entries
             .push(KeyEntry {
                 fingerprint: fp,
+                cipher,
                 name: n,
             })
             .map(|_| fp)
@@ -224,7 +238,9 @@ impl KeyStore {
     }
 
     /// Look up a key by fingerprint.  Used by the receiver to
-    /// resolve incoming `key_fp` values.
+    /// resolve incoming `key_fp` values to a cipher choice;
+    /// the actual key material comes from the flash record by
+    /// the same fingerprint.
     pub fn find(&self, fingerprint: u32) -> Option<&KeyEntry> {
         let fp = fingerprint & 0x00FF_FFFF;
         self.entries.iter().find(|e| e.fingerprint == fp)
@@ -267,32 +283,48 @@ impl KeyStore {
 mod tests {
     use super::*;
 
+    fn empty_entry() -> KeyEntry {
+        KeyEntry {
+            fingerprint: 0,
+            cipher: CipherId::ChaCha20Poly1305,
+            name: String::new(),
+        }
+    }
+
     #[test]
     fn add_and_find() {
         let mut store = KeyStore::new();
-        let fp = store.add("Alice", 0x123456).unwrap();
+        let fp = store
+            .add("Alice", CipherId::ChaCha20Poly1305, 0x123456)
+            .unwrap();
         assert_eq!(fp, 0x123456);
         let found = store.find(0x123456).unwrap();
         assert_eq!(found.name.as_str(), "Alice");
+        assert_eq!(found.cipher, CipherId::ChaCha20Poly1305);
     }
 
     #[test]
     fn add_rejects_zero_fingerprint() {
         let mut store = KeyStore::new();
-        assert!(store.add("Open", 0).is_err());
+        assert!(store.add("Open", CipherId::ChaCha20Poly1305, 0).is_err());
     }
 
     #[test]
     fn add_rejects_duplicate() {
         let mut store = KeyStore::new();
-        store.add("A", 0xAAAA).unwrap();
-        assert!(store.add("B", 0xAAAA).is_err());
+        store.add("A", CipherId::ChaCha20Poly1305, 0xAAAA).unwrap();
+        // Duplicate fingerprint even with a different cipher is rejected:
+        // the on-wire dispatch is by fingerprint alone, so duplicates
+        // would be ambiguous.
+        assert!(store.add("B", CipherId::Aes128Ccm, 0xAAAA).is_err());
     }
 
     #[test]
     fn add_strips_high_byte_of_fingerprint() {
         let mut store = KeyStore::new();
-        let fp = store.add("X", 0xFF12_3456).unwrap();
+        let fp = store
+            .add("X", CipherId::ChaCha20Poly1305, 0xFF12_3456)
+            .unwrap();
         assert_eq!(fp, 0x12_3456); // 24-bit only
         assert!(store.find(0xFF12_3456).is_some()); // lookup masks too
     }
@@ -300,7 +332,7 @@ mod tests {
     #[test]
     fn remove_works() {
         let mut store = KeyStore::new();
-        store.add("A", 0xAAAA).unwrap();
+        store.add("A", CipherId::ChaCha20Poly1305, 0xAAAA).unwrap();
         store.remove(0xAAAA);
         assert!(store.find(0xAAAA).is_none());
     }
@@ -308,14 +340,15 @@ mod tests {
     #[test]
     fn sorted_by_name() {
         let mut store = KeyStore::new();
-        store.add("Charlie", 0x111).unwrap();
-        store.add("Alice", 0x222).unwrap();
-        store.add("Bob", 0x333).unwrap();
+        store
+            .add("Charlie", CipherId::ChaCha20Poly1305, 0x111)
+            .unwrap();
+        store
+            .add("Alice", CipherId::ChaCha20Poly1305, 0x222)
+            .unwrap();
+        store.add("Bob", CipherId::ChaCha20Poly1305, 0x333).unwrap();
 
-        let mut buf: [KeyEntry; MAX_KEYS] = core::array::from_fn(|_| KeyEntry {
-            fingerprint: 0,
-            name: String::new(),
-        });
+        let mut buf: [KeyEntry; MAX_KEYS] = core::array::from_fn(|_| empty_entry());
         let sorted = store.sorted_into(&mut buf);
         assert_eq!(sorted[0].name.as_str(), "Alice");
         assert_eq!(sorted[1].name.as_str(), "Bob");
@@ -326,39 +359,81 @@ mod tests {
     fn format_fingerprint_renders_6_hex_chars() {
         let e = KeyEntry {
             fingerprint: 0xa3f9c1,
+            cipher: CipherId::ChaCha20Poly1305,
             name: String::new(),
         };
         assert_eq!(e.format_fingerprint().as_str(), "a3f9c1");
     }
 
     #[test]
-    fn key_record_roundtrip() {
+    fn key_record_roundtrip_chacha() {
         let mut name: String<MAX_KEY_NAME> = String::new();
         name.push_str("Stage Left").unwrap();
         let entry = KeyEntry {
             fingerprint: 0x12_3456,
+            cipher: CipherId::ChaCha20Poly1305,
             name,
         };
         let material = [0xAB; KEY_MATERIAL_LEN];
         let record = KeyRecord::from_entry(&entry, material);
         assert_eq!(record.fingerprint, 0x12_3456);
+        assert_eq!(record.cipher_id, CipherId::ChaCha20Poly1305 as u8);
         assert_eq!(record.name_len, "Stage Left".len() as u8);
         assert_eq!(record.key_material, material);
-        assert_eq!(record.reserved, [0; 11]);
+        assert_eq!(record.reserved, [0; 10]);
 
         let back = record.to_entry().expect("round trips");
         assert_eq!(back.fingerprint, 0x12_3456);
+        assert_eq!(back.cipher, CipherId::ChaCha20Poly1305);
         assert_eq!(back.name.as_str(), "Stage Left");
+    }
+
+    #[test]
+    fn key_record_roundtrip_aes() {
+        let mut name: String<MAX_KEY_NAME> = String::new();
+        name.push_str("FX rack").unwrap();
+        let entry = KeyEntry {
+            fingerprint: 0xABCDEF,
+            cipher: CipherId::Aes128Ccm,
+            name,
+        };
+        let record = KeyRecord::from_entry(&entry, [0; KEY_MATERIAL_LEN]);
+        assert_eq!(record.cipher_id, CipherId::Aes128Ccm as u8);
+        let back = record.to_entry().expect("round trips");
+        assert_eq!(back.cipher, CipherId::Aes128Ccm);
     }
 
     #[test]
     fn key_record_rejects_bad_name_len() {
         let record = KeyRecord {
             fingerprint: 0xAABBCC,
+            cipher_id: 1,
             name_len: 99, // > MAX_KEY_NAME
             name_bytes: [0; MAX_KEY_NAME],
             key_material: [0; KEY_MATERIAL_LEN],
-            reserved: [0; 11],
+            reserved: [0; 10],
+        };
+        assert!(record.to_entry().is_none());
+    }
+
+    #[test]
+    fn key_record_rejects_unknown_cipher() {
+        // cipher_id = 0 = the sentinel for "this record was written
+        // by pre-Stage-3 firmware or is corrupt".  Reject.
+        let record = KeyRecord {
+            fingerprint: 0xAABBCC,
+            cipher_id: 0,
+            name_len: 1,
+            name_bytes: [b'X'; MAX_KEY_NAME],
+            key_material: [0; KEY_MATERIAL_LEN],
+            reserved: [0; 10],
+        };
+        assert!(record.to_entry().is_none());
+        // cipher_id = 99 = future cipher this firmware doesn't know
+        // about.  Also rejected — keeps RX dispatch unambiguous.
+        let record = KeyRecord {
+            cipher_id: 99,
+            ..record
         };
         assert!(record.to_entry().is_none());
     }
@@ -369,6 +444,7 @@ mod tests {
         name.push_str("X").unwrap();
         let entry = KeyEntry {
             fingerprint: 0xFF_12_3456,
+            cipher: CipherId::ChaCha20Poly1305,
             name,
         };
         let record = KeyRecord::from_entry(&entry, [0; KEY_MATERIAL_LEN]);

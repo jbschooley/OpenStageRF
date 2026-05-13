@@ -7,9 +7,10 @@ license     = "AGPL-3.0-or-later"
 description = "Display-agnostic UI core for OpenStageRF: settings model, screen state machine, widget tree.  Renderer lives in a separate crate so the same UI runs on monochrome OLED and colour TFT."
 
 [features]
-defmt = ["dep:defmt", "osrf-driver-input-joystick5way/defmt"]
+defmt = ["dep:defmt", "osrf-driver-input-joystick5way/defmt", "osrf-crypto/defmt"]
 
 [dependencies]
+osrf-crypto                    = { workspace = true }
 osrf-driver-input-joystick5way = { workspace = true }
 heapless                       = { workspace = true }
 embedded-graphics              = "0.8"

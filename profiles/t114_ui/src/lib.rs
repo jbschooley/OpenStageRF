@@ -33,8 +33,8 @@ use osrf_app_ui_runtime as app;
 use osrf_board_t114 as board;
 use osrf_driver_input_joystick5way::Joystick5Way;
 use osrf_ui::{
-    BatteryChemistry, BatteryStatus, KeyStore, PowerPolicy, Renderer, Role, Settings, UiState,
-    Widget, WidgetList,
+    BatteryChemistry, BatteryStatus, CipherId, KeyStore, PowerPolicy, Renderer, Role, Settings,
+    UiState, Widget, WidgetList,
 };
 
 use board::embassy_nrf::gpio::{Input, Output, Pull};
@@ -233,8 +233,12 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     let mut settings = Settings::default();
     app::load_settings(&mut flash, board::storage::SETTINGS_RANGE, &mut settings).await;
     let mut keys = KeyStore::new();
-    let _ = keys.add("Studio A", 0x111111);
-    let _ = keys.add("Backup", 0x222222);
+    // Seed demo entries so the KeySelect screen shows something
+    // during bring-up.  These have no flash record yet — task #17
+    // (flash persistence) replaces this with a real load_from_flash
+    // call once the boot path wires sequential-storage::map.
+    let _ = keys.add("Studio A", CipherId::ChaCha20Poly1305, 0x111111);
+    let _ = keys.add("Backup", CipherId::ChaCha20Poly1305, 0x222222);
     let mut widgets: WidgetList = WidgetList::new();
     let mut renderer = Renderer::new();
 

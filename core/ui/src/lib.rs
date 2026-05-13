@@ -48,6 +48,7 @@ pub use band_plan::{
 };
 pub use battery::{BatteryChemistry, BatteryStatus, CRITICAL_THRESHOLD_PCT, LOW_THRESHOLD_PCT};
 pub use key_store::{KeyEntry, KeyRecord, KeyStore, KEY_MATERIAL_LEN, MAX_KEYS, MAX_KEY_NAME};
+pub use osrf_crypto::CipherId;
 pub use render::{render, Renderer};
 // (PowerPolicy + WIRED_USB_LOSS_GRACE_SECS are already public at the
 // module root — listed here for visibility alongside the other
@@ -1013,6 +1014,7 @@ fn active_key_cursor(active_fp: Option<u32>, keys: &KeyStore) -> u8 {
     };
     let mut buf: [KeyEntry; MAX_KEYS] = core::array::from_fn(|_| KeyEntry {
         fingerprint: 0,
+        cipher: CipherId::ChaCha20Poly1305,
         name: String::new(),
     });
     let sorted = keys.sorted_into(&mut buf);
@@ -1099,6 +1101,7 @@ impl ListKind {
                 } else {
                     let mut buf: [KeyEntry; MAX_KEYS] = core::array::from_fn(|_| KeyEntry {
                         fingerprint: 0,
+                        cipher: CipherId::ChaCha20Poly1305,
                         name: String::new(),
                     });
                     let sorted = keys.sorted_into(&mut buf);
@@ -1487,6 +1490,7 @@ fn build_key_select(state: &UiState, settings: &Settings, keys: &KeyStore, out: 
     // Materialise the sorted key list once into a stack buffer.
     let mut buf: [KeyEntry; MAX_KEYS] = core::array::from_fn(|_| KeyEntry {
         fingerprint: 0,
+        cipher: CipherId::ChaCha20Poly1305,
         name: String::new(),
     });
     let sorted = keys.sorted_into(&mut buf);

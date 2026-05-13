@@ -86,7 +86,8 @@ jobs:
             osrf-protocols-midi-v1 \
             osrf-driver-input-joystick5way \
             osrf-radio-sx126x \
-            osrf-driver-display-st7789
+            osrf-driver-display-st7789 \
+            osrf-crypto
           do
             echo "::group::cargo test -p $crate"
             cargo test --target x86_64-unknown-linux-gnu -p "$crate"
@@ -125,7 +126,8 @@ jobs:
             osrf-link-runtime \
             osrf-panic-log \
             osrf-app-midi-node \
-            osrf-app-ui-runtime
+            osrf-app-ui-runtime \
+            osrf-crypto
           do
             echo "::group::cargo clippy -p $crate"
             cargo clippy --target x86_64-unknown-linux-gnu -p "$crate" --no-deps -- -D warnings
