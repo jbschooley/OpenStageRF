@@ -52,6 +52,9 @@ pub use battery::{
 };
 pub use key_store::{KeyEntry, KeyRecord, KeyStore, KEY_MATERIAL_LEN, MAX_KEY_NAME, MAX_KEYS};
 pub use render::{render, Renderer};
+// (PowerPolicy + WIRED_USB_LOSS_GRACE_SECS are already public at the
+// module root — listed here for visibility alongside the other
+// profile-level config knobs.)
 
 // ── Settings ────────────────────────────────────────────────────────────────
 
@@ -260,6 +263,47 @@ pub enum Role {
     /// meaningless (RX doesn't transmit).
     Rx,
 }
+
+/// Power-source policy for a deployment.  Profile-level `const`;
+/// selects how the device interprets USB presence + drives its
+/// power management state machine.
+///
+/// This is independent of [`BatteryChemistry`](battery::BatteryChemistry) —
+/// chemistry tells the gauge what cells are wired, policy tells the
+/// power manager what kind of usage pattern the device expects.
+/// A wired-rig deployment might still ship with a backup LiPo for
+/// the 10-second USB-loss grace period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum PowerPolicy {
+    /// Battery-powered handheld.  User controls power explicitly:
+    /// long-press Left → Right → Center to soft-off; Center press
+    /// to wake from real System OFF.  USB plug-in shows a brief 2 s
+    /// charging frame and re-sleeps.  This is the default for the
+    /// stock T114 / DX-LR30 builds.
+    Battery,
+    /// Wired-only — device is on whenever USB power is present.
+    /// On USB plug-in, boots immediately to Idle (no charging
+    /// frame).  On USB unplug, starts a [`WIRED_USB_LOSS_GRACE`]
+    /// timer; if power doesn't return inside that window, the device
+    /// soft-offs.  Intended for permanent installations on a host
+    /// instrument's USB port (keytar / keyboard / pedalboard) where
+    /// the device should track the host's power state.
+    ///
+    /// A battery is still optional in this mode: if present, it
+    /// keeps the device alive through the grace window even if the
+    /// host's USB power is briefly dropped (loose connector, host
+    /// rebooting).  If absent, USB-loss simply kills the chip
+    /// immediately and the next USB plug-in cold-boots.
+    Wired,
+}
+
+/// How long the [`PowerPolicy::Wired`] state machine tolerates USB
+/// absence before triggering a clean soft-off.  10 seconds is a
+/// compromise: long enough to ride out a host re-enumeration or
+/// flaky cable seat, short enough that you don't drain the backup
+/// battery to no purpose if the host is genuinely off.
+pub const WIRED_USB_LOSS_GRACE_SECS: u64 = 10;
 
 impl Role {
     /// The MAIN_MENU appropriate for this role.  Used by the UI
