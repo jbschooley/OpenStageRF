@@ -582,66 +582,99 @@ per-profile.
 
 - [x] **USB-plug wake (brief).**  When soft-off, plugging in USB wakes the device just
       long enough to render one frame showing battery charging status, then re-enters
-      System OFF.  Hold-time set at 2 s (PLAN originally said ~5 s; 2 s reads cleanly
-      without feeling like the device decided to stay on).
+      System OFF.  Hold-time set at 2 s.
 
-      **Mechanism**: a `.uninit` magic byte in `board::wakeflag` is set just before the
-      `sd_power_system_off` SVC.  Next boot's `board::power::detect_wake_source()`
-      reads the magic + clears it, reads the Center pin level via raw P0.IN, and reads
-      VBUS via `battery::vbus_present()`.  The three signals combine to return a
-      `WakeSource` enum: `ColdBoot` / `CenterPress` / `UsbPlug`.  Detection runs *before*
-      SD enable so the latency between reset vector and the Center read is minimal —
-      the press signal is only present while the user is still holding, ~hundreds of ms.
+      **Mechanism**: a `.uninit` magic byte in `board::wakeflag` (RAM) plus a flash-
+      backed `KEY_SOFT_OFF_INTENT` flag (survives brown-out / battery-pull where RAM
+      is wiped).  Next boot's `board::power::detect_wake_source()` polls the Center
+      pin (after configuring `PIN_CNF[13]` for input + pull-up so `P0.IN` reads the
+      actual line, not 0-from-disconnect — see notes below) for ~100 ms with a 10-
+      consecutive-LOW debounce, then consults the RAM wakeflag.  `profiles/t114_ui::run`
+      combines that with the flash intent + live `VBUS` presence to dispatch:
+      `CenterPress` → Idle; `UsbPlug` + VBUS → 2 s charging frame; everything else
+      where soft-off intent is set + no VBUS → silent re-sleep with no display
+      activity.
 
-      `profiles/t114_ui::run` branches on the wake source.  On `UsbPlug` it calls
-      `usb_wake_charging_frame()` instead of spawning the full UI: that helper inits
-      the display, samples the battery once, builds a "Charging / N mV / N %" frame
-      with the existing widgets, holds it for 2 s, runs the same display teardown as
-      `enter_soft_off`, and re-enters `board::power::enter_system_off()`.  No flash,
-      no tasks, no settings restore — minimum work for the brief-frame budget.
+      **Status (2026-05-12)**: ✅ implemented and verified on hardware.  Bench
+      learnings (memorialised in memory notes + this PLAN):
+        - **PIN_CNF resets on POR / brown-out wake**, including `INPUT=Disconnect`.
+          Reading `P0.IN` after a brown-out returns 0 for every pin regardless of
+          actual voltage.  `detect_wake_source` writes `PIN_CNF[13] = 0x0C` before
+          polling.
+        - **USB plug-in often causes a brown-out**, not a clean SENSE wake.  RAM is
+          lost, the RAM wakeflag is gone, and only the flash flag identifies the
+          previous run as a soft-off.
+        - **ESD on the USB shield** can spuriously latch GPIO or pulse Center LOW
+          for µs; live-Center poll requires 10 ms of stable LOW (10 consecutive
+          samples) to avoid false `CenterPress` returns during plug events.
+        - **EGU0_SWI0 must be masked alongside GPIOTE** in `enter_system_off`; the
+          link runtime's shutdown LED-blink runs on the interrupt executor and would
+          otherwise preempt our final GPIO state-setting between the OUTCLR/OUTSET
+          writes and the SVC.
+        - **Probe-attached emulated mode** (post-`cargo run` with DBGEN set): the
+          SVC returns `NRF_ERROR_SOC_POWER_OFF_SHOULD_NOT_RETURN` (0x2006).  We now
+          park in WFI forever on that return instead of `sys_reset`, so dev sessions
+          see "device powered off" cleanly instead of a busy reboot loop.
+        - **Status LED is active LOW** on P1_03 (board crate corrected; was wrongly
+          documented as active HIGH).  `enter_system_off` drives the pin HIGH via
+          OUTSET to guarantee LED off in System OFF.
 
-      **Status (2026-05-12)**: ✅ implemented and unit-tested (existing UI tests cover
-      the un-changed normal-boot path; the USB-wake branch is one-shot async code that
-      exercises in-tree types but doesn't lend itself to host tests).  Hardware
-      verification still pending — needs probe-detached + power-cycled bench session
-      (same as core soft-off verification).
+- [x] **Battery chemistry as a per-profile compile-time option** (2026-05-12).
+      `core/ui/src/battery.rs` now exposes a `BatteryChemistry` enum with
+      `LiPoSingle` (the default, OCV unchanged from Meshtastic's reference) and
+      `NimhPack { cells: u8 }` (3-cell curve derived from the Panasonic Eneloop
+      datasheet; smaller/larger pack counts fall through to the 3-cell table with a
+      build-time-validation expectation on the profile).  `BatteryStatus::from_reading`
+      and `voltage_to_percent` take chemistry as a parameter; `no_battery_mv`,
+      `shutdown_mv`, and `charging_floor_mv` are methods on the enum.  Profiles
+      declare `const CHEMISTRY: BatteryChemistry = ...;`  `profiles/t114_ui` ships
+      with `LiPoSingle`; swap to NiMH by changing one line + de-popping the TP4054
+      to avoid over-charging.
 
-- [ ] **Battery chemistry as a per-profile compile-time option.**  Today `core/ui/src/battery.rs`
-      assumes single-cell LiPo with Meshtastic's OCV table.  Add a `BatteryChemistry` enum
-      with at least: `LiPoSingle`, `NimhPack { cells: u8 }`.  Each variant carries an OCV
-      table (3-cell NiMH: ~3.0-4.2 V range, but flatter discharge curve with sharp knee
-      around 3.3 V; 2-cell NiMH would need boost so probably not viable; 4-cell NiMH ≈
-      4.0-5.6 V, exceeds LiPo regulator input range so also not viable without a buck).
-      Profile picks via Cargo feature or const associated with the board crate.
+      **Boost-fed NiMH-as-AA** (1× or 2× Eneloop + a basic boost converter wired
+      to the JST-PH battery input) is now supported on the software side via two
+      enum additions:
 
-- [ ] **Document the external-charging story for NiMH.**  Decision: **no on-board NiMH
-      charging.**  TP4054 is LiPo-only and overcharging NiMH at 4.2 V CV would damage cells.
-      Users running NiMH packs use an off-board smart charger and swap cells between gigs.
-      The T114's `vbus_present()` still works for showing the lightning bolt during USB
-      operation, but no automatic charging happens — clearly labelled in the About screen
-      / docs so users don't expect it.
+        - `BatteryChemistry::Regulated { shutdown_mv, low_mv }` — no extra
+          hardware.  The SAADC keeps reading the post-boost rail (VBat).  Gauge
+          collapses to a three-zone OK / Low / Critical mapping driven by
+          configured thresholds; when cells weaken and the boost can't hold
+          regulation, VBat droops below `low_mv` and eventually `shutdown_mv`,
+          firmware soft-offs cleanly.  Workable with a Pololu U1V11A33 or
+          similar bargain-bin boost, no UVLO required from the IC since firmware
+          does the cutoff.
 
-- [ ] **Document removable-LiPo workflow.**  Recommended path for fast battery swaps:
-      **14500 LiPo cells** (AA form factor, 14×50 mm, ~800 mAh) in an AA-style holder
-      (Keystone 79 series, ~$1) connected to the existing JST-PH battery port.  Same LiPo
-      chemistry → same TP4054 path → same firmware OCV table → zero board or firmware
-      changes beyond the swap mechanism itself.  Carry charged spares in a pocket, swap in
-      ~5 seconds on stage.  External charging via a single-bay LiPo charger that handles
-      14500 (Nitecore F1, XTAR MC1 — $10-15 each).  Same active runtime as the current
-      800 mAh pouch cell but with a meaningful "dead-battery-on-stage" recovery story.
+        - `BatteryChemistry::NimhPack { cells: 1 | 2 }` — designed for the
+          "fuel-gauge mod" where a 1 MΩ : 1 MΩ divider taps the pre-boost cell
+          stack to AIN3 (P0_05, currently unused).  OCV tables for 1- and 2-cell
+          packs are derived from the Eneloop datasheet's 0.2 C discharge curve
+          (per-cell × N).  Hardware side requires the divider + a second SAADC
+          channel added to `boards/t114/src/battery.rs`'s `BatteryMonitor`
+          (channels: 2; `sample()` returns `BatterySample { bus_mv, cell_mv }`).
+          The scaffolding plan is documented inline in that file; the
+          chemistry side is ready to flip whenever the hardware is wired.
 
-      Larger swappable options if capacity matters more than form-factor:
-        - **18350** (18×35 mm, ~1000 mAh): slight capacity bump.
-        - **18650** (18×65 mm, ~3000 mAh): the bulk-charge / long-set option, 4× capacity.
-      Both use the same charging story (LiPo, external multi-bay smart charger).  Update
-      the hardware-guide doc in `docs/`.
+      Both paths share the same firmware-side soft-off pipeline as LiPo — the
+      profile just changes its `const CHEMISTRY` declaration.  Hardware mod
+      details (TP4054 disable for direct NiMH, MAX17222 / U1V11A33 boost selection,
+      pre-boost divider for the fuel-gauge variant) live in `docs/hardware_guides/`
+      (to be written) and the t114 board crate's `battery.rs` module docs.
 
-- [ ] **Optional: route TP4054 STAT to a GPIO.**  The T114's CHG LED is hardwired to the
-      charger IC's STAT pin (active-low while charging, released at full).  Currently
-      firmware can't distinguish "charging" from "charge done" — both show as
-      `vbus_present == true`.  Wiring STAT to a free GPIO (P0_05 is unclaimed) lets the
-      UI render "Charging…" vs "Charged" vs "Powered" states distinctly.  Small hardware
-      mod (one wire-tack), nice-to-have not required.
+- [x] **Document the external-charging story for NiMH** (2026-05-13).
+- [x] **Document removable-LiPo workflow** (2026-05-13).
+
+      Both covered by `docs/hardware_guides/battery_options.md`, which walks through
+      stock LiPo, drop-in 14500 / 18350 / 18650 LiPo swaps, NiMH Option A (3-cell
+      direct), NiMH Option B (1×/2× cell via boost, no fuel gauge), and NiMH Option C
+      (1×/2× cell via boost + pre-boost fuel-gauge mod).  Each option's hardware mods,
+      firmware `const CHEMISTRY`, and safety notes are spelled out, plus a decision
+      table at the bottom.
+
+- [ ] ~~**Optional: route TP4054 STAT to a GPIO.**~~ **Deferred.**  No code or doc work
+      for this bullet until / unless someone actually wants the UI to distinguish
+      "Charging" / "Charged" / "Powered."  When that day arrives: wire STAT pin to
+      P0_05, add an Input in `boards/t114/src/lib.rs::build_resources`, and have the
+      battery widget take a tri-state.  Not blocking M8 closure.
 
 **Exit criteria:** long-press Left from Idle → Center on the confirm screen powers down
 the unit cleanly; current draw in soft-off measures < 100 µA on a multimeter; Center
@@ -652,21 +685,30 @@ charging frame; battery indicator correctly reflects voltage for both LiPo and
 **Exit criteria status (2026-05-12):**
   - ✅ Confirm flow works end-to-end (dev + production paths).
   - ✅ Real System OFF engages with probe detached + power-cycled — verified visually
-    via VEXT-powered joystick LED going dark and staying dark through sleep.
+    via VEXT-powered joystick LED going dark and staying dark through sleep, and via
+    probe-rs's RTT link dropping cleanly at the SVC moment.
+  - ✅ USB plug → one charging frame (2 s) → re-sleep — verified on hardware.
+  - ✅ USB shield touch / battery pull while soft-off → silent re-sleep, no display
+    activity (per user spec: "only wake on actual cable plug").
+  - ✅ Status LED behaviour: on while awake, off through soft-off (active-LOW
+    polarity, board crate + `enter_system_off` corrected).
   - ⏳ <100 µA quantitative measurement — pending ammeter setup; qualitative evidence
-    (no measurable % drop over multi-hour real-off tests) is consistent.
-  - ✅ USB plug → one charging frame (2 s) → re-sleep — wired; hardware verification
-    pending in the same bench session as the µA measurement.
+    (no measurable battery % drop over multi-hour real-off tests) is consistent with
+    the target.
   - ⏳ NiMH OCV table — not started.
 
 **Out of scope:** on-board NiMH charging circuit (covered above — external charger only);
 hardware-switch design (revisit if soft-off proves unreliable in practice).
 
-**Milestone status:** 🟢 core deep soft-off complete (2026-05-12).  The headline
-"powers down cleanly to a sub-µA standby state on operator command and wakes on Center
-press" bullet is done and hardware-verified.  Remaining bullets — USB-plug brief wake,
-NiMH chemistry, docs, optional STAT-pin mod — are independent follow-ups and can each
-be picked up à la carte.
+**Milestone status:** 🟢 **complete** (2026-05-13).  Headline behaviour ("powers down
+cleanly to sub-µA on operator command, wakes on Center press, USB plug-in shows brief
+charging frame and re-sleeps") is done and hardware-verified.  Battery-chemistry
+support landed for LiPo + 1/2/3-cell NiMH (direct, boost-fed, and boost-fed-with-
+fuel-gauge-mod).  Hardware-guide docs cover every configuration including the safety
+notes around mixing 14500 LiPo with primary-AA-form-factor cells and the TP4054 +
+NiMH danger.  Only deferred bullet is the optional TP4054 STAT → GPIO mod, which is
+hardware-side-only and can land whenever someone wants charging-state distinction in
+the UI.
 
 ## Total estimate
 

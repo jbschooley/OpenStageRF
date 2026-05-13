@@ -50,13 +50,19 @@ use osrf_board_t114 as board;
 use osrf_driver_input_joystick5way::{Joystick5Way, JoystickEvent};
 use nrf_softdevice::Flash;
 use osrf_link_runtime::{LinkConfigSignal, LinkStatsCell, ScanController, ShutdownSignal};
-use osrf_ui::battery::NO_BATTERY_MV;
 use osrf_ui::{
     band_plan_channel, band_plan_index, build_screen, max_channel_index, AboutData, BandPlan,
-    BatteryStatus, SHUTDOWN_MV,
-    Command, KeyStore, LinkStatus, Renderer, Role, ScanState, ScreenId, Settings, UiState, Widget,
-    WidgetList, BAND_PLANS, MAX_SCAN_CHANNELS,
+    BatteryChemistry, BatteryStatus, Command, KeyStore, LinkStatus, Renderer, Role, ScanState,
+    ScreenId, Settings, UiState, Widget, WidgetList, BAND_PLANS, MAX_SCAN_CHANNELS,
 };
+
+/// Battery chemistry for this build.  Stock T114 ships with a
+/// single-cell LiPo pouch; swap to `BatteryChemistry::NimhPack
+/// { cells: 3 }` if you've replaced the cell with a 3-AA NiMH
+/// holder (requires de-popping the TP4054 charger to avoid
+/// over-charging the pack on USB-plug).  See `PLAN.md` M8 → battery
+/// chemistry bullet and the `core/ui/battery.rs` module docs.
+const CHEMISTRY: BatteryChemistry = BatteryChemistry::LiPoSingle;
 use sequential_storage::cache::NoCache;
 use sequential_storage::map;
 
@@ -755,7 +761,7 @@ async fn battery_task(mut monitor: board::battery::BatteryMonitor) {
     loop {
         let mv = monitor.sample().await;
         let plugged_in = board::battery::vbus_present();
-        let status = BatteryStatus::from_reading(mv, plugged_in);
+        let status = BatteryStatus::from_reading(mv, plugged_in, CHEMISTRY);
         critical_section::with(|cs| BATTERY.borrow(cs).set(status));
         // Only nag when there's a real battery to nag about.  An
         // unpopulated cell socket reads ~0 mV and would otherwise
@@ -781,8 +787,8 @@ async fn battery_task(mut monitor: board::battery::BatteryMonitor) {
         // single low-voltage spike + recovery shouldn't un-shut us
         // down, because the link tasks have already started parking.
         let shutdown_eligible = !plugged_in
-            && mv >= NO_BATTERY_MV
-            && mv <= SHUTDOWN_MV;
+            && mv >= CHEMISTRY.no_battery_mv()
+            && mv <= CHEMISTRY.shutdown_mv();
         if shutdown_eligible {
             shutdown_run = shutdown_run.saturating_add(1);
             if !shutdown_fired && shutdown_run >= SHUTDOWN_BATTERY_SUSTAINED_SAMPLES {
@@ -1137,7 +1143,7 @@ async fn usb_wake_charging_frame(
     // Sample once so the frame shows actual mV / %.  Single SAADC
     // round is ~200 µs.
     let mv = battery_mon.sample().await;
-    let status = osrf_ui::BatteryStatus::from_reading(mv, true);
+    let status = osrf_ui::BatteryStatus::from_reading(mv, true, CHEMISTRY);
     defmt::info!(
         "usb-wake: battery {=u16} mV ({=u8} %)",
         status.voltage_mv,
