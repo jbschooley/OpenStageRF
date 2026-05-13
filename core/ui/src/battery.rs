@@ -293,29 +293,6 @@ pub const LOW_THRESHOLD_PCT: u8 = 20;
 /// auto-disable, etc.  Chemistry-independent.
 pub const CRITICAL_THRESHOLD_PCT: u8 = 10;
 
-// ── Back-compat: LiPo defaults exposed at module scope ─────────────
-//
-// Earlier code consumed these as bare module constants.  Keeping
-// them as the LiPo defaults preserves source compatibility while
-// new code transitions to the chemistry-aware methods.  Profiles
-// running NiMH should use `chemistry.no_battery_mv()` etc. instead
-// of these.
-
-/// Backwards-compatible alias for `BatteryChemistry::LiPoSingle.no_battery_mv()`.
-pub const NO_BATTERY_MV: u16 = 3000;
-/// Backwards-compatible alias for `BatteryChemistry::LiPoSingle.charging_floor_mv()`.
-pub const CHARGING_FLOOR_MV: u16 = 4200;
-/// Backwards-compatible alias for `BatteryChemistry::LiPoSingle.shutdown_mv()`.
-pub const SHUTDOWN_MV: u16 = 3100;
-
-/// Backwards-compatible free function — same as
-/// `BatteryChemistry::LiPoSingle.voltage_to_percent(mv)`.  New code
-/// should call the method form so the gauge tracks the actual
-/// installed chemistry.
-pub fn voltage_to_percent(mv: u16) -> u8 {
-    BatteryChemistry::LiPoSingle.voltage_to_percent(mv)
-}
-
 /// Shared state between the profile's battery monitor task and the
 /// UI rendering path.  `Copy` so it can live in a
 /// `critical_section::Mutex<Cell<_>>` for cross-task sharing.
@@ -621,13 +598,4 @@ mod tests {
         assert!(crit.plugged_in);
     }
 
-    #[test]
-    fn back_compat_module_voltage_to_percent_matches_lipo() {
-        // The deprecated module-level free fn should give the same
-        // answers as the LiPo method form.
-        let lipo = BatteryChemistry::LiPoSingle;
-        for mv in [3000u16, 3300, 3720, 4050, 4190, 4500] {
-            assert_eq!(voltage_to_percent(mv), lipo.voltage_to_percent(mv));
-        }
-    }
 }

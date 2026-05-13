@@ -137,7 +137,7 @@ pub mod joystick {
     pub type Center = peripherals::P0_13;
 }
 
-// ── Status LED (green, active-high) ──────────────────────────────────────────
+// ── Status LED (green, **active LOW**) ──────────────────────────────────────
 pub mod led_status {
     use embassy_nrf::peripherals;
     pub type Pin = peripherals::P1_03;
