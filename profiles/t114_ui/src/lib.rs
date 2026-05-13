@@ -52,8 +52,9 @@ use nrf_softdevice::Flash;
 use osrf_link_runtime::{LinkConfigSignal, LinkStatsCell, ScanController, ShutdownSignal};
 use osrf_ui::{
     band_plan_channel, band_plan_index, build_screen, max_channel_index, AboutData, BandPlan,
-    BatteryChemistry, BatteryStatus, Command, KeyStore, LinkStatus, Renderer, Role, ScanState,
-    ScreenId, Settings, UiState, Widget, WidgetList, BAND_PLANS, MAX_SCAN_CHANNELS,
+    BatteryChemistry, BatteryStatus, Command, KeyStore, LinkStatus, PowerPolicy, Renderer, Role,
+    ScanState, ScreenId, Settings, UiState, Widget, WidgetList, BAND_PLANS, MAX_SCAN_CHANNELS,
+    WIRED_USB_LOSS_GRACE_SECS,
 };
 
 /// Battery chemistry for this build.  Stock T114 ships with a
@@ -63,6 +64,16 @@ use osrf_ui::{
 /// over-charging the pack on USB-plug).  See `PLAN.md` M8 → battery
 /// chemistry bullet and the `core/ui/battery.rs` module docs.
 const CHEMISTRY: BatteryChemistry = BatteryChemistry::LiPoSingle;
+
+/// Power policy for this build.  Default is
+/// [`PowerPolicy::Battery`]: user controls on/off via long-press
+/// gesture, USB plug-in shows a brief charging frame.  Switch to
+/// [`PowerPolicy::Wired`] when the device is permanently mounted on
+/// a host instrument (keytar / keyboard USB port) — the chip then
+/// tracks the host's USB power and auto-soft-offs ~10 s after USB
+/// is lost.  See `docs/hardware_guides/battery_options.md` and the
+/// `PowerPolicy` enum docs in `core/ui`.
+const POWER_POLICY: PowerPolicy = PowerPolicy::Wired;
 use sequential_storage::cache::NoCache;
 use sequential_storage::map;
 
@@ -147,6 +158,14 @@ const POWEROFF_REASON_OPERATOR: u8 = 1;
 /// record before the System OFF call so next boot's About screen
 /// surfaces the cause.
 const POWEROFF_REASON_LOW_BATTERY: u8 = 2;
+/// [`PowerPolicy::Wired`] mode + USB power has been absent for
+/// [`WIRED_USB_LOSS_GRACE_SECS`] seconds, with no sign of recovery.
+/// `enter_soft_off()` renders a "USB disconnected" goodbye and
+/// drops the chip into real System OFF; the next USB plug-in or
+/// Center press cold-boots back to Idle (the Wired policy will
+/// then either keep us on if USB is back, or re-start the grace
+/// timer if not).  No panic-ring record — this is normal-flow.
+const POWEROFF_REASON_WIRED_USB_LOST: u8 = 3;
 
 /// "Power off the display" handshake from `ui_state_loop` to
 /// `ui_render_task`.  The render task owns the display and we need
@@ -353,47 +372,64 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     // boot won't be misread as USB-wake.
     save_soft_off_intent(&mut flash, false).await;
 
-    match early_wake {
-        // Live Center press caught — full boot to Idle.
-        board::power::WakeSource::CenterPress => {
-            defmt::info!("ui: wake = CenterPress → Idle");
-        }
-        // Intentional wake with VBUS — confirmed USB plug-in
-        // alongside the prior soft-off.  Brief charging frame
-        // then real System OFF.
-        board::power::WakeSource::UsbPlug if vbus_at_boot => {
-            defmt::info!("ui: wake = UsbPlug + VBUS → charging frame");
-            usb_wake_charging_frame(r.display, r.display_backlight, r.battery, flash)
-                .await;
-        }
-        // Intentional wake without VBUS — most likely a SENSE
-        // event on Center triggered by ESD or a quick press we
-        // missed during the live poll.  Silent re-sleep.
-        board::power::WakeSource::UsbPlug => {
-            unexpected_wake_resleep(flash).await;
-        }
-        // Cold boot + flash_intent + VBUS — brown-out from a USB
-        // plug-in event.  RAM wiped but the cable is plugged in;
-        // show charging frame.
-        board::power::WakeSource::ColdBoot if flash_intent && vbus_at_boot => {
-            defmt::info!(
-                "ui: wake = ColdBoot + flash_intent + VBUS → charging frame \
-                 (probable brown-out from USB plug-in)"
-            );
-            usb_wake_charging_frame(r.display, r.display_backlight, r.battery, flash)
-                .await;
-        }
-        // Cold boot + flash_intent + no VBUS — most likely a USB-
-        // shield ESD event or a battery-pull while soft-off was
-        // active.  Silent re-sleep — neither warrants user-visible
-        // wake activity.
-        board::power::WakeSource::ColdBoot if flash_intent => {
-            unexpected_wake_resleep(flash).await;
-        }
-        // Genuinely cold boot — fresh power-on without a prior
-        // soft-off in the flash flag.  Boot to Idle.
-        board::power::WakeSource::ColdBoot => {
-            defmt::info!("ui: wake = ColdBoot (no flash_intent) → Idle");
+    // Wired mode is its own short-circuit: device should be on
+    // whenever USB is present.  Skip the charging-frame and silent-
+    // re-sleep paths entirely and boot straight to Idle.  The
+    // 10-second USB-loss grace timer in `ui_state_loop` enforces
+    // the rest of the policy (auto-soft-off when USB has been gone
+    // for too long).  This means in Wired mode every wake reason
+    // produces the same user-facing behaviour — VBUS-present at
+    // boot → Idle, VBUS-absent at boot → Idle (and the grace timer
+    // shuts us back down 10 s later if USB doesn't return).
+    if matches!(POWER_POLICY, PowerPolicy::Wired) {
+        defmt::info!(
+            "ui: Wired policy → Idle (VBUS={}, early_wake={:?})",
+            vbus_at_boot,
+            early_wake
+        );
+    } else {
+        match early_wake {
+            // Live Center press caught — full boot to Idle.
+            board::power::WakeSource::CenterPress => {
+                defmt::info!("ui: wake = CenterPress → Idle");
+            }
+            // Intentional wake with VBUS — confirmed USB plug-in
+            // alongside the prior soft-off.  Brief charging frame
+            // then real System OFF.
+            board::power::WakeSource::UsbPlug if vbus_at_boot => {
+                defmt::info!("ui: wake = UsbPlug + VBUS → charging frame");
+                usb_wake_charging_frame(r.display, r.display_backlight, r.battery, flash)
+                    .await;
+            }
+            // Intentional wake without VBUS — most likely a SENSE
+            // event on Center triggered by ESD or a quick press we
+            // missed during the live poll.  Silent re-sleep.
+            board::power::WakeSource::UsbPlug => {
+                unexpected_wake_resleep(flash).await;
+            }
+            // Cold boot + flash_intent + VBUS — brown-out from a USB
+            // plug-in event.  RAM wiped but the cable is plugged in;
+            // show charging frame.
+            board::power::WakeSource::ColdBoot if flash_intent && vbus_at_boot => {
+                defmt::info!(
+                    "ui: wake = ColdBoot + flash_intent + VBUS → charging frame \
+                     (probable brown-out from USB plug-in)"
+                );
+                usb_wake_charging_frame(r.display, r.display_backlight, r.battery, flash)
+                    .await;
+            }
+            // Cold boot + flash_intent + no VBUS — most likely a USB-
+            // shield ESD event or a battery-pull while soft-off was
+            // active.  Silent re-sleep — neither warrants user-
+            // visible wake activity.
+            board::power::WakeSource::ColdBoot if flash_intent => {
+                unexpected_wake_resleep(flash).await;
+            }
+            // Genuinely cold boot — fresh power-on without a prior
+            // soft-off in the flash flag.  Boot to Idle.
+            board::power::WakeSource::ColdBoot => {
+                defmt::info!("ui: wake = ColdBoot (no flash_intent) → Idle");
+            }
         }
     }
 
@@ -858,6 +894,21 @@ async fn ui_state_loop(
     let mut scan_running = false;
     let mut scan_plan: Option<BandPlan> = None;
 
+    // Wired-mode USB-loss grace timer.  Tracks the most recent
+    // moment we observed VBUS-present; if that timestamp falls
+    // more than `WIRED_USB_LOSS_GRACE_SECS` seconds behind `now`,
+    // the policy says "USB has been gone too long" and we latch a
+    // [`POWEROFF_REASON_WIRED_USB_LOST`] soft-off.
+    //
+    // Initialised to `now` so a Wired-mode boot with USB absent
+    // still gets the full grace window before shutting down — gives
+    // the user a chance to plug in if they powered on without USB
+    // first.  In `PowerPolicy::Battery` builds this variable is
+    // updated but never consulted (the const-folded check below
+    // short-circuits), so the storage is essentially free.
+    let mut last_vbus_present_at = Instant::now();
+    const WIRED_GRACE: Duration = Duration::from_secs(WIRED_USB_LOSS_GRACE_SECS);
+
     loop {
         // Pet the WDT at every loop iteration top.  Cadence is the
         // scan_tick (~300 ms) plus whatever flash-write time an
@@ -865,12 +916,35 @@ async fn ui_state_loop(
         // Bursts of joystick events may pet faster than that.
         wdt.pet();
 
+        // Wired-mode VBUS tracking.  Sample once per loop iteration
+        // (~300 ms).  USB-state change events on the T114 don't have
+        // an interrupt routed (USBDETECTED is consumed by the SD's
+        // POWER handler for wake-from-System-OFF), so we poll.
+        let vbus = board::battery::vbus_present();
+        if vbus {
+            last_vbus_present_at = Instant::now();
+        }
+        if matches!(POWER_POLICY, PowerPolicy::Wired)
+            && !vbus
+            && Instant::now().duration_since(last_vbus_present_at) >= WIRED_GRACE
+        {
+            defmt::warn!(
+                "ui: Wired mode + USB absent > {} s → latching soft-off",
+                WIRED_USB_LOSS_GRACE_SECS,
+            );
+            POWEROFF_REASON.store(
+                POWEROFF_REASON_WIRED_USB_LOST,
+                core::sync::atomic::Ordering::Release,
+            );
+        }
+
         // Deep soft-off: either `battery_task` latched
-        // `POWEROFF_REASON_LOW_BATTERY` (sustained low Vbat) or the
-        // operator confirmed `Command::PowerOff`.  Both reasons run
-        // the same teardown — radio to SLEEP, display SLPIN + VDD
-        // gate, VEXT off, GPIO SENSE wake on Center, System OFF —
-        // and the helper diverges so we never re-enter this loop.
+        // `POWEROFF_REASON_LOW_BATTERY` (sustained low Vbat), the
+        // operator confirmed `Command::PowerOff`, or the Wired-mode
+        // USB grace timer above expired.  All reasons run the same
+        // teardown — radio to SLEEP, display SLPIN + VDD gate, VEXT
+        // off, GPIO SENSE wake on Center, System OFF — and the
+        // helper diverges so we never re-enter this loop.
         let reason = POWEROFF_REASON.load(core::sync::atomic::Ordering::Acquire);
         if reason != POWEROFF_REASON_NONE {
             enter_soft_off(
@@ -1253,6 +1327,7 @@ async fn enter_soft_off(
     let reason_label = match reason {
         POWEROFF_REASON_OPERATOR => "operator",
         POWEROFF_REASON_LOW_BATTERY => "low-battery",
+        POWEROFF_REASON_WIRED_USB_LOST => "wired-usb-lost",
         _ => "unknown",
     };
     defmt::warn!("ui: deep soft-off ({}) — rendering goodbye", reason_label);
@@ -1356,6 +1431,16 @@ fn build_power_off_goodbye(reason: u8, out: &mut WidgetList) {
             let _ = out.push(Widget::Text {
                 row: 3,
                 text: String::try_from("Plug in to charge").unwrap_or_default(),
+            });
+        }
+        POWEROFF_REASON_WIRED_USB_LOST => {
+            let _ = out.push(Widget::Text {
+                row: 2,
+                text: String::try_from("USB disconnected").unwrap_or_default(),
+            });
+            let _ = out.push(Widget::Text {
+                row: 3,
+                text: String::try_from("Plug back in to wake").unwrap_or_default(),
             });
         }
         _ => {

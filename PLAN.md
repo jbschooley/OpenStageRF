@@ -704,11 +704,13 @@ hardware-switch design (revisit if soft-off proves unreliable in practice).
 cleanly to sub-µA on operator command, wakes on Center press, USB plug-in shows brief
 charging frame and re-sleeps") is done and hardware-verified.  Battery-chemistry
 support landed for LiPo + 1/2/3-cell NiMH (direct, boost-fed, and boost-fed-with-
-fuel-gauge-mod).  Hardware-guide docs cover every configuration including the safety
-notes around mixing 14500 LiPo with primary-AA-form-factor cells and the TP4054 +
-NiMH danger.  Only deferred bullet is the optional TP4054 STAT → GPIO mod, which is
-hardware-side-only and can land whenever someone wants charging-state distinction in
-the UI.
+fuel-gauge-mod).  Power-policy support landed for handheld (`Battery`, default) and
+permanent-install (`Wired`, with a 10 s USB-loss grace timer for hot-mounting on a
+host instrument's USB port).  Hardware-guide docs cover every configuration including
+the safety notes around mixing 14500 LiPo with primary-AA-form-factor cells and the
+TP4054 + NiMH danger.  Only deferred bullet is the optional TP4054 STAT → GPIO mod,
+which is hardware-side-only and can land whenever someone wants charging-state
+distinction in the UI.
 
 ## Total estimate
 

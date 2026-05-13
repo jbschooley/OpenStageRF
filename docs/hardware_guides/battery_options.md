@@ -1,8 +1,17 @@
-# OpenStageRF — Battery Options for the T114
+# OpenStageRF — Battery & Power Options for the T114
 
-This doc covers every battery configuration the firmware currently supports on the Heltec
-Mesh Node T114, the trade-offs between them, and the firmware constant + hardware mods (if
-any) each one requires.  If you want to skim, jump to the [decision table](#which-option).
+This doc covers every battery + power-source configuration the firmware currently supports
+on the Heltec Mesh Node T114, the trade-offs between them, and the firmware constants +
+hardware mods (if any) each one requires.
+
+Two **orthogonal** profile-level constants control behaviour:
+
+- **`BatteryChemistry`** — what cells are wired (LiPo, NiMH-direct, NiMH-via-boost,
+  external regulator).  Controls the OCV table and the soft-off voltage threshold.
+- **`PowerPolicy`** — how the device treats USB presence (handheld battery use vs.
+  permanent install on a host's USB rail).  Controls boot dispatch + auto-shutdown.
+
+If you want to skim, jump to the [decision tables](#which-option).
 
 The T114 ships with an 800 mAh single-cell LiPo pouch wired to a JST-PH on the underside.
 The on-board charger is a TP4054 (LiPo-only, 4.2 V CV) driven from VBUS through a TVS;
@@ -260,6 +269,78 @@ Are you fine with the stock 800 mAh pouch?
 | NiMH Option A    | 3× AA NiMH          | de-pop TP4054, swap to 3× holder                 | `NimhPack { cells: 3 }`                                     | yes        |
 | NiMH Option B    | 1×/2× AA NiMH       | de-pop TP4054, add boost                         | `Regulated { shutdown_mv: 3000, low_mv: 3100 }`             | OK / Low only |
 | NiMH Option C    | 1×/2× AA NiMH       | de-pop TP4054, add boost, add divider on P0_05   | `NimhPack { cells: 1 \| 2 }` + 2-channel SAADC firmware     | yes        |
+
+---
+
+---
+
+## Power policy: handheld vs. permanent install
+
+Independent of which cells you wire, the firmware also picks a `PowerPolicy` controlling
+how the device behaves around USB power.
+
+### `PowerPolicy::Battery` (default)
+
+Handheld / pocketable use.
+
+- User controls on/off explicitly: long-press Left → Right → Center to soft-off; Center
+  press to wake.
+- USB plug-in while soft-off shows a brief 2 s charging frame, then re-sleeps.
+- Stays in real System OFF indefinitely until Center wakes it.
+- This is what the stock t114 profiles ship with.  Use this when the device runs on its
+  own pack and the user actively decides when it's on.
+
+### `PowerPolicy::Wired`
+
+Permanent-install on a host instrument (keytar, keyboard, synth, pedalboard).  The
+device tracks the host's USB power: on when the host is on, off when the host is off.
+
+- **USB plug-in → instant Idle.**  No charging frame, no Center-press required.  Wake
+  source is the existing `USBDETECTED` event from the POWER peripheral; whenever the
+  chip is in real System OFF, plugging USB cold-boots it straight into the UI.
+- **USB unplug → 10-second grace timer.**  The device stays on for 10 s after USB power
+  is lost, in case it's a brief host re-enumeration / loose cable seat.  If USB returns
+  inside the grace window, the timer resets and the device stays up.  If 10 s elapses
+  without recovery, the device soft-offs cleanly through the M8 deep-soft-off pipeline
+  (display off, radio asleep, chip into System OFF).
+- **Optional backup battery.**  A battery is *not* required in Wired mode — the device
+  cold-boots on USB plug-in and dies immediately on unplug if no battery is wired.  When
+  a battery is present, it bridges the 10 s grace window so transient host glitches
+  don't show up as device flicker.
+- **Operator soft-off gesture still works** — but if USB is still present when the SVC
+  fires, the chip immediately wakes via USB detect and reboots back to Idle.  Net effect
+  is a 2–3 second restart.
+
+Tunable in `core/ui/src/lib.rs`:
+
+- `WIRED_USB_LOSS_GRACE_SECS` — 10 seconds.  Make it shorter if you want snappier
+  shutoffs; longer if your host has noisier USB power.
+
+**Use this policy when**: the device lives on the host instrument and shouldn't require
+the operator to press buttons to power it on.  Mounting it inside a keytar or under a
+keyboard control panel, wired to one of the host's USB ports — the firmware just tracks
+"is the host on?"
+
+**Firmware**:
+
+```rust
+const POWER_POLICY: PowerPolicy = PowerPolicy::Wired;
+```
+
+**Decision table**:
+
+| Scenario                                         | Battery policy                | Wired policy                       |
+|--------------------------------------------------|--------------------------------|------------------------------------|
+| Power on the device for a gig                    | Center press                   | Plug in (or turn on the host)      |
+| Power off the device after a gig                 | Long-press Left → Right → Center | Unplug (or turn off the host)    |
+| USB plug-in while soft-off                       | brief charging frame, re-sleep | instant Idle                       |
+| USB unplug while running                         | nothing (battery only)         | 10 s grace, then soft-off          |
+| USB temporarily disconnected (<10 s)             | n/a                            | device stays on through the dip    |
+| Battery dies mid-use (no USB)                    | low-battery shutdown           | low-battery shutdown               |
+| Battery dies mid-use (USB present)               | charging continues             | charging continues (Wired ignores) |
+| Fresh power-on, no USB, no battery in            | impossible (no power)          | impossible (no power)              |
+| Fresh power-on, no USB, battery in               | Idle, awaits Center to stay    | Idle for 10 s, then soft-off       |
+| Fresh power-on, USB plugged                      | Idle                           | Idle                               |
 
 ---
 
