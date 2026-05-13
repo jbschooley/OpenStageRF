@@ -12,7 +12,7 @@ allow = [
     "CC0-1.0",
     "AGPL-3.0-or-later",
 ]
-unused-allowed-licenses = "warn"
+unused-allowed-license = "warn"
 
 [bans]
 multiple-versions = "warn"

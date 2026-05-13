@@ -1,0 +1,167 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel in-flight runs for the same PR / branch when a newer commit lands —
+# saves runner time on rebases.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── fmt ────────────────────────────────────────────────────────────
+  # Single-pass `cargo fmt --check` across the workspace.  Cheapest job;
+  # surfaces formatting drift before anything else burns runner time.
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # ── audit ──────────────────────────────────────────────────────────
+  # `cargo xtask audit` enforces the portability + no-alloc guardrails
+  # documented in PLAN.md § Embassy → Zephyr portability.  Catches new
+  # `embassy-*` HAL leaks or `extern crate alloc` imports landing in
+  # `core/`, `drivers/`, `protocols/`, `crypto/`, or `apps/`.
+  #
+  # We invoke xtask directly with `--target x86_64-unknown-linux-gnu`
+  # rather than via the `cargo xtask` alias because the alias hardcodes
+  # `aarch64-apple-darwin` (developer-local).
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: host-x86_64
+      - run: cargo run --target x86_64-unknown-linux-gnu -p osrf-xtask -- audit
+
+  # ── deny ───────────────────────────────────────────────────────────
+  # License + advisory + multiple-version checks per the workspace's
+  # `deny.toml`.  Fails on disallowed licences, security advisories,
+  # and (after a grace period) duplicated dependency versions.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --workspace
+
+  # ── host-test ──────────────────────────────────────────────────────
+  # Unit + integration tests for the no_std-but-host-runnable crates.
+  # These are the shared crates with no HAL deps: pure-Rust logic that
+  # `cargo test` can execute on the CI runner's native target.
+  #
+  # `--target x86_64-unknown-linux-gnu` overrides the workspace's
+  # `[build].target = "thumbv7m-none-eabi"` from `.cargo/config.toml`,
+  # which otherwise would try to compile tests for the embedded target
+  # (no std → link failure).
+  host-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: host-x86_64
+      - name: cargo test (shared crates)
+        run: |
+          set -e
+          for crate in \
+            osrf-ui \
+            osrf-link \
+            osrf-midi-din \
+            osrf-protocols-midi-v1 \
+            osrf-driver-input-joystick5way \
+            osrf-radio-sx126x \
+            osrf-driver-display-st7789
+          do
+            echo "::group::cargo test -p $crate"
+            cargo test --target x86_64-unknown-linux-gnu -p "$crate"
+            echo "::endgroup::"
+          done
+
+  # ── clippy ─────────────────────────────────────────────────────────
+  # Lint shared crates with `-D warnings`.  Per-crate so each runs on
+  # the right target — embedded-only crates would otherwise fail to
+  # link std-using tests against the host target.
+  #
+  # Profile / board crates are linted via the embedded-build job below
+  # (cargo build catches the same warning escalation when run with the
+  # right `--target`).
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: host-x86_64
+      - name: cargo clippy (shared crates)
+        run: |
+          set -e
+          for crate in \
+            osrf-ui \
+            osrf-link \
+            osrf-midi-din \
+            osrf-protocols-midi-v1 \
+            osrf-driver-input-joystick5way \
+            osrf-radio-sx126x \
+            osrf-driver-display-st7789 \
+            osrf-link-runtime \
+            osrf-panic-log \
+            osrf-app-midi-node \
+            osrf-app-ui-runtime
+          do
+            echo "::group::cargo clippy -p $crate"
+            cargo clippy --target x86_64-unknown-linux-gnu -p "$crate" --no-deps -- -D warnings
+            echo "::endgroup::"
+          done
+
+  # ── embedded-build ─────────────────────────────────────────────────
+  # Build canary profiles for each supported board to catch breakage
+  # of the profile / board / driver layers.  `cargo xtask check`
+  # resolves each profile's board → target from its
+  # `[package.metadata.osrf]` block, so we just enumerate the profile
+  # names here.
+  #
+  # Profiles in the matrix exercise different feature combinations:
+  #   - `*_blink`       — bare-minimum board bring-up.
+  #   - `*_midi_tx/rx`  — link runtime + MIDI app on each board.
+  #   - `t114_ui`       — the full UI / battery / power-policy stack.
+  embedded-build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          - dx_lr30_blink
+          - dx_lr30_midi_tx
+          - dx_lr30_midi_rx
+          - t114_blink
+          - t114_midi_tx
+          - t114_midi_rx
+          - t114_ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: thumbv7m-none-eabi, thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: embedded-${{ matrix.profile }}
+      - run: cargo run --target x86_64-unknown-linux-gnu -p osrf-xtask -- check ${{ matrix.profile }}

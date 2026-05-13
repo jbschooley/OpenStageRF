@@ -174,7 +174,13 @@ pub fn decode(buf: &[u8]) -> Result<(Header, &[u8]), DecodeError> {
     let event_type = EventType::from_u8(event_type_byte);
     let body = &buf[HEADER_LEN..];
     Ok((
-        Header { ver, key_fp, boot_counter, packet_seq, event_type },
+        Header {
+            ver,
+            key_fp,
+            boot_counter,
+            packet_seq,
+            event_type,
+        },
         body,
     ))
 }
@@ -286,9 +292,17 @@ pub fn parse_sysex_fragment(body: &[u8]) -> Result<SysExFragmentParts<'_>, SysEx
         return Err(SysExParseError::InvalidFragTotal);
     }
     if frag_idx >= frag_total {
-        return Err(SysExParseError::InvalidFragIdx { idx: frag_idx, total: frag_total });
+        return Err(SysExParseError::InvalidFragIdx {
+            idx: frag_idx,
+            total: frag_total,
+        });
     }
-    Ok(SysExFragmentParts { sysex_id, frag_idx, frag_total, data })
+    Ok(SysExFragmentParts {
+        sysex_id,
+        frag_idx,
+        frag_total,
+        data,
+    })
 }
 
 pub fn encode_sysex_fragment_body(
@@ -341,7 +355,11 @@ pub struct PacketReplayWindow32 {
 
 impl PacketReplayWindow32 {
     pub const fn new() -> Self {
-        Self { high: 0, bitmap: 0, initialised: false }
+        Self {
+            high: 0,
+            bitmap: 0,
+            initialised: false,
+        }
     }
 
     pub fn reset(&mut self) {
@@ -408,7 +426,11 @@ pub struct EventReplayWindow16 {
 
 impl EventReplayWindow16 {
     pub const fn new() -> Self {
-        Self { high: 0, bitmap: 0, initialised: false }
+        Self {
+            high: 0,
+            bitmap: 0,
+            initialised: false,
+        }
     }
 
     pub fn reset(&mut self) {
@@ -489,10 +511,7 @@ mod tests {
     fn round_trip_channel_voice() {
         let hdr = h(0xABCD, 0x1234_5678, EventType::ChannelVoice);
         // Body: (seq=1, NoteOn 60 100), (seq=2, NoteOn 64 100)
-        let body = [
-            0x00, 0x01, 0x90, 60, 100,
-            0x00, 0x02, 0x90, 64, 100,
-        ];
+        let body = [0x00, 0x01, 0x90, 60, 100, 0x00, 0x02, 0x90, 64, 100];
         let mut buf = [0u8; 32];
         let n = encode(&mut buf, &hdr, &body).unwrap();
         assert_eq!(n, HEADER_LEN + body.len());
@@ -567,9 +586,7 @@ mod tests {
     fn channel_voice_iter_yields_each_event() {
         // (seq=10, NoteOn C, NoteOn E, NoteOn G)
         let body = [
-            0x00, 0x0A, 0x90, 60, 100,
-            0x00, 0x0B, 0x90, 64, 100,
-            0x00, 0x0C, 0x90, 67, 100,
+            0x00, 0x0A, 0x90, 60, 100, 0x00, 0x0B, 0x90, 64, 100, 0x00, 0x0C, 0x90, 67, 100,
         ];
         let events: std::vec::Vec<_> = ChannelVoiceIter::new(&body)
             .collect::<Result<_, _>>()
@@ -584,9 +601,7 @@ mod tests {
     fn channel_voice_iter_handles_mixed_lengths() {
         // ProgramChange (2 bytes) + NoteOn (3 bytes) + TimingClock (1 byte)
         let body = [
-            0x00, 0x01, 0xC5, 42,
-            0x00, 0x02, 0x90, 60, 100,
-            0x00, 0x03, 0xF8,
+            0x00, 0x01, 0xC5, 42, 0x00, 0x02, 0x90, 60, 100, 0x00, 0x03, 0xF8,
         ];
         let events: std::vec::Vec<_> = ChannelVoiceIter::new(&body)
             .collect::<Result<_, _>>()
@@ -721,7 +736,10 @@ mod tests {
     fn encode_rejects_buffer_too_small() {
         let mut buf = [0u8; 5];
         let hdr = h(0, 0, EventType::Heartbeat);
-        assert_eq!(encode(&mut buf, &hdr, &[]), Err(EncodeError::BufferTooSmall));
+        assert_eq!(
+            encode(&mut buf, &hdr, &[]),
+            Err(EncodeError::BufferTooSmall)
+        );
     }
 
     // ── PacketReplayWindow32 ─────────────────────────────────────────────
@@ -768,10 +786,7 @@ mod tests {
         let mut w = PacketReplayWindow32::new();
         assert_eq!(w.check_and_advance(200_000), CheckOutcome::Accept);
         // Jump backward by 100_000+ → session reset.
-        assert_eq!(
-            w.check_and_advance(50),
-            CheckOutcome::AcceptSessionReset
-        );
+        assert_eq!(w.check_and_advance(50), CheckOutcome::AcceptSessionReset);
         // Window reset to new high.
         assert_eq!(w.check_and_advance(50), CheckOutcome::Replay);
         assert_eq!(w.check_and_advance(51), CheckOutcome::Accept);

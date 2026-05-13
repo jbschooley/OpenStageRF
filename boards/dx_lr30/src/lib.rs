@@ -40,16 +40,16 @@ bind_interrupts!(struct Irqs {
 // ── Built-in SX1262 radio on SPI1 ────────────────────────────────────────────
 pub mod radio0 {
     use embassy_stm32::peripherals;
-    pub type Spi  = peripherals::SPI1;
-    pub type Sck  = peripherals::PA5;
+    pub type Spi = peripherals::SPI1;
+    pub type Sck = peripherals::PA5;
     pub type Miso = peripherals::PA6;
     pub type Mosi = peripherals::PA7;
-    pub type Cs   = peripherals::PA4;
+    pub type Cs = peripherals::PA4;
     pub type Busy = peripherals::PA2;
-    pub type Dio1 = peripherals::PC15;  // OSC32_OUT repurposed as GPIO
+    pub type Dio1 = peripherals::PC15; // OSC32_OUT repurposed as GPIO
     pub type Nrst = peripherals::PA3;
-    pub type Txen = peripherals::PA0;   // RF-switch TX path
-    pub type Rxen = peripherals::PA1;   // RF-switch RX path
+    pub type Txen = peripherals::PA0; // RF-switch TX path
+    pub type Rxen = peripherals::PA1; // RF-switch RX path
 }
 
 // ── Default radio1 pinout for dual_spi_diff_bus ──────────────────────────────
@@ -57,14 +57,14 @@ pub mod radio0 {
 // by defining their own radio1 module if a different pin set is needed.
 pub mod dual_spi_diff_bus_radio1 {
     use embassy_stm32::peripherals;
-    pub type Spi  = peripherals::SPI2;
-    pub type Sck  = peripherals::PB13;
+    pub type Spi = peripherals::SPI2;
+    pub type Sck = peripherals::PB13;
     pub type Miso = peripherals::PB14;
     pub type Mosi = peripherals::PB15;
-    pub type Cs   = peripherals::PB12;  // SPI2_NSS
+    pub type Cs = peripherals::PB12; // SPI2_NSS
     pub type Busy = peripherals::PB5;
     pub type Dio1 = peripherals::PA8;
-    pub type Nrst = peripherals::PC14;  // OSC32_IN repurposed as GPIO
+    pub type Nrst = peripherals::PC14; // OSC32_IN repurposed as GPIO
 }
 
 // Note: `dual_spi_same_bus_radio1` would be possible (radio1 sharing SPI1
@@ -76,16 +76,16 @@ pub mod dual_spi_diff_bus_radio1 {
 pub mod midi_uart {
     use embassy_stm32::peripherals;
     pub type Uart = peripherals::USART3;
-    pub type Tx   = peripherals::PB10;
-    pub type Rx   = peripherals::PB11;
+    pub type Tx = peripherals::PB10;
+    pub type Rx = peripherals::PB11;
 }
 
 // ── Debug UART (CH340C bridge on USART1) ─────────────────────────────────────
 pub mod debug_uart {
     use embassy_stm32::peripherals;
     pub type Uart = peripherals::USART1;
-    pub type Tx   = peripherals::PA9;
-    pub type Rx   = peripherals::PA10;
+    pub type Tx = peripherals::PA9;
+    pub type Rx = peripherals::PA10;
 }
 
 // ── Status LED (active-low) ──────────────────────────────────────────────────
@@ -105,10 +105,10 @@ pub mod oled_i2c {
 // ── 5-way joystick add-on ────────────────────────────────────────────────────
 pub mod joystick {
     use embassy_stm32::peripherals;
-    pub type Up     = peripherals::PA8;
-    pub type Down   = peripherals::PB8;
-    pub type Left   = peripherals::PB9;
-    pub type Right  = peripherals::PB3;
+    pub type Up = peripherals::PA8;
+    pub type Down = peripherals::PB8;
+    pub type Left = peripherals::PB9;
+    pub type Right = peripherals::PB3;
     pub type Center = peripherals::PB4;
 }
 
@@ -132,14 +132,21 @@ pub fn init() -> embassy_stm32::Peripherals {
 /// GPIO NRESET + two-pin RF switch (TXEN/RXEN).
 pub type Radio0 = osrf_radio_sx126x::Sx1262Radio<
     embedded_hal_bus::spi::ExclusiveDevice<
-        embassy_stm32::spi::Spi<'static, embassy_stm32::mode::Async, embassy_stm32::spi::mode::Master>,
+        embassy_stm32::spi::Spi<
+            'static,
+            embassy_stm32::mode::Async,
+            embassy_stm32::spi::mode::Master,
+        >,
         embassy_stm32::gpio::Output<'static>,
         embassy_time::Delay,
     >,
     embassy_stm32::exti::ExtiInput<'static, embassy_stm32::mode::Async>, // BUSY (PA2)
     embassy_stm32::exti::ExtiInput<'static, embassy_stm32::mode::Async>, // DIO1
     embassy_stm32::gpio::Output<'static>,
-    osrf_radio_sx126x::PinRfSwitch<embassy_stm32::gpio::Output<'static>, embassy_stm32::gpio::Output<'static>>,
+    osrf_radio_sx126x::PinRfSwitch<
+        embassy_stm32::gpio::Output<'static>,
+        embassy_stm32::gpio::Output<'static>,
+    >,
 >;
 
 /// SSD1306 128×64 mono OLED on I²C1 (PB6=SCL, PB7=SDA), async via
@@ -150,7 +157,9 @@ pub type Radio0 = osrf_radio_sx126x::Sx1262Radio<
 /// drawing — `resources()` returns an *un-initialised* display because
 /// it is itself sync.
 pub type Display = ssd1306::Ssd1306Async<
-    ssd1306::prelude::I2CInterface<embassy_stm32::i2c::I2c<'static, embassy_stm32::mode::Async, embassy_stm32::i2c::Master>>,
+    ssd1306::prelude::I2CInterface<
+        embassy_stm32::i2c::I2c<'static, embassy_stm32::mode::Async, embassy_stm32::i2c::Master>,
+    >,
     ssd1306::prelude::DisplaySize128x64,
     ssd1306::mode::BufferedGraphicsModeAsync<ssd1306::prelude::DisplaySize128x64>,
 >;
@@ -197,10 +206,10 @@ pub struct Resources {
 
 /// Initialise hardware and bundle the common peripherals into `Resources`.
 pub fn resources() -> Resources {
+    use embassy_stm32::exti::ExtiInput;
     use embassy_stm32::gpio::{Level, Output, Pull, Speed};
     use embassy_stm32::spi::{Config as SpiConfig, Spi};
     use embassy_stm32::time::Hertz;
-    use embassy_stm32::exti::ExtiInput;
 
     let p = init();
 
@@ -211,14 +220,12 @@ pub fn resources() -> Resources {
     let mut spi_cfg = SpiConfig::default();
     spi_cfg.frequency = Hertz(8_000_000);
     let spi = Spi::new(
-        p.SPI1,
-        p.PA5,        // SCK
-        p.PA7,        // MOSI
-        p.PA6,        // MISO
-        p.DMA1_CH3,   // TX DMA
-        p.DMA1_CH2,   // RX DMA
-        Irqs,
-        spi_cfg,
+        p.SPI1, p.PA5,      // SCK
+        p.PA7,      // MOSI
+        p.PA6,      // MISO
+        p.DMA1_CH3, // TX DMA
+        p.DMA1_CH2, // RX DMA
+        Irqs, spi_cfg,
     );
     let cs = Output::new(p.PA4, Level::High, Speed::Medium);
     let spi_dev = embedded_hal_bus::spi::ExclusiveDevice::new(spi, cs, embassy_time::Delay)
@@ -290,13 +297,11 @@ pub fn resources() -> Resources {
     let mut i2c_cfg = embassy_stm32::i2c::Config::default();
     i2c_cfg.frequency = embassy_stm32::time::Hertz(400_000);
     let i2c = embassy_stm32::i2c::I2c::new(
-        p.I2C1,
-        p.PB6,        // SCL
-        p.PB7,        // SDA
-        p.DMA1_CH6,   // TX DMA (RM0008 table 78: I2C1_TX → CH6)
-        p.DMA1_CH7,   // RX DMA (I2C1_RX → CH7)
-        Irqs,
-        i2c_cfg,
+        p.I2C1, p.PB6,      // SCL
+        p.PB7,      // SDA
+        p.DMA1_CH6, // TX DMA (RM0008 table 78: I2C1_TX → CH6)
+        p.DMA1_CH7, // RX DMA (I2C1_RX → CH7)
+        Irqs, i2c_cfg,
     );
     let interface = ssd1306::I2CDisplayInterface::new(i2c);
     let display = ssd1306::Ssd1306Async::new(
@@ -306,5 +311,10 @@ pub fn resources() -> Resources {
     )
     .into_buffered_graphics_mode();
 
-    Resources { status_led, radio0, midi_uart, display }
+    Resources {
+        status_led,
+        radio0,
+        midi_uart,
+        display,
+    }
 }

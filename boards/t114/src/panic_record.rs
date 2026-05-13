@@ -149,10 +149,7 @@ pub unsafe fn take_panic_record() -> Option<PanicStaging> {
     let record = core::ptr::read(pending_ptr);
     // Clear the magic.  We could also zero the whole buffer but
     // that's wasted cycles — magic alone gates the recovery.
-    core::ptr::write_volatile(
-        core::ptr::addr_of_mut!((*pending_ptr).magic),
-        0,
-    );
+    core::ptr::write_volatile(core::ptr::addr_of_mut!((*pending_ptr).magic), 0);
     Some(record)
 }
 
@@ -263,7 +260,10 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
                 Ok(())
             }
         }
-        let mut w = SliceWriter { buf: &mut buf, n: 0 };
+        let mut w = SliceWriter {
+            buf: &mut buf,
+            n: 0,
+        };
         let _ = write!(&mut w, "{}", info);
         w.n
     };
@@ -283,10 +283,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         );
         // Magic last — readers gate on this, so a partially-staged
         // record is never seen as valid.
-        core::ptr::write_volatile(
-            core::ptr::addr_of_mut!((*pending_ptr).magic),
-            PANIC_MAGIC,
-        );
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*pending_ptr).magic), PANIC_MAGIC);
     }
 
     #[cfg(feature = "defmt")]

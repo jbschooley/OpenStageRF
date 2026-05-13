@@ -49,7 +49,7 @@ pub const MAX_KEY_NAME: usize = 16;
 pub const KEY_MATERIAL_LEN: usize = 32;
 
 /// On-flash representation of a single key store entry.  Fixed size
-/// + `#[repr(C)]` so the byte layout is stable across firmware
+/// with `#[repr(C)]` so the byte layout is stable across firmware
 /// revisions — this is the v1 commitment that Stage 3 AEAD work
 /// won't have to migrate around.  Read / written via
 /// `sequential-storage::map` keyed by the 24-bit fingerprint.
@@ -192,6 +192,7 @@ impl KeyStore {
     /// success, or `Err` if the store is full or the fingerprint
     /// is `0x000000` (reserved) or already present.  Names need
     /// not be unique.
+    #[allow(clippy::result_unit_err)] // Stage 3 will replace with a typed error.
     pub fn add(&mut self, name: &str, fingerprint: u32) -> Result<u32, ()> {
         let fp = fingerprint & 0x00FF_FFFF;
         if fp == 0 {
@@ -245,10 +246,7 @@ impl KeyStore {
     /// over a sorted view) because heapless::Vec doesn't give
     /// us a place to materialise the sort cheaply, and we don't
     /// want to mutate the underlying store.
-    pub fn sorted_into<'a>(
-        &self,
-        buf: &'a mut [KeyEntry; MAX_KEYS],
-    ) -> &'a [KeyEntry] {
+    pub fn sorted_into<'a>(&self, buf: &'a mut [KeyEntry; MAX_KEYS]) -> &'a [KeyEntry] {
         let n = self.entries.len();
         for (i, e) in self.entries.iter().enumerate() {
             buf[i] = e.clone();

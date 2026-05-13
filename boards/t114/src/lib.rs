@@ -37,10 +37,10 @@ pub mod framebuffer;
 pub mod panic_record;
 pub mod power;
 pub mod softdevice;
-pub mod wakeflag;
 pub mod storage;
 #[cfg(feature = "usb-log")]
 pub mod usb_log;
+pub mod wakeflag;
 
 // `BufferedUarte` (used for the MIDI UART so we can expose
 // `embedded_io_async::Read`) needs UARTE1's interrupt bound to its own
@@ -58,11 +58,11 @@ bind_interrupts!(pub struct Irqs {
 // directly.  Set DIO2_AS_RF_SWITCH in the SX126x driver config.
 pub mod radio0 {
     use embassy_nrf::peripherals;
-    pub type Spi  = peripherals::TWISPI0;
-    pub type Sck  = peripherals::P0_19;
+    pub type Spi = peripherals::TWISPI0;
+    pub type Sck = peripherals::P0_19;
     pub type Miso = peripherals::P0_23;
     pub type Mosi = peripherals::P0_22;
-    pub type Cs   = peripherals::P0_24;
+    pub type Cs = peripherals::P0_24;
     pub type Busy = peripherals::P0_17;
     pub type Dio1 = peripherals::P0_20;
     pub type Nrst = peripherals::P0_25;
@@ -73,11 +73,11 @@ pub mod radio0 {
 // Profiles can override by defining their own radio1 module.
 pub mod dual_spi_diff_bus_radio1 {
     use embassy_nrf::peripherals;
-    pub type Spi  = peripherals::SPI3;
-    pub type Sck  = peripherals::P0_28;
+    pub type Spi = peripherals::SPI3;
+    pub type Sck = peripherals::P0_28;
     pub type Miso = peripherals::P0_29;
     pub type Mosi = peripherals::P0_30;
-    pub type Cs   = peripherals::P0_31;
+    pub type Cs = peripherals::P0_31;
     pub type Busy = peripherals::P1_13;
     pub type Dio1 = peripherals::P1_15;
     pub type Nrst = peripherals::P0_05;
@@ -97,8 +97,8 @@ pub mod dual_spi_diff_bus_radio1 {
 pub mod midi_uart {
     use embassy_nrf::peripherals;
     pub type Uart = peripherals::UARTE1;
-    pub type Rx   = peripherals::P0_09;
-    pub type Tx   = peripherals::P0_10;
+    pub type Rx = peripherals::P0_09;
+    pub type Tx = peripherals::P0_10;
 }
 
 // ── User button ──────────────────────────────────────────────────────────────
@@ -130,10 +130,10 @@ pub mod joystick {
     // claims P0_28..P0_31 + P1_13/P1_15 + P0_05) or with the display
     // (which uses P0_02/P0_03/P0_11/P0_12/P0_15/P1_08/P1_09) or with
     // MIDI UART (P0_09/P0_10).
-    pub type Up     = peripherals::P1_14;
-    pub type Right  = peripherals::P1_12;
-    pub type Left   = peripherals::P0_07;
-    pub type Down   = peripherals::P0_08;
+    pub type Up = peripherals::P1_14;
+    pub type Right = peripherals::P1_12;
+    pub type Left = peripherals::P0_07;
+    pub type Down = peripherals::P0_08;
     pub type Center = peripherals::P0_13;
 }
 
@@ -328,7 +328,10 @@ pub fn resources_with(config: embassy_nrf::config::Config) -> Resources {
 /// peripheral stays idle) until the caller actually starts a USB driver.
 pub fn resources_and_usbd_with(
     config: embassy_nrf::config::Config,
-) -> (Resources, embassy_nrf::Peri<'static, embassy_nrf::peripherals::USBD>) {
+) -> (
+    Resources,
+    embassy_nrf::Peri<'static, embassy_nrf::peripherals::USBD>,
+) {
     let p = init_with(config);
     build_resources(p)
 }
@@ -339,7 +342,10 @@ pub fn resources_and_usbd_with(
 /// function boundary.
 fn build_resources(
     p: embassy_nrf::Peripherals,
-) -> (Resources, embassy_nrf::Peri<'static, embassy_nrf::peripherals::USBD>) {
+) -> (
+    Resources,
+    embassy_nrf::Peri<'static, embassy_nrf::peripherals::USBD>,
+) {
     use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
     use embassy_nrf::spim::{Config as SpimConfig, Frequency, Spim, MODE_0};
 
@@ -362,9 +368,7 @@ fn build_resources(
     spi_cfg.frequency = Frequency::M8;
     spi_cfg.mode = MODE_0;
     let spi = Spim::new(
-        p.TWISPI0,
-        Irqs,
-        p.P0_19, // SCK
+        p.TWISPI0, Irqs, p.P0_19, // SCK
         p.P0_23, // MISO
         p.P0_22, // MOSI
         spi_cfg,

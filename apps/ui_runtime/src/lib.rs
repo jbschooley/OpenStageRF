@@ -49,7 +49,9 @@ use embassy_time::{Duration, Instant, Timer};
 
 use osrf_app_midi_node::LinkConfig;
 use osrf_driver_input_joystick5way::JoystickEvent;
-use osrf_link_runtime::{LinkConfigSignal, LinkStatsCell, LinkStats, ScanController, ShutdownSignal};
+use osrf_link_runtime::{
+    LinkConfigSignal, LinkStats, LinkStatsCell, ScanController, ShutdownSignal,
+};
 use osrf_ui::{
     band_plan_channel, band_plan_index, build_screen, max_channel_index, AboutData, BandPlan,
     BatteryChemistry, BatteryStatus, Command, KeyStore, LinkStatus, PowerPolicy, ScanState,
@@ -673,10 +675,16 @@ pub fn build_charging_frame(status: BatteryStatus, out: &mut WidgetList) {
     let _ = out.push(Widget::Title(short_str::<24>("Charging")));
     let mut mv_text: heapless::String<24> = heapless::String::new();
     let _ = write!(&mut mv_text, "{} mV", status.voltage_mv);
-    let _ = out.push(Widget::Text { row: 2, text: mv_text });
+    let _ = out.push(Widget::Text {
+        row: 2,
+        text: mv_text,
+    });
     let mut pct_text: heapless::String<24> = heapless::String::new();
     let _ = write!(&mut pct_text, "{}%", status.percent);
-    let _ = out.push(Widget::Text { row: 3, text: pct_text });
+    let _ = out.push(Widget::Text {
+        row: 3,
+        text: pct_text,
+    });
     let _ = out.push(Widget::BatteryIndicator {
         voltage_mv: status.voltage_mv,
         percent: status.percent,
@@ -734,9 +742,8 @@ where
                 status.percent
             );
         }
-        let shutdown_eligible = !plugged_in
-            && mv >= chemistry.no_battery_mv()
-            && mv <= chemistry.shutdown_mv();
+        let shutdown_eligible =
+            !plugged_in && mv >= chemistry.no_battery_mv() && mv <= chemistry.shutdown_mv();
         if shutdown_eligible {
             shutdown_run = shutdown_run.saturating_add(1);
             if !shutdown_fired && shutdown_run >= SHUTDOWN_BATTERY_SUSTAINED_SAMPLES {
@@ -802,24 +809,23 @@ where
     {
         Ok(Some(v)) => settings.channel = v as u8,
         Ok(None) => defmt::info!("persist: no stored channel, using default"),
-        Err(e) => defmt::warn!("persist: load channel failed: {:?}", defmt::Debug2Format(&e)),
+        Err(e) => defmt::warn!(
+            "persist: load channel failed: {:?}",
+            defmt::Debug2Format(&e)
+        ),
     }
-    match map::fetch_item::<u8, u32, _>(
-        flash,
-        range.clone(),
-        &mut cache,
-        &mut buf,
-        &KEY_BAND_PLAN,
-    )
-    .await
+    match map::fetch_item::<u8, u32, _>(flash, range.clone(), &mut cache, &mut buf, &KEY_BAND_PLAN)
+        .await
     {
         Ok(Some(v)) if (v as usize) < BAND_PLANS.len() => {
             settings.band_plan = BAND_PLANS[v as usize];
         }
-        Ok(Some(v)) => defmt::warn!(
-            "persist: stored band_plan index {} out of range, using default",
-            v
-        ),
+        Ok(Some(v)) => {
+            defmt::warn!(
+                "persist: stored band_plan index {} out of range, using default",
+                v
+            )
+        }
         Ok(None) => defmt::info!("persist: no stored band_plan, using default"),
         Err(e) => defmt::warn!(
             "persist: load band_plan failed: {:?}",
@@ -831,7 +837,10 @@ where
     {
         Ok(Some(v)) => settings.tx_power_dbm = v as i8,
         Ok(None) => defmt::info!("persist: no stored tx_power, using default"),
-        Err(e) => defmt::warn!("persist: load tx_power failed: {:?}", defmt::Debug2Format(&e)),
+        Err(e) => defmt::warn!(
+            "persist: load tx_power failed: {:?}",
+            defmt::Debug2Format(&e)
+        ),
     }
     match map::fetch_item::<u8, u32, _>(flash, range, &mut cache, &mut buf, &KEY_ACTIVE_KEY_FP)
         .await
@@ -860,7 +869,11 @@ where
     if let Err(e) =
         map::store_item::<u8, u32, _>(flash, range, &mut cache, &mut buf, &key, &value).await
     {
-        defmt::warn!("persist: save {} failed: {:?}", what, defmt::Debug2Format(&e));
+        defmt::warn!(
+            "persist: save {} failed: {:?}",
+            what,
+            defmt::Debug2Format(&e)
+        );
     }
 }
 
@@ -873,7 +886,11 @@ where
     if let Err(e) =
         map::store_item::<u8, i32, _>(flash, range, &mut cache, &mut buf, &key, &value).await
     {
-        defmt::warn!("persist: save {} failed: {:?}", what, defmt::Debug2Format(&e));
+        defmt::warn!(
+            "persist: save {} failed: {:?}",
+            what,
+            defmt::Debug2Format(&e)
+        );
     }
 }
 
@@ -941,14 +958,8 @@ where
 {
     let mut buf = [0u8; PERSIST_BUF_LEN];
     let mut cache = NoCache::new();
-    match map::fetch_item::<u8, u32, _>(
-        flash,
-        range,
-        &mut cache,
-        &mut buf,
-        &KEY_SOFT_OFF_INTENT,
-    )
-    .await
+    match map::fetch_item::<u8, u32, _>(flash, range, &mut cache, &mut buf, &KEY_SOFT_OFF_INTENT)
+        .await
     {
         Ok(Some(v)) => v == 1,
         Ok(None) => false,

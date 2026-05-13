@@ -1,0 +1,4 @@
+# rustfmt defaults are fine workspace-wide.  For the few table-driven
+# statics where collapsed one-line entries read clearer than the default
+# field-per-line break (menus, band plans), annotate the declaration
+# with `#[rustfmt::skip]` at the source.

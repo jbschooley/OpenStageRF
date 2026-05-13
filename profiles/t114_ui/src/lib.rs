@@ -120,13 +120,8 @@ fn vbus_present_fn() -> bool {
 
 // ── Joystick type alias ─────────────────────────────────────────
 
-type Joystick = Joystick5Way<
-    Input<'static>,
-    Input<'static>,
-    Input<'static>,
-    Input<'static>,
-    Input<'static>,
->;
+type Joystick =
+    Joystick5Way<Input<'static>, Input<'static>, Input<'static>, Input<'static>, Input<'static>>;
 
 // ── Watchdog timing ─────────────────────────────────────────────
 
@@ -174,8 +169,7 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
 
     // Boot dispatch — see the per-chemistry/policy/wake matrix
     // in `osrf_app_ui_runtime` docs and the comments below.
-    let flash_intent =
-        app::load_soft_off_intent(&mut flash, board::storage::SETTINGS_RANGE).await;
+    let flash_intent = app::load_soft_off_intent(&mut flash, board::storage::SETTINGS_RANGE).await;
     let vbus_at_boot = board::battery::vbus_present();
 
     // Wired-mode short-circuit: any wake path → Idle (the 10 s
@@ -306,8 +300,7 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     let (_wdt, [wdt_main, wdt_render]) =
         Watchdog::try_new(r.wdt, wdt_config).expect("WDT already configured differently");
 
-    spawner
-        .spawn(ui_render_task(display, fb, renderer, wdt_render).expect("alloc ui_render_task"));
+    spawner.spawn(ui_render_task(display, fb, renderer, wdt_render).expect("alloc ui_render_task"));
 
     // ── link_runtime on its own interrupt executor at P2 ─────────
     let config = app::link_config_from(&settings);
@@ -320,8 +313,7 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
         Role::Rx => {
             let sink = UartMidiSink::new(r.midi_uart);
             spawner_link.spawn(
-                link_rx_task(r.radio0, r.status_led, sink, config)
-                    .expect("alloc link_rx_task"),
+                link_rx_task(r.radio0, r.status_led, sink, config).expect("alloc link_rx_task"),
             );
         }
         Role::Tx => {
@@ -330,26 +322,15 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
                 TxSource::Uart => {
                     let source = UartMidiSource::new(r.midi_uart);
                     spawner_link.spawn(
-                        link_tx_uart_task(
-                            r.radio0,
-                            r.status_led,
-                            source,
-                            boot_counter,
-                            config,
-                        )
-                        .expect("alloc link_tx_uart_task"),
+                        link_tx_uart_task(r.radio0, r.status_led, source, boot_counter, config)
+                            .expect("alloc link_tx_uart_task"),
                     );
                 }
                 TxSource::Scenario => {
                     defmt::info!("ui_bench_tx: synthetic scenario source running");
                     spawner_link.spawn(
-                        link_tx_scenario_task(
-                            r.radio0,
-                            r.status_led,
-                            boot_counter,
-                            config,
-                        )
-                        .expect("alloc link_tx_scenario_task"),
+                        link_tx_scenario_task(r.radio0, r.status_led, boot_counter, config)
+                            .expect("alloc link_tx_scenario_task"),
                     );
                 }
             }
@@ -531,8 +512,7 @@ async fn usb_wake_charging_frame(
     // SAFETY: same FRAMEBUFFER borrow as the normal-boot path, but
     // we're on the USB-wake branch so the normal path's borrow
     // never runs.  Single-owner across this boot.
-    let fb: &'static mut Framebuffer =
-        unsafe { &mut *core::ptr::addr_of_mut!(FRAMEBUFFER) };
+    let fb: &'static mut Framebuffer = unsafe { &mut *core::ptr::addr_of_mut!(FRAMEBUFFER) };
     let scan = osrf_ui::ScanState::default();
     let _ = renderer.render(&widgets, &scan, fb);
     display.flush(fb).await;
@@ -570,4 +550,3 @@ fn read_random_u16() -> u16 {
 // `boards/t114/src/panic_record.rs`, gated behind the board crate's
 // `panic-stage` Cargo feature (enabled in this profile's
 // `Cargo.toml`).
-

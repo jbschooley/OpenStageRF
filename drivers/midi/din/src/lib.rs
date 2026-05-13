@@ -24,18 +24,46 @@
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum MidiEvent {
     // ── Channel voice ────────────────────────────────────────────────────
-    NoteOff           { channel: u8, note: u8, velocity: u8 },
-    NoteOn            { channel: u8, note: u8, velocity: u8 },
-    PolyAftertouch    { channel: u8, note: u8, pressure: u8 },
-    ControlChange     { channel: u8, controller: u8, value: u8 },
-    ProgramChange     { channel: u8, program: u8 },
-    ChannelAftertouch { channel: u8, pressure: u8 },
+    NoteOff {
+        channel: u8,
+        note: u8,
+        velocity: u8,
+    },
+    NoteOn {
+        channel: u8,
+        note: u8,
+        velocity: u8,
+    },
+    PolyAftertouch {
+        channel: u8,
+        note: u8,
+        pressure: u8,
+    },
+    ControlChange {
+        channel: u8,
+        controller: u8,
+        value: u8,
+    },
+    ProgramChange {
+        channel: u8,
+        program: u8,
+    },
+    ChannelAftertouch {
+        channel: u8,
+        pressure: u8,
+    },
     /// Pitch bend, signed `-8192..=8191`, centered at 0.  On-wire is
     /// LSB-first 14-bit unsigned `0..=16383`; we re-center on parse.
-    PitchBend         { channel: u8, value: i16 },
+    PitchBend {
+        channel: u8,
+        value: i16,
+    },
 
     // ── System common ────────────────────────────────────────────────────
-    TimeCodeQuarterFrame { msg_type: u8, value: u8 },
+    TimeCodeQuarterFrame {
+        msg_type: u8,
+        value: u8,
+    },
     SongPosition(u16),
     SongSelect(u8),
     TuneRequest,
@@ -87,7 +115,9 @@ enum SystemCommon {
     TcqfWaiting,
     /// 0xF2 SongPosition: takes LSB then MSB.
     SppWaitingLsb,
-    SppWaitingMsb { lsb: u8 },
+    SppWaitingMsb {
+        lsb: u8,
+    },
     /// 0xF3 SongSelect: takes 1 data byte.
     SongSelectWaiting,
 }
@@ -124,7 +154,10 @@ impl Default for MidiParser {
 impl MidiParser {
     /// Create a parser in the neutral state.
     pub const fn new() -> Self {
-        Self { state: State::Idle, running_status: 0 }
+        Self {
+            state: State::Idle,
+            running_status: 0,
+        }
     }
 
     /// Reset to neutral state — call on link reset or after a parse error.
@@ -179,7 +212,10 @@ impl MidiParser {
             // Channel voice messages (0x80..=0xEF).
             0x80..=0xEF => {
                 self.running_status = byte;
-                self.state = State::Channel(InProgress { status: byte, first_data: None });
+                self.state = State::Channel(InProgress {
+                    status: byte,
+                    first_data: None,
+                });
                 // ProgramChange (Cn) and ChannelAftertouch (Dn) take only
                 // 1 data byte — but we still need that byte before we can
                 // emit, so don't shortcut.
@@ -248,24 +284,42 @@ impl MidiParser {
                     0xC0 => {
                         // ProgramChange.  After completion, running_status
                         // is still `status` — running status holds.
-                        self.state = State::Channel(InProgress { status, first_data: None });
-                        ParseResult::Event(MidiEvent::ProgramChange { channel: chan, program: byte })
+                        self.state = State::Channel(InProgress {
+                            status,
+                            first_data: None,
+                        });
+                        ParseResult::Event(MidiEvent::ProgramChange {
+                            channel: chan,
+                            program: byte,
+                        })
                     }
                     0xD0 => {
                         // ChannelAftertouch.
-                        self.state = State::Channel(InProgress { status, first_data: None });
-                        ParseResult::Event(MidiEvent::ChannelAftertouch { channel: chan, pressure: byte })
+                        self.state = State::Channel(InProgress {
+                            status,
+                            first_data: None,
+                        });
+                        ParseResult::Event(MidiEvent::ChannelAftertouch {
+                            channel: chan,
+                            pressure: byte,
+                        })
                     }
                     // 2-data-byte messages.
                     _ => match first_data {
                         None => {
-                            self.state = State::Channel(InProgress { status, first_data: Some(byte) });
+                            self.state = State::Channel(InProgress {
+                                status,
+                                first_data: Some(byte),
+                            });
                             ParseResult::None
                         }
                         Some(d1) => {
                             // Reset to "waiting for next message of same status"
                             // so running status keeps working.
-                            self.state = State::Channel(InProgress { status, first_data: None });
+                            self.state = State::Channel(InProgress {
+                                status,
+                                first_data: None,
+                            });
                             ParseResult::Event(decode_two_byte_channel(status, d1, byte))
                         }
                     },
@@ -307,14 +361,23 @@ impl MidiParser {
                         0xC0 => {
                             // PC: 1 data byte — done already.
                             // (state stays Idle; running_status unchanged)
-                            ParseResult::Event(MidiEvent::ProgramChange { channel: chan, program: byte })
+                            ParseResult::Event(MidiEvent::ProgramChange {
+                                channel: chan,
+                                program: byte,
+                            })
                         }
                         0xD0 => {
                             // CAT: 1 data byte — done already.
-                            ParseResult::Event(MidiEvent::ChannelAftertouch { channel: chan, pressure: byte })
+                            ParseResult::Event(MidiEvent::ChannelAftertouch {
+                                channel: chan,
+                                pressure: byte,
+                            })
                         }
                         _ => {
-                            self.state = State::Channel(InProgress { status, first_data: Some(byte) });
+                            self.state = State::Channel(InProgress {
+                                status,
+                                first_data: Some(byte),
+                            });
                             ParseResult::None
                         }
                     }
@@ -331,15 +394,34 @@ fn decode_two_byte_channel(status: u8, d1: u8, d2: u8) -> MidiEvent {
     let kind = status & 0xF0;
     let chan = status & 0x0F;
     match kind {
-        0x80 => MidiEvent::NoteOff { channel: chan, note: d1, velocity: d2 },
-        0x90 => MidiEvent::NoteOn { channel: chan, note: d1, velocity: d2 },
-        0xA0 => MidiEvent::PolyAftertouch { channel: chan, note: d1, pressure: d2 },
-        0xB0 => MidiEvent::ControlChange { channel: chan, controller: d1, value: d2 },
+        0x80 => MidiEvent::NoteOff {
+            channel: chan,
+            note: d1,
+            velocity: d2,
+        },
+        0x90 => MidiEvent::NoteOn {
+            channel: chan,
+            note: d1,
+            velocity: d2,
+        },
+        0xA0 => MidiEvent::PolyAftertouch {
+            channel: chan,
+            note: d1,
+            pressure: d2,
+        },
+        0xB0 => MidiEvent::ControlChange {
+            channel: chan,
+            controller: d1,
+            value: d2,
+        },
         0xE0 => {
             // PitchBend: LSB first, MSB second; 14-bit unsigned, recenter at 0x2000.
             let raw = ((d2 as u16) << 7) | (d1 as u16);
             let value = (raw as i16) - 0x2000;
-            MidiEvent::PitchBend { channel: chan, value }
+            MidiEvent::PitchBend {
+                channel: chan,
+                value,
+            }
         }
         // ProgramChange / ChannelAftertouch don't reach here — they're
         // 1-data-byte and handled before the second byte arrives.
@@ -379,7 +461,11 @@ mod tests {
         assert_eq!(feed_one(&mut p, 60), ParseResult::None);
         assert_eq!(
             feed_one(&mut p, 100),
-            ParseResult::Event(MidiEvent::NoteOn { channel: 0, note: 60, velocity: 100 })
+            ParseResult::Event(MidiEvent::NoteOn {
+                channel: 0,
+                note: 60,
+                velocity: 100
+            })
         );
     }
 
@@ -390,32 +476,54 @@ mod tests {
             // NoteOff
             assert_eq!(
                 feed_all(&mut p, &[0x80 | ch, 60, 64]),
-                vec![ParseResult::Event(MidiEvent::NoteOff { channel: ch, note: 60, velocity: 64 })]
+                vec![ParseResult::Event(MidiEvent::NoteOff {
+                    channel: ch,
+                    note: 60,
+                    velocity: 64
+                })]
             );
             // NoteOn
             assert_eq!(
                 feed_all(&mut p, &[0x90 | ch, 60, 100]),
-                vec![ParseResult::Event(MidiEvent::NoteOn { channel: ch, note: 60, velocity: 100 })]
+                vec![ParseResult::Event(MidiEvent::NoteOn {
+                    channel: ch,
+                    note: 60,
+                    velocity: 100
+                })]
             );
             // PolyAftertouch
             assert_eq!(
                 feed_all(&mut p, &[0xA0 | ch, 60, 50]),
-                vec![ParseResult::Event(MidiEvent::PolyAftertouch { channel: ch, note: 60, pressure: 50 })]
+                vec![ParseResult::Event(MidiEvent::PolyAftertouch {
+                    channel: ch,
+                    note: 60,
+                    pressure: 50
+                })]
             );
             // CC
             assert_eq!(
                 feed_all(&mut p, &[0xB0 | ch, 7, 100]),
-                vec![ParseResult::Event(MidiEvent::ControlChange { channel: ch, controller: 7, value: 100 })]
+                vec![ParseResult::Event(MidiEvent::ControlChange {
+                    channel: ch,
+                    controller: 7,
+                    value: 100
+                })]
             );
             // PC
             assert_eq!(
                 feed_all(&mut p, &[0xC0 | ch, 42]),
-                vec![ParseResult::Event(MidiEvent::ProgramChange { channel: ch, program: 42 })]
+                vec![ParseResult::Event(MidiEvent::ProgramChange {
+                    channel: ch,
+                    program: 42
+                })]
             );
             // CAT
             assert_eq!(
                 feed_all(&mut p, &[0xD0 | ch, 80]),
-                vec![ParseResult::Event(MidiEvent::ChannelAftertouch { channel: ch, pressure: 80 })]
+                vec![ParseResult::Event(MidiEvent::ChannelAftertouch {
+                    channel: ch,
+                    pressure: 80
+                })]
             );
         }
     }
@@ -426,7 +534,10 @@ mod tests {
         // 0xE0 status, LSB=0x00, MSB=0x40 → raw 0x2000 → centered = 0.
         assert_eq!(
             feed_all(&mut p, &[0xE0, 0x00, 0x40]),
-            vec![ParseResult::Event(MidiEvent::PitchBend { channel: 0, value: 0 })]
+            vec![ParseResult::Event(MidiEvent::PitchBend {
+                channel: 0,
+                value: 0
+            })]
         );
     }
 
@@ -436,12 +547,18 @@ mod tests {
         // Min: LSB=0, MSB=0 → raw 0 → -8192.
         assert_eq!(
             feed_all(&mut p, &[0xE0, 0x00, 0x00]),
-            vec![ParseResult::Event(MidiEvent::PitchBend { channel: 0, value: -8192 })]
+            vec![ParseResult::Event(MidiEvent::PitchBend {
+                channel: 0,
+                value: -8192
+            })]
         );
         // Max: LSB=0x7F, MSB=0x7F → raw 0x3FFF → +8191.
         assert_eq!(
             feed_all(&mut p, &[0xE0, 0x7F, 0x7F]),
-            vec![ParseResult::Event(MidiEvent::PitchBend { channel: 0, value: 8191 })]
+            vec![ParseResult::Event(MidiEvent::PitchBend {
+                channel: 0,
+                value: 8191
+            })]
         );
     }
 
@@ -453,8 +570,16 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                ParseResult::Event(MidiEvent::NoteOn { channel: 0, note: 60, velocity: 100 }),
-                ParseResult::Event(MidiEvent::NoteOn { channel: 0, note: 64, velocity: 90 }),
+                ParseResult::Event(MidiEvent::NoteOn {
+                    channel: 0,
+                    note: 60,
+                    velocity: 100
+                }),
+                ParseResult::Event(MidiEvent::NoteOn {
+                    channel: 0,
+                    note: 64,
+                    velocity: 90
+                }),
             ]
         );
     }
@@ -467,8 +592,14 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                ParseResult::Event(MidiEvent::ProgramChange { channel: 0, program: 1 }),
-                ParseResult::Event(MidiEvent::ProgramChange { channel: 0, program: 2 }),
+                ParseResult::Event(MidiEvent::ProgramChange {
+                    channel: 0,
+                    program: 1
+                }),
+                ParseResult::Event(MidiEvent::ProgramChange {
+                    channel: 0,
+                    program: 2
+                }),
             ]
         );
     }
@@ -484,7 +615,11 @@ mod tests {
         // Now feed the velocity — original NoteOn must complete.
         assert_eq!(
             p.feed(100),
-            ParseResult::Event(MidiEvent::NoteOn { channel: 0, note: 60, velocity: 100 })
+            ParseResult::Event(MidiEvent::NoteOn {
+                channel: 0,
+                note: 60,
+                velocity: 100
+            })
         );
     }
 
@@ -533,7 +668,11 @@ mod tests {
             vec![
                 ParseResult::Event(MidiEvent::SysExStart),
                 ParseResult::SysExByte(0x11),
-                ParseResult::Event(MidiEvent::NoteOn { channel: 0, note: 60, velocity: 100 }),
+                ParseResult::Event(MidiEvent::NoteOn {
+                    channel: 0,
+                    note: 60,
+                    velocity: 100
+                }),
             ]
         );
     }
@@ -542,7 +681,12 @@ mod tests {
     fn undefined_status_bytes_dropped() {
         let mut p = MidiParser::new();
         for byte in [0xF4u8, 0xF5, 0xF9, 0xFD] {
-            assert_eq!(p.feed(byte), ParseResult::None, "byte {:#x} should drop", byte);
+            assert_eq!(
+                p.feed(byte),
+                ParseResult::None,
+                "byte {:#x} should drop",
+                byte
+            );
         }
     }
 
@@ -552,7 +696,11 @@ mod tests {
         // Establish running status with a NoteOn.
         assert_eq!(
             feed_all(&mut p, &[0x90, 60, 100]),
-            vec![ParseResult::Event(MidiEvent::NoteOn { channel: 0, note: 60, velocity: 100 })]
+            vec![ParseResult::Event(MidiEvent::NoteOn {
+                channel: 0,
+                note: 60,
+                velocity: 100
+            })]
         );
         // Send a TuneRequest (0xF6), which breaks running status.
         assert_eq!(p.feed(0xF6), ParseResult::Event(MidiEvent::TuneRequest));
@@ -571,7 +719,11 @@ mod tests {
         assert_eq!(p.feed(64), ParseResult::None);
         assert_eq!(
             p.feed(90),
-            ParseResult::Event(MidiEvent::NoteOn { channel: 0, note: 64, velocity: 90 })
+            ParseResult::Event(MidiEvent::NoteOn {
+                channel: 0,
+                note: 64,
+                velocity: 90
+            })
         );
     }
 
@@ -600,7 +752,10 @@ mod tests {
         // 0xF1 status, value byte 0x35 → msg_type = 3, value = 5.
         assert_eq!(
             feed_all(&mut p, &[0xF1, 0x35]),
-            vec![ParseResult::Event(MidiEvent::TimeCodeQuarterFrame { msg_type: 3, value: 5 })]
+            vec![ParseResult::Event(MidiEvent::TimeCodeQuarterFrame {
+                msg_type: 3,
+                value: 5
+            })]
         );
     }
 

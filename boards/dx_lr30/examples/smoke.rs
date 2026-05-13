@@ -39,15 +39,19 @@ async fn main(_spawner: Spawner) {
     // CS and RESET are outputs (idle-high); BUSY and DIO1 are inputs.
     info!("[RADIO] configuring SX1262 GPIO pins");
 
-    let mut cs           = Output::new(p.PA4, Level::High, Speed::Medium);
-    let mut radio_reset  = Output::new(p.PA3, Level::High, Speed::Medium);
-    let busy             = Input::new(p.PA2, Pull::None);
-    let dio1             = Input::new(p.PC15, Pull::Down); // OSC32_OUT repurposed
-    let mut txen         = Output::new(p.PA0, Level::Low, Speed::Medium);
-    let mut rxen         = Output::new(p.PA1, Level::Low, Speed::Medium);
+    let mut cs = Output::new(p.PA4, Level::High, Speed::Medium);
+    let mut radio_reset = Output::new(p.PA3, Level::High, Speed::Medium);
+    let busy = Input::new(p.PA2, Pull::None);
+    let dio1 = Input::new(p.PC15, Pull::Down); // OSC32_OUT repurposed
+    let mut txen = Output::new(p.PA0, Level::Low, Speed::Medium);
+    let mut rxen = Output::new(p.PA1, Level::Low, Speed::Medium);
     let _ = (&mut txen, &mut rxen); // suppress unused warnings until radio driver lands
 
-    info!("[RADIO] pre-reset  — BUSY={} DIO1={}", busy.is_high(), dio1.is_high());
+    info!(
+        "[RADIO] pre-reset  — BUSY={} DIO1={}",
+        busy.is_high(),
+        dio1.is_high()
+    );
 
     // Hardware reset: hold NRESET low ≥100 µs, release, wait ≥3 ms.
     radio_reset.set_low();
@@ -57,7 +61,10 @@ async fn main(_spawner: Spawner) {
 
     let busy_after = busy.is_high();
     let dio1_after = dio1.is_high();
-    info!("[RADIO] post-reset — BUSY={} DIO1={}", busy_after, dio1_after);
+    info!(
+        "[RADIO] post-reset — BUSY={} DIO1={}",
+        busy_after, dio1_after
+    );
     if busy_after {
         warn!("[RADIO] BUSY still high after reset + 5 ms — SX1262 may be absent or wiring wrong");
     } else {
@@ -78,7 +85,7 @@ async fn main(_spawner: Spawner) {
     uart_cfg.baudrate = 31250;
     match Uart::new_blocking(p.USART3, p.PB11, p.PB10, uart_cfg) {
         Ok(_uart) => info!("[UART] PASS — USART3 initialised at 31250 baud"),
-        Err(e)    => error!("[UART] FAIL — {:?}", e),
+        Err(e) => error!("[UART] FAIL — {:?}", e),
     }
 
     info!("══════════════════════════════════════");

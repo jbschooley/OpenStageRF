@@ -161,7 +161,7 @@ impl BatteryChemistry {
         match self {
             Self::LiPoSingle => 3000,
             Self::NimhPack { cells } => match cells {
-                1 => 900,  // ~0.9 V/cell — below safe-discharge floor
+                1 => 900, // ~0.9 V/cell — below safe-discharge floor
                 2 => 1800,
                 3 => 2700,
                 _ => 2700,
@@ -244,7 +244,10 @@ impl BatteryChemistry {
     ///   - `mv ≤ shutdown_mv` → 0 %
     pub fn voltage_to_percent(self, mv: u16) -> u8 {
         match self {
-            Self::Regulated { shutdown_mv, low_mv } => {
+            Self::Regulated {
+                shutdown_mv,
+                low_mv,
+            } => {
                 if mv <= shutdown_mv {
                     return 0;
                 }
@@ -263,7 +266,9 @@ impl BatteryChemistry {
                 // SAFETY of unwrap: only Regulated returns None
                 // above; every other arm of this match returns
                 // Some(table).
-                let table = self.ocv_table().expect("non-Regulated chemistries have an OCV table");
+                let table = self
+                    .ocv_table()
+                    .expect("non-Regulated chemistries have an OCV table");
                 if mv <= table[0] {
                     return 0;
                 }
@@ -332,11 +337,7 @@ impl BatteryStatus {
     /// cable is unplugged, or we just haven't sampled yet).
     ///
     /// [`no_battery_mv`]: BatteryChemistry::no_battery_mv
-    pub fn from_reading(
-        voltage_mv: u16,
-        plugged_in: bool,
-        chemistry: BatteryChemistry,
-    ) -> Self {
+    pub fn from_reading(voltage_mv: u16, plugged_in: bool, chemistry: BatteryChemistry) -> Self {
         if voltage_mv >= chemistry.no_battery_mv() {
             Self {
                 voltage_mv,
@@ -543,7 +544,11 @@ mod tests {
             (4050, 100),
         ] {
             let got = nimh.voltage_to_percent(anchor_mv);
-            assert_eq!(got, expected_pct, "anchor {} mV → expected {} %, got {} %", anchor_mv, expected_pct, got);
+            assert_eq!(
+                got, expected_pct,
+                "anchor {} mV → expected {} %, got {} %",
+                anchor_mv, expected_pct, got
+            );
         }
     }
 
@@ -555,7 +560,10 @@ mod tests {
         // *below* this so the renderer doesn't flag a flat pack as
         // "no battery."
         let status = BatteryStatus::from_reading(3000, false, nimh);
-        assert!(status.is_present(), "3.0 V should be present (0 % SoC), not absent");
+        assert!(
+            status.is_present(),
+            "3.0 V should be present (0 % SoC), not absent"
+        );
         assert_eq!(status.percent, 0);
         // Below 2.7 V → absent.
         let absent = BatteryStatus::from_reading(2500, false, nimh);
@@ -597,5 +605,4 @@ mod tests {
         assert!(crit.is_critical());
         assert!(crit.plugged_in);
     }
-
 }

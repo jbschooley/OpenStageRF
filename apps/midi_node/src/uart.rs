@@ -181,7 +181,7 @@ impl<W: Write> MidiSink for UartMidiSink<W> {
     type Error = Infallible;
 
     async fn write_message(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
-        if let Err(_) = self.uart.write_all(bytes).await {
+        if self.uart.write_all(bytes).await.is_err() {
             defmt::error!("midi_node RX: UART write error");
         }
         Ok(())
@@ -195,7 +195,7 @@ impl<W: Write> MidiSink for UartMidiSink<W> {
             buf[ch * 3 + 1] = 0x7B; // CC#123
             buf[ch * 3 + 2] = 0;
         }
-        if let Err(_) = self.uart.write_all(&buf).await {
+        if self.uart.write_all(&buf).await.is_err() {
             defmt::error!("midi_node RX: UART write error during all_notes_off");
         }
         Ok(())
@@ -210,23 +210,45 @@ fn encode_event(event: MidiEvent) -> Option<Vec<u8, EVENT_BYTES_MAX>> {
     let mut v: Vec<u8, EVENT_BYTES_MAX> = Vec::new();
     match event {
         // Channel voice — these are what the link layer ships.
-        MidiEvent::NoteOff { channel, note, velocity } => {
-            v.extend_from_slice(&[0x80 | (channel & 0x0F), note & 0x7F, velocity & 0x7F]).ok()?;
+        MidiEvent::NoteOff {
+            channel,
+            note,
+            velocity,
+        } => {
+            v.extend_from_slice(&[0x80 | (channel & 0x0F), note & 0x7F, velocity & 0x7F])
+                .ok()?;
         }
-        MidiEvent::NoteOn { channel, note, velocity } => {
-            v.extend_from_slice(&[0x90 | (channel & 0x0F), note & 0x7F, velocity & 0x7F]).ok()?;
+        MidiEvent::NoteOn {
+            channel,
+            note,
+            velocity,
+        } => {
+            v.extend_from_slice(&[0x90 | (channel & 0x0F), note & 0x7F, velocity & 0x7F])
+                .ok()?;
         }
-        MidiEvent::PolyAftertouch { channel, note, pressure } => {
-            v.extend_from_slice(&[0xA0 | (channel & 0x0F), note & 0x7F, pressure & 0x7F]).ok()?;
+        MidiEvent::PolyAftertouch {
+            channel,
+            note,
+            pressure,
+        } => {
+            v.extend_from_slice(&[0xA0 | (channel & 0x0F), note & 0x7F, pressure & 0x7F])
+                .ok()?;
         }
-        MidiEvent::ControlChange { channel, controller, value } => {
-            v.extend_from_slice(&[0xB0 | (channel & 0x0F), controller & 0x7F, value & 0x7F]).ok()?;
+        MidiEvent::ControlChange {
+            channel,
+            controller,
+            value,
+        } => {
+            v.extend_from_slice(&[0xB0 | (channel & 0x0F), controller & 0x7F, value & 0x7F])
+                .ok()?;
         }
         MidiEvent::ProgramChange { channel, program } => {
-            v.extend_from_slice(&[0xC0 | (channel & 0x0F), program & 0x7F]).ok()?;
+            v.extend_from_slice(&[0xC0 | (channel & 0x0F), program & 0x7F])
+                .ok()?;
         }
         MidiEvent::ChannelAftertouch { channel, pressure } => {
-            v.extend_from_slice(&[0xD0 | (channel & 0x0F), pressure & 0x7F]).ok()?;
+            v.extend_from_slice(&[0xD0 | (channel & 0x0F), pressure & 0x7F])
+                .ok()?;
         }
         MidiEvent::PitchBend { channel, value } => {
             // Re-encode signed -8192..=8191 → 14-bit unsigned 0..=16383.

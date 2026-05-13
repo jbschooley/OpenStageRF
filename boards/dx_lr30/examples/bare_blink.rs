@@ -47,15 +47,15 @@ const IOPCEN: u32 = 1 << 4;
 // CRL bits [3:0] = CNF0[1:0] | MODE0[1:0].  0b0010 = push-pull output, 2 MHz.
 const GPIOB_CRL: *mut u32 = 0x4001_0C00 as *mut u32;
 const GPIOB_BSRR: *mut u32 = 0x4001_0C10 as *mut u32;
-const BSRR_BS0: u32 = 1 << 0;     // set PB0 high
-const BSRR_BR0: u32 = 1 << 16;    // reset PB0 low
+const BSRR_BS0: u32 = 1 << 0; // set PB0 high
+const BSRR_BR0: u32 = 1 << 16; // reset PB0 low
 
 // GPIOC port: PC13 = on-board LED2 through R2 = 4.7 KΩ (likely dead/dim).
 // CRH bits [23:20] = CNF13[1:0] | MODE13[1:0].  0b0010 = push-pull, 2 MHz.
 const GPIOC_CRH: *mut u32 = 0x4001_1004 as *mut u32;
 const GPIOC_BSRR: *mut u32 = 0x4001_1010 as *mut u32;
-const BSRR_BS13: u32 = 1 << 13;   // set PC13 high
-const BSRR_BR13: u32 = 1 << 29;   // reset PC13 low
+const BSRR_BS13: u32 = 1 << 13; // set PC13 high
+const BSRR_BR13: u32 = 1 << 29; // reset PC13 low
 
 #[entry]
 fn main() -> ! {

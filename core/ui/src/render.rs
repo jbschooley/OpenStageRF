@@ -248,11 +248,7 @@ impl Renderer {
                         // from "100%" down to "99%".
                         let v_int = (*voltage_mv) / 1000;
                         let v_frac = ((*voltage_mv) % 1000) / 10;
-                        let _ = write!(
-                            &mut text_buf,
-                            "{:>3}% {}.{:02}V",
-                            percent, v_int, v_frac
-                        );
+                        let _ = write!(&mut text_buf, "{:>3}% {}.{:02}V", percent, v_int, v_frac);
                     }
 
                     // Compute pixel x where the text starts.  Right-
@@ -294,27 +290,18 @@ impl Renderer {
                         let by: i32 = 3;
                         let stroke = PrimitiveStyle::with_stroke(bg, 1);
                         // Top diagonal: top-right down to mid-left.
-                        Line::new(
-                            Point::new(bx + 4, by),
-                            Point::new(bx + 1, by + 6),
-                        )
-                        .into_styled(stroke)
-                        .draw(display)?;
+                        Line::new(Point::new(bx + 4, by), Point::new(bx + 1, by + 6))
+                            .into_styled(stroke)
+                            .draw(display)?;
                         // Horizontal crossbar at the kink.
-                        Line::new(
-                            Point::new(bx + 1, by + 6),
-                            Point::new(bx + 5, by + 6),
-                        )
-                        .into_styled(stroke)
-                        .draw(display)?;
+                        Line::new(Point::new(bx + 1, by + 6), Point::new(bx + 5, by + 6))
+                            .into_styled(stroke)
+                            .draw(display)?;
                         // Bottom diagonal: from crossbar's right down
                         // to lower-left tip.
-                        Line::new(
-                            Point::new(bx + 5, by + 6),
-                            Point::new(bx + 2, by + 12),
-                        )
-                        .into_styled(stroke)
-                        .draw(display)?;
+                        Line::new(Point::new(bx + 5, by + 6), Point::new(bx + 2, by + 12))
+                            .into_styled(stroke)
+                            .draw(display)?;
                     }
                 }
 
@@ -324,13 +311,8 @@ impl Renderer {
                         continue;
                     }
                     let line = pad_right_to(text, line_cols);
-                    Text::with_text_style(
-                        &line,
-                        Point::new(line_x, y),
-                        bgfg_style,
-                        baseline_top,
-                    )
-                    .draw(display)?;
+                    Text::with_text_style(&line, Point::new(line_x, y), bgfg_style, baseline_top)
+                        .draw(display)?;
                 }
 
                 Widget::Selector {
@@ -354,20 +336,10 @@ impl Renderer {
                     } else {
                         let _ = value_str.push_str(value);
                     }
-                    let line = build_selector_line(
-                        active_char,
-                        cursor_char,
-                        label,
-                        &value_str,
-                        line_cols,
-                    );
-                    Text::with_text_style(
-                        &line,
-                        Point::new(line_x, y),
-                        bgfg_style,
-                        baseline_top,
-                    )
-                    .draw(display)?;
+                    let line =
+                        build_selector_line(active_char, cursor_char, label, &value_str, line_cols);
+                    Text::with_text_style(&line, Point::new(line_x, y), bgfg_style, baseline_top)
+                        .draw(display)?;
                 }
 
                 Widget::Footer(text) => {
@@ -376,13 +348,8 @@ impl Renderer {
                         continue;
                     }
                     let line = pad_right_to(text, line_cols);
-                    Text::with_text_style(
-                        &line,
-                        Point::new(line_x, y),
-                        bgfg_style,
-                        baseline_top,
-                    )
-                    .draw(display)?;
+                    Text::with_text_style(&line, Point::new(line_x, y), bgfg_style, baseline_top)
+                        .draw(display)?;
                 }
 
                 Widget::LinkStatus { row, up: _, text } => {
@@ -391,13 +358,8 @@ impl Renderer {
                         continue;
                     }
                     let line = pad_right_to(text, line_cols);
-                    Text::with_text_style(
-                        &line,
-                        Point::new(line_x, y),
-                        bgfg_style,
-                        baseline_top,
-                    )
-                    .draw(display)?;
+                    Text::with_text_style(&line, Point::new(line_x, y), bgfg_style, baseline_top)
+                        .draw(display)?;
                 }
 
                 Widget::ScanGraph {
@@ -436,11 +398,7 @@ impl Renderer {
 /// which means a full-screen clear every time → flash.  Useful
 /// for smoke tests; production code should hold a single
 /// [`Renderer`] across renders for the no-flash incremental path.
-pub fn render<D>(
-    widgets: &WidgetList,
-    scan: &ScanState,
-    display: &mut D,
-) -> Result<(), D::Error>
+pub fn render<D>(widgets: &WidgetList, scan: &ScanState, display: &mut D) -> Result<(), D::Error>
 where
     D: DrawTarget,
     D::Color: From<BinaryColor>,
@@ -469,12 +427,7 @@ fn widget_row(w: &Widget) -> u8 {
 
 /// Clear one row's worth of pixels to background.  Handles the
 /// footer's "anchored to bottom" sentinel.
-fn clear_row<D>(
-    display: &mut D,
-    row: u8,
-    panel_size: Size,
-    bg: D::Color,
-) -> Result<(), D::Error>
+fn clear_row<D>(display: &mut D, row: u8, panel_size: Size, bg: D::Color) -> Result<(), D::Error>
 where
     D: DrawTarget,
 {
@@ -715,12 +668,9 @@ where
             if peak != SCAN_NO_DATA {
                 let peak_h = dbm_to_bar_height(peak, bars_h);
                 let peak_y = (bars_y1 - peak_h - 1).max(bars_y0);
-                Rectangle::new(
-                    Point::new(cx, peak_y),
-                    Size::new(col_w as u32, 2),
-                )
-                .into_styled(PrimitiveStyle::with_fill(fg))
-                .draw(display)?;
+                Rectangle::new(Point::new(cx, peak_y), Size::new(col_w as u32, 2))
+                    .into_styled(PrimitiveStyle::with_fill(fg))
+                    .draw(display)?;
             }
         }
 
@@ -819,12 +769,9 @@ where
         .into_styled(PrimitiveStyle::with_fill(bg))
         .draw(display)?;
     }
-    Rectangle::new(
-        Point::new(mark_x, y),
-        Size::new(col_w as u32, h as u32),
-    )
-    .into_styled(PrimitiveStyle::with_fill(fg))
-    .draw(display)?;
+    Rectangle::new(Point::new(mark_x, y), Size::new(col_w as u32, h as u32))
+        .into_styled(PrimitiveStyle::with_fill(fg))
+        .draw(display)?;
     let after = mark_x + col_w;
     if after < row_right {
         Rectangle::new(

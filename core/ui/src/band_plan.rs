@@ -154,6 +154,7 @@ pub const BAND_PLANS: &[BandPlan] = &[
 /// ~150 kHz outside the receiver's filter passband, well rejected.
 /// Two OpenStageRF systems can run simultaneously on adjacent
 /// channels at this spacing without measurable cross-talk.
+#[rustfmt::skip] // Channel table; one-line entries read as a frequency map.
 static ISM_915: BandPlanInfo = BandPlanInfo {
     label: "ISM 915",
     channels: &[
@@ -186,6 +187,7 @@ static ISM_915: BandPlanInfo = BandPlanInfo {
 
 /// Sennheiser-compat plan.  v1 stub frequencies — placeholders for
 /// real Sennheiser-G-band-coordination data once we have it.
+#[rustfmt::skip] // Channel table; one-line entries read as a frequency map.
 static SENNHEISER_COMPAT: BandPlanInfo = BandPlanInfo {
     label: "Senn G compat",
     channels: &[
@@ -199,6 +201,7 @@ static SENNHEISER_COMPAT: BandPlanInfo = BandPlanInfo {
 
 /// Shure-compat plan.  v1 stub frequencies — placeholders for real
 /// Shure G50 / H50 / J50 coordination data once we have it.
+#[rustfmt::skip] // Channel table; one-line entries read as a frequency map.
 static SHURE_COMPAT: BandPlanInfo = BandPlanInfo {
     label: "Shure compat",
     channels: &[
@@ -217,7 +220,7 @@ static SHURE_COMPAT: BandPlanInfo = BandPlanInfo {
 /// **scan / fine-tune** plans, not multi-link coordination plans.
 /// Two OpenStageRF systems CANNOT run on adjacent Dense channels
 /// simultaneously — they'll desense each other badly.
-
+#[rustfmt::skip] // Channel table; one-line entries read as a frequency map.
 static DENSE_LO: BandPlanInfo = BandPlanInfo {
     label: "Dense Lo 0.1",
     channels: &[
@@ -311,6 +314,7 @@ static DENSE_LO: BandPlanInfo = BandPlanInfo {
     ],
 };
 
+#[rustfmt::skip] // Channel table; one-line entries read as a frequency map.
 static DENSE_MID: BandPlanInfo = BandPlanInfo {
     label: "Dense Mid 0.1",
     channels: &[
@@ -404,6 +408,7 @@ static DENSE_MID: BandPlanInfo = BandPlanInfo {
     ],
 };
 
+#[rustfmt::skip] // Channel table; one-line entries read as a frequency map.
 static DENSE_HI: BandPlanInfo = BandPlanInfo {
     label: "Dense Hi 0.1",
     channels: &[
@@ -497,6 +502,7 @@ static DENSE_HI: BandPlanInfo = BandPlanInfo {
     ],
 };
 
+#[rustfmt::skip] // Channel table; one-line entries read as a frequency map.
 static WIDE: BandPlanInfo = BandPlanInfo {
     label: "Wide 0.2",
     channels: &[
@@ -634,7 +640,6 @@ static WIDE: BandPlanInfo = BandPlanInfo {
     ],
 };
 
-
 /// Look up a channel within a band plan by index, clamping to the
 /// plan's range.  `(plan, idx)` is the canonical (Settings-stored)
 /// representation; this is how the runtime resolves the actual
@@ -658,7 +663,11 @@ mod tests {
     #[test]
     fn all_plans_have_at_least_one_channel() {
         for &p in BAND_PLANS {
-            assert!(!p.info().channels.is_empty(), "plan {:?} has no channels", p);
+            assert!(
+                !p.info().channels.is_empty(),
+                "plan {:?} has no channels",
+                p
+            );
         }
     }
 
@@ -689,9 +698,15 @@ mod tests {
 
     #[test]
     fn format_frequency_renders_three_decimals() {
-        let c = ChannelInfo { label: "test", frequency_khz: 915_000 };
+        let c = ChannelInfo {
+            label: "test",
+            frequency_khz: 915_000,
+        };
         assert_eq!(c.format_frequency().as_str(), "915.000 MHz");
-        let c = ChannelInfo { label: "test", frequency_khz: 916_125 };
+        let c = ChannelInfo {
+            label: "test",
+            frequency_khz: 916_125,
+        };
         assert_eq!(c.format_frequency().as_str(), "916.125 MHz");
     }
 

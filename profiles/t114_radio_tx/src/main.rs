@@ -14,7 +14,6 @@
 
 use embassy_executor::Spawner;
 
-
 #[cfg(feature = "usb-log")]
 use embassy_time::Timer;
 use osrf_board_t114 as board;
