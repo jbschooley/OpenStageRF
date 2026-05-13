@@ -1,0 +1,29 @@
+[package]
+name        = "osrf-app-ui-runtime"
+version     = "0.1.0"
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "UI runtime — state-machine driver loop, battery monitor, soft-off coordination, settings persistence.  Board-agnostic; profiles wire the concrete display / flash / watchdog / joystick / radio peripherals via embedded-hal traits + a small set of helper traits."
+
+[dependencies]
+osrf-ui                        = { workspace = true, features = ["defmt"] }
+osrf-link-runtime              = { workspace = true }
+osrf-app-midi-node             = { workspace = true }
+osrf-driver-input-joystick5way = { workspace = true, features = ["defmt"] }
+osrf-panic-log                 = { workspace = true, features = ["defmt"] }
+
+embedded-hal              = { workspace = true }
+embedded-hal-async        = { workspace = true }
+embedded-storage-async    = { workspace = true }
+embassy-time              = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-sync              = { version = "0.8" }
+embassy-futures           = "0.1"
+critical-section          = "1"
+sequential-storage        = { workspace = true }
+heapless                  = { workspace = true }
+defmt                     = { workspace = true }
+
+[lib]
+test    = false
+doctest = false
+bench   = false
