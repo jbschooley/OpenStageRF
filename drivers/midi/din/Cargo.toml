@@ -1,6 +1,7 @@
 [package]
 name        = "osrf-midi-din"
 version     = "0.1.0"
+publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
 description = "DIN MIDI byte parser — converts a 31250 baud byte stream into typed MidiEvent values"

@@ -1,6 +1,7 @@
 [package]
 name        = "osrf-app-midi-bench"
 version     = "0.1.0"
+publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
 description = "Milestone 3 — board-agnostic DIN MIDI bench (RX parser + TX arpeggiator)"

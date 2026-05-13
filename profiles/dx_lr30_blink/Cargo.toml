@@ -1,6 +1,7 @@
 [package]
 name        = "osrf-profile-dx-lr30-blink"
 version     = "0.1.0"
+publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
 description = "Milestone 0 blink — DX-LR30 deployment.  Wires the DX-LR30 board's Resources into the board-agnostic blink loop."

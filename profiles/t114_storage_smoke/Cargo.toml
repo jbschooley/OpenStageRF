@@ -1,6 +1,7 @@
 [package]
 name        = "osrf-profile-t114-storage-smoke"
 version     = "0.1.0"
+publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
 description = "Milestone 7 smoke test — verifies flash persistence via nrf-softdevice + sequential-storage on the T114.  Reads a boot-count integer from the Settings region, increments it, writes back.  Power-cycle (probe-rs reset, hardware reset, or battery pull) and the next boot should report n+1."

@@ -1,6 +1,7 @@
 [package]
 name        = "osrf-app-midi-node"
 version     = "0.1.0"
+publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
 description = "Milestone 4 integration: real DIN MIDI over the wireless link layer.  Wraps osrf-link-runtime with UART-backed MidiSource (parses keyboard MIDI in via osrf-midi-din) and MidiSink (writes events out to a synth's MIDI in)."

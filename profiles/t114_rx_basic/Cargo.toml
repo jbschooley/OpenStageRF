@@ -1,6 +1,7 @@
 [package]
 name        = "osrf-profile-t114-rx-basic"
 version     = "0.1.0"
+publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
 description = "T114 receiver — single SX1262 + ST7789 TFT + user button, US 915 ISM, GFSK MIDI"

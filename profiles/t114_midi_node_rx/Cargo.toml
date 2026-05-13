@@ -1,6 +1,7 @@
 [package]
 name        = "osrf-profile-t114-midi-node-rx"
 version     = "0.1.0"
+publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
 description = "Milestone 4 MIDI node RX — T114 deployment of osrf-app-midi-node.  Receives MIDI events over the wireless link, drives a synth via FeatherWing DIN OUT."

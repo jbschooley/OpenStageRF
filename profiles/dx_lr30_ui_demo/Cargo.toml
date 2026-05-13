@@ -1,6 +1,7 @@
 [package]
 name        = "osrf-profile-dx-lr30-ui-demo"
 version     = "0.1.0"
+publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
 description = "UI bench demo — DX-LR30 deployment.  Drives the SSD1306 OLED through osrf-app-ui-bench."

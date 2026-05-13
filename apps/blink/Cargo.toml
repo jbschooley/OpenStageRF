@@ -1,6 +1,7 @@
 [package]
 name        = "osrf-app-blink"
 version     = "0.1.0"
+publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
 description = "Milestone 0 — board-agnostic LED blink loop.  Library only; per-board deployment lives in profiles/<board>_blink/."

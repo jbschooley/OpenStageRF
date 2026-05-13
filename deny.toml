@@ -1,5 +1,7 @@
 [licenses]
 # Licenses allowed for dependencies.  Our own crates use AGPL-3.0-or-later.
+# Keep this list narrow on purpose — every new entry expands the legal
+# surface of the firmware.  Add only when a concrete dep needs it.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -12,11 +14,45 @@ allow = [
     "CC0-1.0",
     "AGPL-3.0-or-later",
 ]
-unused-allowed-license = "warn"
+# Don't fail the build over allow-list entries that no current dep
+# happens to use — informational only.
+unused-allowed-license = "allow"
+
+# nrf-softdevice-s140 ships Nordic's proprietary SoftDevice as a binary
+# blob and has no SPDX expression in its manifest.  License is Nordic's
+# 5-clause BSD-ish (https://www.nordicsemi.com/license/nordic-5-clause).
+# We acknowledge it explicitly so cargo-deny stops emitting a warning
+# every build.
+[[licenses.clarify]]
+crate = "nrf-softdevice-s140"
+expression = "LicenseRef-Nordic-5-clause"
+license-files = []
+
+[[licenses.exceptions]]
+crate = "nrf-softdevice-s140"
+allow = ["LicenseRef-Nordic-5-clause"]
 
 [bans]
+# Duplicate transitive crate versions (bitflags 1 vs 2, defmt 0.3 vs 1,
+# darling 0.10 vs 0.20, etc.) are common when embassy and other deps
+# straddle major bumps.  Warn so we notice when it grows, but don't
+# block — most can only resolve when upstream catches up.
 multiple-versions = "warn"
-wildcards         = "deny"
+# Disallow wildcard ("*") version specifiers on published crates.io
+# deps — that's a real bug (silently picks whatever resolver finds).
+# `allow-wildcard-paths` makes the rule skip our own workspace path
+# deps (where `version = "*"` is the standard idiom).
+wildcards            = "deny"
+allow-wildcard-paths = true
 
 [advisories]
-ignore = []
+# Both ignores are transitive `unmaintained` advisories — informational
+# only, not exploitable bugs.  Revisit when upstream drops the dep.
+ignore = [
+    # `bare-metal` deprecated; pulled in by older cortex-m / embedded-hal
+    # versions our HAL crates still depend on.
+    { id = "RUSTSEC-2026-0110", reason = "transitive via cortex-m / embedded-hal; awaiting upstream drop" },
+    # `proc-macro-error` unmaintained; pulled in by `maybe-async-cfg` via
+    # `ssd1306` (DX-LR30 OLED).  `cargo deny` confirms no safe upgrade.
+    { id = "RUSTSEC-2024-0370", reason = "transitive via ssd1306 → maybe-async-cfg; awaiting upstream replacement" },
+]

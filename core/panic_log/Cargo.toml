@@ -1,6 +1,7 @@
 [package]
 name        = "osrf-panic-log"
 version     = "0.1.0"
+publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
 description = "Board-agnostic panic / shutdown-record ring buffer over a flash region.  Wraps sequential-storage::queue with a fixed record format ([reset_reas: u32 LE][UTF-8 message]) and exposes push/read/clear helpers.  Callers supply the flash adapter + range; this crate doesn't know about specific board memory layouts."
