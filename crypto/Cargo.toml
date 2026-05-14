@@ -9,6 +9,14 @@ description = "AEAD primitives + key fingerprinting for the OpenStageRF link lay
 [features]
 defmt = ["dep:defmt"]
 
+# Hardware-AES backend for AES-128-CCM on the nRF52840 via the
+# SoftDevice's `sd_ecb_block_encrypt` SVC.  Only enable on builds
+# that have the SoftDevice running (currently: `osrf-board-t114`'s
+# softdevice-enabled profiles).  Host tests run with this feature
+# off; the algorithm is the same so wire-format compatibility is
+# unaffected.  See `src/aes_hw.rs` for the trait-impl details.
+aes-hw-sd = ["dep:nrf-softdevice-s140", "dep:cipher"]
+
 [dependencies]
 defmt            = { workspace = true, optional = true }
 heapless         = { workspace = true }
@@ -16,6 +24,12 @@ aes              = { workspace = true }
 ccm              = { workspace = true }
 chacha20poly1305 = { workspace = true }
 sha2             = { workspace = true }
+
+# Optional — only pulled in when the `aes-hw-sd` feature is enabled.
+# `cipher` is brought in directly so we can `impl` its traits on the
+# hardware-AES newtype; without the feature it's a no-op pull.
+cipher              = { version = "0.4", default-features = false, optional = true }
+nrf-softdevice-s140 = { workspace = true, optional = true }
 
 [lib]
 test    = true

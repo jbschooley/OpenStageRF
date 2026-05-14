@@ -14,8 +14,10 @@
 //! changes to `run_rx` itself.
 
 use embassy_executor::Spawner;
+use heapless::Vec;
 use osrf_app_link_bench::{
-    run_rx, synthetic::DefmtLogSink, test_aead_chacha, LinkBenchConfig, LinkStatsCell,
+    aead_fp, run_rx, synthetic::DefmtLogSink, test_aead_chacha, AeadConfig, LinkBenchConfig,
+    LinkStatsCell, MAX_RX_KEYS,
 };
 use osrf_board_t114 as board;
 
@@ -45,7 +47,13 @@ async fn main(_spawner: Spawner) {
     // `key_fp` from the cipher + key, so any packet with the wrong
     // header fingerprint or a failed tag fires `RxDrop::AeadFail` /
     // `KeyFpMismatch` and is logged + counted.
-    let aead = Some(test_aead_chacha());
+    // One-key keyring: the test stub ChaCha key.  Strict mode (no
+    // plaintext) — bench is a paired AEAD test; an Open packet from
+    // the bench TX would be a test setup error not a feature.
+    let test_ctx = test_aead_chacha();
+    let filter = Some(aead_fp(&test_ctx));
+    let mut keyring: Vec<AeadConfig, MAX_RX_KEYS> = Vec::new();
+    let _ = keyring.push(test_ctx);
     defmt::info!("link bench RX: AEAD = ChaCha20-Poly1305 (test stub key, strict)");
     run_rx(
         &mut r.radio0,
@@ -56,9 +64,8 @@ async fn main(_spawner: Spawner) {
         None,
         None,
         None,
-        aead,
-        // Strict — link-bench is a paired AEAD test, plaintext from
-        // the bench TX would be a test setup error not a feature.
+        keyring,
+        filter,
         false,
         None, // No UI on the link bench — AEAD config is fixed at boot.
     )

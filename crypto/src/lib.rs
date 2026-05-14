@@ -172,10 +172,27 @@ pub fn derive_nonce(
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct AeadError;
 
+/// AES-128 block cipher used as the building block of AES-128-CCM.
+/// With the `aes-hw-sd` feature enabled (T114 builds with the
+/// SoftDevice running) this is the hardware-backed
+/// [`aes_hw::HwAes128`], which routes each block through the nRF52840
+/// AES peripheral via `sd_ecb_block_encrypt`.  Otherwise it's the
+/// portable software [`aes::Aes128`] from RustCrypto.  Both
+/// implementations are byte-identical at the algorithm level, so
+/// the on-air wire format is unaffected; choosing one over the
+/// other is purely a per-target speed/size tradeoff.
+#[cfg(feature = "aes-hw-sd")]
+mod aes_hw;
+#[cfg(feature = "aes-hw-sd")]
+type Aes128Impl = aes_hw::HwAes128;
+#[cfg(not(feature = "aes-hw-sd"))]
+type Aes128Impl = aes::Aes128;
+
 /// AES-128-CCM with a 16-byte tag and 13-byte nonce.  Type alias for
 /// readability; the generic parameters lock the RustCrypto `Ccm`
-/// adapter to the exact mode our wire format expects.
-type Aes128Ccm = ccm::Ccm<aes::Aes128, ccm::consts::U16, ccm::consts::U13>;
+/// adapter to the exact mode our wire format expects.  The block-
+/// cipher slot is picked by [`Aes128Impl`] above.
+type Aes128Ccm = ccm::Ccm<Aes128Impl, ccm::consts::U16, ccm::consts::U13>;
 
 /// Encrypt `buf` in place with `cipher` and return the 16-byte tag.
 /// `key` must be at least [`KEY_LEN`] bytes (excess ignored).

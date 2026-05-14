@@ -44,6 +44,11 @@ async fn main(_spawner: Spawner) {
     let config = LinkConfig::default_915();
     let mut sink = UartMidiSink::new(r.midi_uart);
 
+    // Empty keyring — production midi_node profile starts in
+    // plaintext-only mode (Open).  Key plumbing lands with the
+    // Stage 4 BLE provisioning work; until then this profile never
+    // decrypts anything.
+    let keyring = heapless::Vec::new();
     run_rx(
         &mut r.radio0,
         &mut r.status_led,
@@ -53,8 +58,9 @@ async fn main(_spawner: Spawner) {
         None,
         None,
         None,
-        None, // AEAD off — production midi_node profile, no key wiring yet.
-        true, // allow_open is a no-op when aead is None; pass true for consistency.
+        keyring,
+        None, // no filter
+        true, // allow_open — accept plaintext (the only thing we can do).
         None, // No UI on midi_node — no live AEAD update channel.
     )
     .await

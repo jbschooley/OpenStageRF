@@ -37,7 +37,10 @@ use osrf_link::{
 };
 // Re-export the AEAD types so callers configure encryption without
 // depending on `osrf-link` directly.
-pub use osrf_link::{osrf_crypto, AeadContext as AeadConfig, CipherId, Direction};
+pub use osrf_link::{
+    aead_fp, fp_to_bytes, osrf_crypto, AeadContext as AeadConfig, CipherId, Direction, KeyFp,
+    MAX_RX_KEYS,
+};
 use osrf_radio_sx126x::{
     Error as RadioErrorKind, GfskBandwidth, GfskPulseShape, RadioError, RfSwitchControl,
     Sx1262Radio,
@@ -1292,8 +1295,9 @@ pub async fn run_rx<Spi, Busy, Dio1, Reset, Switch, Led, Sink>(
     config_updates: Option<&LinkConfigSignal>,
     scan: Option<&ScanController>,
     shutdown: Option<&ShutdownSignal>,
-    aead: Option<AeadContext>,
-    allow_open: bool,
+    keyring: heapless::Vec<AeadContext, { osrf_link::MAX_RX_KEYS }>,
+    initial_filter: Option<osrf_link::KeyFp>,
+    initial_allow_open: bool,
     aead_updates: Option<&'static AeadUpdateSignal>,
 ) -> !
 where
@@ -1325,9 +1329,10 @@ where
         current.watchdog_ms
     );
 
-    let mut receiver = match aead {
-        Some(ctx) => LinkReceiver::with_aead(ctx, allow_open),
-        None => LinkReceiver::no_crypto(),
+    let mut receiver = if keyring.is_empty() {
+        LinkReceiver::no_crypto()
+    } else {
+        LinkReceiver::with_keyring(keyring, initial_filter, initial_allow_open)
     };
     let mut wd = WatchdogTimer::new(Duration::from_millis(current.watchdog_ms));
     let mut radio_buf = [0u8; RF_PAYLOAD_MAX as usize];
@@ -1440,23 +1445,35 @@ where
         debug_assert!(midi_events.is_empty() && sysex_events.is_empty());
 
         // Apply any pending live AEAD update from the UI.  Same
-        // latest-wins try_take pattern as the TX side.  The receiver's
-        // `set_aead` resets the link-down flag so the next accepted
-        // packet drives a clean session reset under the new key.
+        // latest-wins try_take pattern as the TX side.  The keyring
+        // itself is fixed at construction (see `run_rx` signature);
+        // what live-updates is the strict-mode filter + the
+        // `allow_open` flag.  RX interpretation of `AeadUpdate`:
+        //
+        //   * `update.aead = Some(ctx)`  → operator picked a key →
+        //     strict filter to that key's fp.
+        //   * `update.aead = None`       → operator picked Open /
+        //     Auto → no filter (any key in the keyring matches).
+        //
+        // `update.allow_open` drives the plaintext gate in either
+        // mode (see `LinkReceiver::with_keyring` doc table).
         if let Some(sig) = aead_updates {
             if let Some(update) = sig.try_take() {
-                receiver.set_aead(update.aead, update.allow_open);
+                let filter = update.aead.as_ref().map(osrf_link::aead_fp);
+                receiver.set_filter(filter, update.allow_open);
                 last_logged_key_fp = None;
-                match (update.aead.is_some(), update.allow_open) {
-                    (true, true) => defmt::info!(
-                        "link RX: key changed → auto (key + plaintext both accepted)",
+                match (filter.is_some(), update.allow_open) {
+                    (false, true) => {
+                        defmt::info!("link RX: key changed → auto (any keyring key + plaintext)",)
+                    }
+                    (false, false) => defmt::info!(
+                        "link RX: key changed → multi (any keyring key, plaintext rejected)",
                     ),
                     (true, false) => defmt::info!(
                         "link RX: key changed → strict (specific key only, plaintext rejected)",
                     ),
-                    (false, true) => defmt::info!("link RX: key changed → Open (plaintext only)"),
-                    (false, false) => defmt::info!(
-                        "link RX: key changed → refusing all (no key configured, plaintext rejected)",
+                    (true, true) => defmt::info!(
+                        "link RX: key changed → strict-with-open (specific key OR plaintext)",
                     ),
                 }
             }
