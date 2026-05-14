@@ -14,11 +14,40 @@
 
 use osrf_protocols_midi_v1 as proto;
 
+pub use osrf_crypto::{self, CipherId, Direction};
 pub use proto::{
     ChannelVoiceIter, ChannelVoiceParseError, CheckOutcome, EventReplayWindow16, EventType, Header,
     KeyFp, PacketReplayWindow32, SysExFragmentParts, SysExParseError, HEADER_LEN, KEY_FP_NONE,
-    MAX_BODY_LEN, MAX_FRAG_DATA_BYTES, SESSION_RESET_GAP, VER_V1,
+    MAX_BODY_LEN, MAX_BODY_LEN_AEAD, MAX_FRAG_DATA_BYTES, SESSION_RESET_GAP, TAG_LEN, VER_V1,
 };
+
+/// Bundles the AEAD parameters that don't change packet-to-packet
+/// — held by [`LinkSender`] (for encrypt) and [`LinkReceiver`] (for
+/// decrypt).
+///
+/// `device_id` and `direction` are part of the nonce; see
+/// [`osrf_crypto::derive_nonce`].  `key` and `cipher` drive the
+/// AEAD primitive.  `key_fp` is the 24-bit fingerprint written into
+/// the header — derived from `fingerprint(cipher, &key)` by the
+/// constructors so TX and RX agree on the wire value without
+/// either side having to compute it from the raw key.
+#[derive(Clone, Copy)]
+pub struct AeadContext {
+    pub cipher: CipherId,
+    pub key: [u8; osrf_crypto::KEY_LEN],
+    pub device_id: u32,
+    pub direction: Direction,
+}
+
+/// 24-bit fingerprint of a key, packed little-endian into the
+/// 3-byte [`KeyFp`] wire field.
+fn fp_to_bytes(fp: u32) -> KeyFp {
+    [
+        (fp & 0xFF) as u8,
+        ((fp >> 8) & 0xFF) as u8,
+        ((fp >> 16) & 0xFF) as u8,
+    ]
+}
 
 pub mod midi_tx;
 pub mod state;
@@ -45,12 +74,12 @@ pub use sysex::{
 /// [`SendError::PacketSeqOverflow`] — caller is expected to bump
 /// `boot_counter` (e.g., reboot) before that happens in practice (~50
 /// days continuous at peak rates).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Clone, Copy)]
 pub struct LinkSender {
     boot_counter: u16,
     packet_seq: u32,
     key_fp: KeyFp,
+    aead: Option<AeadContext>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +89,10 @@ pub enum SendError {
     Encode(proto::EncodeError),
     /// Out of packet sequence numbers.  Reset (bumps boot_counter) required.
     PacketSeqOverflow,
+    /// AEAD encryption failed — either the underlying cipher errored
+    /// (vanishingly rare; effectively an internal bug) or `out`
+    /// didn't have room for the trailing tag.
+    Aead,
 }
 
 impl From<proto::EncodeError> for SendError {
@@ -74,12 +107,27 @@ impl LinkSender {
             boot_counter,
             packet_seq: 0,
             key_fp,
+            aead: None,
         }
     }
 
     /// Construct with `KEY_FP_NONE` — the no-crypto path.
     pub fn no_crypto(boot_counter: u16) -> Self {
         Self::new(boot_counter, KEY_FP_NONE)
+    }
+
+    /// Construct with AEAD enabled.  `key_fp` is computed from
+    /// `(cipher, key)` via [`osrf_crypto::fingerprint`] so the
+    /// receiver — which holds the same `(cipher, key)` — derives the
+    /// same fingerprint without further coordination.
+    pub fn with_aead(boot_counter: u16, aead: AeadContext) -> Self {
+        let fp = osrf_crypto::fingerprint(aead.cipher, &aead.key);
+        Self {
+            boot_counter,
+            packet_seq: 0,
+            key_fp: fp_to_bytes(fp),
+            aead: Some(aead),
+        }
     }
 
     pub fn boot_counter(&self) -> u16 {
@@ -96,6 +144,16 @@ impl LinkSender {
 
     /// Encode header + body into `out`, allocating a fresh `packet_seq`.
     /// Returns the number of bytes written.
+    ///
+    /// **Open mode** (no AEAD context): writes header + plaintext body
+    /// only; output is `HEADER_LEN + body.len()` bytes.
+    ///
+    /// **AEAD mode** (with AEAD context): writes header, encrypts body
+    /// in place over the header AAD, and appends the 16-byte auth tag
+    /// at the tail.  Output is `HEADER_LEN + body.len() + TAG_LEN`
+    /// bytes — `out` must be large enough or [`SendError::Aead`]
+    /// fires.  `body.len()` must additionally fit in
+    /// [`MAX_BODY_LEN_AEAD`] (= 37 bytes for the 64-byte radio packet).
     pub fn encode(
         &mut self,
         event_type: EventType,
@@ -113,9 +171,49 @@ impl LinkSender {
             packet_seq: self.packet_seq,
             event_type,
         };
-        let n = proto::encode(out, &header, body)?;
+
+        // Reject AEAD bodies that don't leave room for the tag inside
+        // the wire-format budget.  In open mode the existing
+        // `MAX_BODY_LEN` check inside `proto::encode` is sufficient.
+        if self.aead.is_some() && body.len() > MAX_BODY_LEN_AEAD {
+            return Err(SendError::Encode(proto::EncodeError::BodyTooLarge));
+        }
+
+        let n_plain = proto::encode(out, &header, body)?;
+
+        if let Some(aead) = &self.aead {
+            // AAD = the just-written header.  Copy it out because the
+            // borrow checker won't let us hand `&out[..HEADER_LEN]` as
+            // AAD while also taking `&mut out[HEADER_LEN..n_plain]` as
+            // the encrypt buffer.  11 bytes — trivial copy.
+            let mut aad = [0u8; HEADER_LEN];
+            aad.copy_from_slice(&out[..HEADER_LEN]);
+
+            let nonce = osrf_crypto::derive_nonce(
+                aead.device_id,
+                aead.direction,
+                header.packet_seq,
+                header.boot_counter,
+            );
+            let nonce_slice = &nonce[..aead.cipher.nonce_len()];
+
+            let body_buf = &mut out[HEADER_LEN..n_plain];
+            let tag = osrf_crypto::encrypt(aead.cipher, &aead.key, nonce_slice, &aad, body_buf)
+                .map_err(|_| SendError::Aead)?;
+
+            // Append tag.
+            let tag_end = n_plain + TAG_LEN;
+            if out.len() < tag_end {
+                return Err(SendError::Aead);
+            }
+            out[n_plain..tag_end].copy_from_slice(&tag);
+
+            self.packet_seq = next;
+            return Ok(tag_end);
+        }
+
         self.packet_seq = next;
-        Ok(n)
+        Ok(n_plain)
     }
 }
 
@@ -140,6 +238,12 @@ pub enum RxDrop {
     /// SysEx fragment processing dropped the fragment (e.g., reassembly
     /// buffer full, invalid frag header).
     SysExDropped,
+    /// AEAD authentication failed: tag mismatch, body too short to
+    /// contain a tag, or any other cipher-side error.  The packet was
+    /// tampered with, was encrypted under a different nonce / key, or
+    /// is plaintext on a port that expects encryption.  Drop without
+    /// further parsing — the body bytes are untrusted.
+    AeadFail,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +317,7 @@ pub enum RxEvent<'a> {
 /// supported deployment.
 pub struct LinkReceiver {
     expected_key_fp: KeyFp,
+    aead: Option<AeadContext>,
     boot_session: Option<u16>,
     packet_replay: PacketReplayWindow32,
     event_replay: EventReplayWindow16,
@@ -227,6 +332,7 @@ impl LinkReceiver {
     pub fn new(expected_key_fp: KeyFp) -> Self {
         Self {
             expected_key_fp,
+            aead: None,
             boot_session: None,
             packet_replay: PacketReplayWindow32::new(),
             event_replay: EventReplayWindow16::new(),
@@ -238,6 +344,24 @@ impl LinkReceiver {
 
     pub fn no_crypto() -> Self {
         Self::new(KEY_FP_NONE)
+    }
+
+    /// Construct with AEAD enabled.  Like [`LinkSender::with_aead`],
+    /// the expected `key_fp` is derived from `fingerprint(cipher,
+    /// &key)`.  `direction` must match the sender's direction byte
+    /// (one-way TX→RX link: both sides use [`Direction::TxToRx`]).
+    pub fn with_aead(aead: AeadContext) -> Self {
+        let fp = osrf_crypto::fingerprint(aead.cipher, &aead.key);
+        Self {
+            expected_key_fp: fp_to_bytes(fp),
+            aead: Some(aead),
+            boot_session: None,
+            packet_replay: PacketReplayWindow32::new(),
+            event_replay: EventReplayWindow16::new(),
+            sysex_reasm: SysExReassembler::new(),
+            sysex_scratch: [0u8; MAX_SYSEX_BYTES],
+            link_down: false,
+        }
     }
 
     /// Called by the watchdog timer when no packet has been received for
@@ -313,8 +437,52 @@ impl LinkReceiver {
             CheckOutcome::TooOld => return Ok(Err(RxDrop::PacketTooOld(hdr.packet_seq))),
         }
 
-        // 5. AEAD verify + decrypt would happen here when crypto lands.
-        //    For now, body is plaintext as-decoded.
+        // 5. AEAD verify + decrypt.  Body slice flips from "wire body
+        //    bytes" (open mode) to "decrypted plaintext inside a stack
+        //    scratch buffer" (AEAD mode).  We allocate the scratch
+        //    here on the stack so the borrow stays disjoint from the
+        //    rest of `self` for the downstream channel-voice / sysex
+        //    dispatch calls that take `&mut self`.
+        let mut aead_scratch = [0u8; MAX_BODY_LEN];
+        let body = if let Some(aead) = &self.aead {
+            if body.len() < TAG_LEN {
+                return Ok(Err(RxDrop::AeadFail));
+            }
+            let plaintext_len = body.len() - TAG_LEN;
+            let (ciphertext, tag) = body.split_at(plaintext_len);
+            // Copy ciphertext into the mutable scratch — RustCrypto's
+            // detached-tag interface decrypts in place.
+            aead_scratch[..plaintext_len].copy_from_slice(ciphertext);
+            let mut tag_arr = [0u8; TAG_LEN];
+            tag_arr.copy_from_slice(tag);
+
+            let nonce = osrf_crypto::derive_nonce(
+                aead.device_id,
+                aead.direction,
+                hdr.packet_seq,
+                hdr.boot_counter,
+            );
+            // AAD = the same 11 header bytes that TX authenticated.
+            // Slice `wire` directly — header bytes are unchanged from
+            // the original packet so the AAD matches byte-for-byte.
+            let aad = &wire[..HEADER_LEN];
+
+            if osrf_crypto::decrypt(
+                aead.cipher,
+                &aead.key,
+                &nonce[..aead.cipher.nonce_len()],
+                aad,
+                &mut aead_scratch[..plaintext_len],
+                &tag_arr,
+            )
+            .is_err()
+            {
+                return Ok(Err(RxDrop::AeadFail));
+            }
+            &aead_scratch[..plaintext_len]
+        } else {
+            body
+        };
 
         // 6. Dispatch by event_type.
         match hdr.event_type {
@@ -809,5 +977,178 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(decoded, Some(mask));
+    }
+
+    // -------- AEAD encrypt / decrypt round-trip --------
+
+    /// Helper: build matched TX + RX pair for a given cipher with the
+    /// same key, device_id, and boot_counter — i.e. the scenario two
+    /// real units form when they share a configured key.
+    fn aead_pair(cipher: CipherId) -> (LinkSender, LinkReceiver) {
+        let key = [0x42u8; osrf_crypto::KEY_LEN];
+        let device_id = 0xDEAD_BEEF;
+        let ctx = AeadContext {
+            cipher,
+            key,
+            device_id,
+            direction: Direction::TxToRx,
+        };
+        (LinkSender::with_aead(7, ctx), LinkReceiver::with_aead(ctx))
+    }
+
+    /// One channel-voice event survives encrypt → decrypt and arrives
+    /// byte-identical at the receiver.  Exercised under both ciphers
+    /// to confirm the dispatch table doesn't silently fall through.
+    #[test]
+    fn aead_roundtrip_channel_voice_chacha() {
+        let (mut s, mut r) = aead_pair(CipherId::ChaCha20Poly1305);
+        let (wire, n) = encode_cv(&mut s, &[(0, &[0x90, 60, 100])]);
+        let mut got: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
+        r.process(&wire[..n], now(), |ev| {
+            if let RxEvent::ChannelVoice(m) = ev {
+                got.push(m.to_vec());
+            }
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(got, vec![vec![0x90, 60, 100]]);
+    }
+
+    #[test]
+    fn aead_roundtrip_channel_voice_aes() {
+        let (mut s, mut r) = aead_pair(CipherId::Aes128Ccm);
+        let (wire, n) = encode_cv(&mut s, &[(0, &[0x90, 60, 100])]);
+        let mut got: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
+        r.process(&wire[..n], now(), |ev| {
+            if let RxEvent::ChannelVoice(m) = ev {
+                got.push(m.to_vec());
+            }
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(got, vec![vec![0x90, 60, 100]]);
+    }
+
+    /// AEAD packet is 16 bytes longer than the equivalent open-mode
+    /// packet (the tag).  Confirms the wire-size accounting is right
+    /// — important because the SX1262 driver sizes its TX buffer
+    /// from this number.
+    #[test]
+    fn aead_packet_is_tag_len_bytes_longer_than_open() {
+        let mut open = LinkSender::no_crypto(0);
+        let mut aead = aead_pair(CipherId::ChaCha20Poly1305).0;
+        let body = [0x00, 0x05, 0x90, 60, 100];
+        let mut buf = [0u8; 64];
+        let n_open = open
+            .encode(EventType::ChannelVoice, &body, &mut buf)
+            .unwrap();
+        let n_aead = aead
+            .encode(EventType::ChannelVoice, &body, &mut buf)
+            .unwrap();
+        assert_eq!(n_aead, n_open + TAG_LEN);
+    }
+
+    /// Flipping one bit of the ciphertext fails authentication.  This
+    /// is the tamper-detection guarantee — without it AEAD would only
+    /// give privacy, not authenticity.
+    #[test]
+    fn aead_tampered_ciphertext_rejected() {
+        let (mut s, mut r) = aead_pair(CipherId::ChaCha20Poly1305);
+        let (mut wire, n) = encode_cv(&mut s, &[(0, &[0x90, 60, 100])]);
+        // Flip one byte of the ciphertext (somewhere in the body region).
+        wire[HEADER_LEN + 2] ^= 0x01;
+        let mut got_count = 0;
+        let outcome = r.process(&wire[..n], now(), |_| got_count += 1).unwrap();
+        assert_eq!(outcome, Err(RxDrop::AeadFail));
+        assert_eq!(got_count, 0, "tampered packet must not emit events");
+    }
+
+    /// Flipping a header bit (changes the AAD) also fails auth.
+    /// The header is not encrypted but it is authenticated.
+    #[test]
+    fn aead_tampered_header_rejected() {
+        let (mut s, mut r) = aead_pair(CipherId::ChaCha20Poly1305);
+        let (mut wire, n) = encode_cv(&mut s, &[(0, &[0x90, 60, 100])]);
+        // Flip a bit in the boot_counter field — the header decode still
+        // succeeds because version + event_type are intact, but the AAD
+        // mismatches the one TX signed with, so the tag check fails.
+        wire[4] ^= 0x01;
+        let outcome = r.process(&wire[..n], now(), |_| {}).unwrap();
+        assert_eq!(outcome, Err(RxDrop::AeadFail));
+    }
+
+    /// Receiver expecting AEAD rejects a plaintext packet at the
+    /// fingerprint check — its expected `key_fp` derives from the
+    /// configured key and won't match `KEY_FP_NONE`.
+    #[test]
+    fn aead_rx_rejects_open_packet() {
+        let mut open_tx = LinkSender::no_crypto(0);
+        let (_, mut aead_rx) = aead_pair(CipherId::ChaCha20Poly1305);
+        let (wire, n) = encode_cv(&mut open_tx, &[(0, &[0x90, 60, 100])]);
+        let outcome = aead_rx.process(&wire[..n], now(), |_| {}).unwrap();
+        assert!(matches!(outcome, Err(RxDrop::KeyFpMismatch(_))));
+    }
+
+    /// Open-mode receiver rejects an AEAD packet for the same reason
+    /// — fingerprint mismatch.  Bytes are never even examined as
+    /// ciphertext on this path.
+    #[test]
+    fn open_rx_rejects_aead_packet() {
+        let (mut aead_tx, _) = aead_pair(CipherId::ChaCha20Poly1305);
+        let mut open_rx = LinkReceiver::no_crypto();
+        let (wire, n) = encode_cv(&mut aead_tx, &[(0, &[0x90, 60, 100])]);
+        let outcome = open_rx.process(&wire[..n], now(), |_| {}).unwrap();
+        assert!(matches!(outcome, Err(RxDrop::KeyFpMismatch(_))));
+    }
+
+    /// RX with the wrong key (same cipher, different bytes) rejects
+    /// at the fingerprint check — fingerprints differ even if the
+    /// attacker knows the cipher.
+    #[test]
+    fn aead_wrong_key_rejected() {
+        let mut s = {
+            let key = [0x42u8; osrf_crypto::KEY_LEN];
+            let ctx = AeadContext {
+                cipher: CipherId::ChaCha20Poly1305,
+                key,
+                device_id: 0xDEAD_BEEF,
+                direction: Direction::TxToRx,
+            };
+            LinkSender::with_aead(7, ctx)
+        };
+        let mut r = {
+            let key = [0x99u8; osrf_crypto::KEY_LEN];
+            let ctx = AeadContext {
+                cipher: CipherId::ChaCha20Poly1305,
+                key,
+                device_id: 0xDEAD_BEEF,
+                direction: Direction::TxToRx,
+            };
+            LinkReceiver::with_aead(ctx)
+        };
+        let (wire, n) = encode_cv(&mut s, &[(0, &[0x90, 60, 100])]);
+        let outcome = r.process(&wire[..n], now(), |_| {}).unwrap();
+        assert!(matches!(outcome, Err(RxDrop::KeyFpMismatch(_))));
+    }
+
+    /// Heartbeat (2-byte body) round-trips through AEAD too —
+    /// the dispatch is body-format agnostic.
+    #[test]
+    fn aead_roundtrip_heartbeat() {
+        let (mut s, mut r) = aead_pair(CipherId::Aes128Ccm);
+        let mut buf = [0u8; 80]; // room for header + 2 body + 16 tag
+        let mask: u16 = 0b0010_0001;
+        let n = s
+            .encode(EventType::Heartbeat, &mask.to_be_bytes(), &mut buf)
+            .unwrap();
+        let mut got: Option<u16> = None;
+        r.process(&buf[..n], now(), |ev| {
+            if let RxEvent::Heartbeat(m) = ev {
+                got = m;
+            }
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(got, Some(mask));
     }
 }

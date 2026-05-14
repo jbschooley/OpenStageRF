@@ -104,6 +104,66 @@ pub const KEY_LEN: usize = 32;
 /// stack-allocated nonce scratch buffers.
 pub const NONCE_LEN_MAX: usize = 13;
 
+/// Link direction tag for the AEAD nonce.  Domain-separates TX-side
+/// encryption from a future RX-to-TX channel so that the two cannot
+/// share a `(device_id, session_seq, boot_counter)` nonce by accident
+/// — that would be a catastrophic key-reuse failure.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Direction {
+    /// Packet flows from the link transmitter to the receiver.
+    /// The only direction in use today (one-way MIDI link).
+    TxToRx = 0,
+    /// Reserved for a future bidirectional path (e.g., RX → TX
+    /// ACKs or telemetry).
+    RxToTx = 1,
+}
+
+/// Derive the AEAD nonce for one packet.
+///
+/// Layout (13 bytes, with the tail zero-padded for ChaCha which only
+/// reads bytes 0..12):
+///
+/// ```text
+///   offset  size  field
+///   ------  ----  -----
+///    0       4    device_id      (FICR.DEVICEID low 32 bits on nRF)
+///    4       1    direction      (Direction enum discriminator)
+///    5       4    session_seq    (== link-layer packet_seq, BE)
+///    9       2    boot_counter   (random per-boot, persisted, BE)
+///   11       2    reserved zero  (used by CCM, ignored by ChaCha)
+/// ```
+///
+/// **Uniqueness guarantees.**  A nonce repeats only when *every*
+/// field repeats:
+///   - `device_id` differs between physical units (FICR is factory-
+///     burned),
+///   - `direction` separates TX-side from any future RX-side traffic,
+///   - `session_seq` increments monotonically within a session,
+///   - `boot_counter` changes on each reboot.
+///
+/// So a key reused across many devices, reboots, and packets still
+/// can't collide unless device_id collisions occur (vanishingly
+/// improbable for FICR) OR a session_seq value repeats within the
+/// same (device_id, boot_counter) — which the link layer prevents
+/// by failing TX once `packet_seq` hits `u32::MAX`.
+pub fn derive_nonce(
+    device_id: u32,
+    direction: Direction,
+    session_seq: u32,
+    boot_counter: u16,
+) -> [u8; NONCE_LEN_MAX] {
+    let mut nonce = [0u8; NONCE_LEN_MAX];
+    nonce[0..4].copy_from_slice(&device_id.to_be_bytes());
+    nonce[4] = direction as u8;
+    nonce[5..9].copy_from_slice(&session_seq.to_be_bytes());
+    nonce[9..11].copy_from_slice(&boot_counter.to_be_bytes());
+    // bytes [11..13] left zero — CCM reads all 13, ChaCha reads only
+    // [0..12], so the trailing zeros are inert padding either way.
+    nonce
+}
+
 /// All AEAD failures collapse to one opaque error.  Distinguishing
 /// "wrong tag" from "wrong nonce length" leaks attacker-useful
 /// side-channel information; callers should drop the packet and
@@ -322,6 +382,49 @@ mod tests {
         // Both must fit in 24 bits.
         assert_eq!(fp_chacha & 0xFF00_0000, 0);
         assert_eq!(fp_aes & 0xFF00_0000, 0);
+    }
+
+    /// Nonce layout — confirms field placement and BE byte order.
+    /// A regression here is a wire-break, so the test pins the
+    /// expected bytes exactly.
+    #[test]
+    fn nonce_layout() {
+        let n = derive_nonce(0x1234_5678, Direction::TxToRx, 0x9ABC_DEF0, 0xCAFE);
+        assert_eq!(
+            n,
+            [
+                0x12, 0x34, 0x56, 0x78, // device_id
+                0x00, // direction TxToRx
+                0x9A, 0xBC, 0xDE, 0xF0, // session_seq
+                0xCA, 0xFE, // boot_counter
+                0x00, 0x00, // reserved zero (CCM-only tail bytes)
+            ],
+        );
+    }
+
+    /// Direction discriminator changes the nonce — confirms domain
+    /// separation between TX-side and any future RX-side path.
+    #[test]
+    fn nonce_direction_distinguishes() {
+        let a = derive_nonce(0, Direction::TxToRx, 0, 0);
+        let b = derive_nonce(0, Direction::RxToTx, 0, 0);
+        assert_ne!(a, b);
+    }
+
+    /// End-to-end: the derived nonce must work as-is in encrypt /
+    /// decrypt for both ciphers (validates length compatibility).
+    #[test]
+    fn nonce_drives_both_ciphers() {
+        let nonce = derive_nonce(0xDEAD_BEEF, Direction::TxToRx, 1, 0x4242);
+        let key = [0u8; KEY_LEN];
+        for cipher in [CipherId::ChaCha20Poly1305, CipherId::Aes128Ccm] {
+            let mut buf = *b"midi note on data";
+            let original = buf;
+            let n = cipher.nonce_len();
+            let tag = encrypt(cipher, &key, &nonce[..n], &[], &mut buf).unwrap();
+            decrypt(cipher, &key, &nonce[..n], &[], &mut buf, &tag).unwrap();
+            assert_eq!(buf, original);
+        }
     }
 
     /// Cipher id round-trips through u8.

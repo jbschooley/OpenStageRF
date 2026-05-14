@@ -14,7 +14,9 @@
 //! changes to `run_rx` itself.
 
 use embassy_executor::Spawner;
-use osrf_app_link_bench::{run_rx, synthetic::DefmtLogSink, LinkBenchConfig, LinkStatsCell};
+use osrf_app_link_bench::{
+    run_rx, synthetic::DefmtLogSink, test_aead_chacha, LinkBenchConfig, LinkStatsCell,
+};
 use osrf_board_t114 as board;
 
 use defmt_rtt as _;
@@ -38,6 +40,13 @@ async fn main(_spawner: Spawner) {
     let config = LinkBenchConfig::default_915();
 
     let mut sink = DefmtLogSink;
+    // Paired with the TX side's `test_aead_chacha()` — same key,
+    // same device_id, same direction.  RX derives the expected
+    // `key_fp` from the cipher + key, so any packet with the wrong
+    // header fingerprint or a failed tag fires `RxDrop::AeadFail` /
+    // `KeyFpMismatch` and is logged + counted.
+    let aead = Some(test_aead_chacha());
+    defmt::info!("link bench RX: AEAD = ChaCha20-Poly1305 (test stub key)");
     run_rx(
         &mut r.radio0,
         &mut r.status_led,
@@ -47,6 +56,7 @@ async fn main(_spawner: Spawner) {
         None,
         None,
         None,
+        aead,
     )
     .await
 }
