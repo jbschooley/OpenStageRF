@@ -158,6 +158,11 @@ jobs:
           - t114_midi_tx
           - t114_midi_rx
           - t114_ui
+          # Paired link-bench profiles with the Stage-3 AEAD test-stub
+          # key wired in.  Exercises the encrypt / decrypt path through
+          # `osrf-link-runtime` end-to-end.
+          - t114_link_tx
+          - t114_link_rx
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0

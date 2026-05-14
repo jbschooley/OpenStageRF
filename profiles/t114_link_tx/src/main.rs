@@ -26,7 +26,9 @@
 //! `run_tx` itself.
 
 use embassy_executor::Spawner;
-use osrf_app_link_bench::{run_tx, synthetic::ScenarioSource, LinkBenchConfig, LinkStatsCell};
+use osrf_app_link_bench::{
+    run_tx, synthetic::ScenarioSource, test_aead_chacha, LinkBenchConfig, LinkStatsCell,
+};
 use osrf_board_t114 as board;
 
 use defmt_rtt as _;
@@ -60,6 +62,13 @@ async fn main(_spawner: Spawner) {
     let config = LinkBenchConfig::default_915();
 
     let mut source = ScenarioSource::new();
+    // Encrypt with the Stage-3 testability stub key (ChaCha20-Poly1305,
+    // 0x42-fill, device_id 0x0001).  The paired `t114_link_rx` profile
+    // calls the matching `test_aead_chacha()` helper to decrypt.  Flip
+    // to plaintext by passing `None`; flip to AES-128-CCM by swapping
+    // for `test_aead_aes()`.
+    let aead = Some(test_aead_chacha());
+    defmt::info!("link bench TX: AEAD = ChaCha20-Poly1305 (test stub key)");
     run_tx(
         &mut r.radio0,
         &mut r.status_led,
@@ -70,6 +79,7 @@ async fn main(_spawner: Spawner) {
         None,
         None,
         None,
+        aead,
     )
     .await
 }

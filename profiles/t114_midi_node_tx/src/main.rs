@@ -65,6 +65,7 @@ async fn main(_spawner: Spawner) {
         None,
         None,
         None,
+        None, // AEAD off — production midi_node profile, no key wiring yet.
     )
     .await
 }

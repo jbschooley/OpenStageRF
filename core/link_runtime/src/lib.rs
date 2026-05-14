@@ -31,9 +31,13 @@ use embedded_hal::digital::StatefulOutputPin;
 use embedded_hal_async::{digital::Wait, spi::SpiDevice};
 
 use osrf_link::{
-    ChannelNoteCounts, EventType, HeartbeatTimer, LinkReceiver, LinkSender, MidiTxQueue,
-    PoppedPacket, PressedNotes, QueueKind, RxDrop, RxEvent, WatchdogTimer, MAX_BODY_LEN,
+    AeadContext, ChannelNoteCounts, EventType, HeartbeatTimer, LinkReceiver, LinkSender,
+    MidiTxQueue, PoppedPacket, PressedNotes, QueueKind, RxDrop, RxEvent, WatchdogTimer,
+    MAX_BODY_LEN,
 };
+// Re-export the AEAD types so callers configure encryption without
+// depending on `osrf-link` directly.
+pub use osrf_link::{AeadContext as AeadConfig, CipherId, Direction};
 use osrf_radio_sx126x::{
     Error as RadioErrorKind, GfskBandwidth, GfskPulseShape, RadioError, RfSwitchControl,
     Sx1262Radio,
@@ -788,6 +792,7 @@ pub async fn run_tx<Spi, Busy, Dio1, Reset, Switch, Led, Source>(
     config_updates: Option<&LinkConfigSignal>,
     scan: Option<&ScanController>,
     shutdown: Option<&ShutdownSignal>,
+    aead: Option<AeadContext>,
 ) -> !
 where
     Spi: SpiDevice,
@@ -813,7 +818,21 @@ where
         boot_counter
     );
 
-    let mut sender = LinkSender::no_crypto(boot_counter);
+    let mut sender = match aead {
+        Some(ctx) => LinkSender::with_aead(boot_counter, ctx),
+        None => LinkSender::no_crypto(boot_counter),
+    };
+    // The plaintext budget that `pop_packet` can pack into a packet
+    // body — `MAX_BODY_LEN` in Open mode, `MAX_BODY_LEN_AEAD` (= 37)
+    // with AEAD active.  Caps how much `pop_packet` may consume from
+    // the queue per call so the cipher's tag can fit in the wire
+    // packet; otherwise `encode()` rejects the body and the events
+    // it had already taken from the queue are silently lost.
+    let body_budget = if aead.is_some() {
+        osrf_link::MAX_BODY_LEN_AEAD
+    } else {
+        MAX_BODY_LEN
+    };
     let mut hb = HeartbeatTimer::new(Duration::from_millis(current.heartbeat_ms));
     let mut queue = MidiTxQueue::new();
     // Per-channel pressed-note counts for the heartbeat active-channel
@@ -966,7 +985,9 @@ where
         //    and TX.  The credit-based queue handles batching, priority,
         //    round-robin retransmits, and time-spread NoteOff redundancy
         //    (delayed copies stay queued until their `next_eligible`).
-        if let Some(PoppedPacket { kind, body_len }) = queue.pop_packet(now, &mut body_buf) {
+        if let Some(PoppedPacket { kind, body_len }) =
+            queue.pop_packet(now, &mut body_buf[..body_budget])
+        {
             let event_type = match kind {
                 QueueKind::ChannelVoice => EventType::ChannelVoice,
                 QueueKind::SysExFragment => EventType::SysExFragment,
@@ -974,10 +995,14 @@ where
             match sender.encode(event_type, &body_buf[..body_len], &mut wire_buf) {
                 Ok(wire_n) => {
                     if radio.tx(&wire_buf[..wire_n]).await.is_err() {
-                        defmt::error!("link TX: radio.tx() failed");
+                        defmt::error!("link TX: radio.tx() failed (wire_n={})", wire_n);
                     }
                 }
-                Err(_) => defmt::error!("link TX: encode failed"),
+                Err(e) => defmt::error!(
+                    "link TX: encode failed (body_len={}, err={:?})",
+                    body_len,
+                    e
+                ),
             }
             hb.note_send();
             let _ = led.toggle();
@@ -1186,6 +1211,7 @@ pub async fn run_rx<Spi, Busy, Dio1, Reset, Switch, Led, Sink>(
     config_updates: Option<&LinkConfigSignal>,
     scan: Option<&ScanController>,
     shutdown: Option<&ShutdownSignal>,
+    aead: Option<AeadContext>,
 ) -> !
 where
     Spi: SpiDevice,
@@ -1216,7 +1242,10 @@ where
         current.watchdog_ms
     );
 
-    let mut receiver = LinkReceiver::no_crypto();
+    let mut receiver = match aead {
+        Some(ctx) => LinkReceiver::with_aead(ctx),
+        None => LinkReceiver::no_crypto(),
+    };
     let mut wd = WatchdogTimer::new(Duration::from_millis(current.watchdog_ms));
     let mut radio_buf = [0u8; RF_PAYLOAD_MAX as usize];
     let mut accepted: u32 = 0;

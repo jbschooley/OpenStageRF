@@ -32,6 +32,7 @@ pub const GIT_HASH: &str = env!("OSRF_GIT_HASH");
 
 pub mod battery;
 pub mod clocks;
+pub mod device_id;
 pub mod display;
 pub mod framebuffer;
 pub mod panic_record;

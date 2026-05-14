@@ -426,6 +426,7 @@ async fn link_rx_task(
         Some(&app::CONFIG_UPDATES),
         Some(&app::SCAN),
         Some(&app::SHUTDOWN),
+        None, // AEAD off — full UI profile, key plumbing lands with task #17/#18.
     )
     .await
 }
@@ -448,6 +449,7 @@ async fn link_tx_uart_task(
         Some(&app::CONFIG_UPDATES),
         Some(&app::SCAN),
         Some(&app::SHUTDOWN),
+        None, // AEAD off — see link_rx_task.
     )
     .await
 }
@@ -470,6 +472,7 @@ async fn link_tx_scenario_task(
         Some(&app::CONFIG_UPDATES),
         Some(&app::SCAN),
         Some(&app::SHUTDOWN),
+        None, // AEAD off — see link_rx_task.
     )
     .await
 }

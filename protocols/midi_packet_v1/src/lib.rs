@@ -41,9 +41,32 @@ pub type KeyFp = [u8; 3];
 /// Maximum body bytes (after header, before any AEAD tag) that the encoder
 /// will write.  Sized to fit the RF payload limit minus the header — for
 /// the current 64-byte radio packet, that's `64 - HEADER_LEN = 53`.
-/// Crypto-enabled builds need to leave room for the tag too; that's the
-/// link layer's concern (it supplies a smaller body buffer).
+///
+/// **Open mode** (`key_fp = KEY_FP_NONE`): the full 53-byte body is
+/// available for plaintext.  **AEAD mode** (`key_fp != KEY_FP_NONE`):
+/// the link layer reserves [`TAG_LEN`] bytes at the end of the body
+/// region for the auth tag, leaving [`MAX_BODY_LEN_AEAD`] = 37 bytes
+/// of plaintext.  The encoder is body-format agnostic and accepts any
+/// length up to `MAX_BODY_LEN`; the link layer is responsible for
+/// sizing its plaintext buffer based on whether AEAD is active.
 pub const MAX_BODY_LEN: usize = 53;
+
+/// AEAD authentication tag length (bytes) — both supported ciphers
+/// (ChaCha20-Poly1305, AES-128-CCM) use a 16-byte tag.  Re-exported
+/// here so the link layer can reason about wire-format budgets without
+/// pulling in `osrf-crypto`.
+pub const TAG_LEN: usize = 16;
+
+/// Maximum plaintext body size when AEAD is active.  Equals
+/// [`MAX_BODY_LEN`] minus [`TAG_LEN`] — the link layer's encrypted-mode
+/// plaintext buffer must not exceed this, leaving room for the tag at
+/// the tail of the packet.
+///
+/// 16 bytes of overhead = ~30% shrink vs Open mode.  Channel-voice
+/// events fit comfortably (3 bytes each, ~12 events per packet).
+/// SysEx fragmentation may divide longer messages into more fragments
+/// when AEAD is enabled; that's transparent to the user.
+pub const MAX_BODY_LEN_AEAD: usize = MAX_BODY_LEN - TAG_LEN;
 
 /// Maximum SysEx fragment data bytes (excluding the 4-byte fragment
 /// header `[sysex_id:2][frag_idx:1][frag_total:1]`).
