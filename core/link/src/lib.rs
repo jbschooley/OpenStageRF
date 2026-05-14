@@ -22,8 +22,8 @@ pub use proto::{
 };
 
 /// Bundles the AEAD parameters that don't change packet-to-packet
-/// — held by [`LinkSender`] (for encrypt) and [`LinkReceiver`] (for
-/// decrypt).
+/// — held by [`LinkSender`] (for encrypt) and by [`LinkReceiver`]'s
+/// keyring entries (for decrypt).
 ///
 /// `device_id` and `direction` are part of the nonce; see
 /// [`osrf_crypto::derive_nonce`].  `key` and `cipher` drive the
@@ -39,14 +39,29 @@ pub struct AeadContext {
     pub direction: Direction,
 }
 
+/// Maximum number of keys an [`LinkReceiver`] can hold in its
+/// keyring.  Sized for the typical "a few hardcoded keys for
+/// testing" plus future BLE-provisioned entries (Stage 4).  Bump
+/// if you need more — currently 4 covers the t114_ui profile's
+/// `Shared` + `Shared (AES)` plus headroom.
+pub const MAX_RX_KEYS: usize = 4;
+
 /// 24-bit fingerprint of a key, packed little-endian into the
-/// 3-byte [`KeyFp`] wire field.
-fn fp_to_bytes(fp: u32) -> KeyFp {
+/// 3-byte [`KeyFp`] wire field.  Public so callers that need to
+/// derive the wire `key_fp` from an [`AeadContext`] (e.g. building
+/// an RX-side strict-mode filter) don't have to reimplement the
+/// packing.
+pub fn fp_to_bytes(fp: u32) -> KeyFp {
     [
         (fp & 0xFF) as u8,
         ((fp >> 8) & 0xFF) as u8,
         ((fp >> 16) & 0xFF) as u8,
     ]
+}
+
+/// Convenience: derive an [`AeadContext`]'s `KeyFp` directly.
+pub fn aead_fp(aead: &AeadContext) -> KeyFp {
+    fp_to_bytes(osrf_crypto::fingerprint(aead.cipher, &aead.key))
 }
 
 pub mod midi_tx;
@@ -336,15 +351,34 @@ pub enum RxEvent<'a> {
 /// `event_seq` before delivering to the sink.  Trades 30 ms latency
 /// for strict ordering.  Not implemented today — single antenna is the
 /// supported deployment.
+/// One entry in [`LinkReceiver`]'s keyring.  Caches the fingerprint
+/// alongside the context so per-packet lookup is a flat O(N) loop
+/// without a SHA-256 per packet.
+#[derive(Clone, Copy)]
+struct KeyringEntry {
+    fp: KeyFp,
+    ctx: AeadContext,
+}
+
 pub struct LinkReceiver {
-    aead_fp: KeyFp,
-    aead: Option<AeadContext>,
+    /// All AEAD keys this receiver can decrypt with.  Configured at
+    /// boot (typically from the profile's hardcoded keys plus any
+    /// flash-loaded entries; Stage 4 BLE provisioning will add more
+    /// at runtime).  Per-packet `key_fp` lookup is a linear scan;
+    /// `MAX_RX_KEYS` keeps that cheap.
+    keyring: heapless::Vec<KeyringEntry, MAX_RX_KEYS>,
+    /// When `Some(fp)`, only packets whose `key_fp` matches are
+    /// accepted (must also be in `keyring` for the material lookup
+    /// to succeed).  When `None`, any `key_fp` in `keyring` is
+    /// accepted ("Auto" mode).  `KEY_FP_NONE` is handled separately
+    /// via [`Self::allow_open`] — operators wanting "encrypted only,
+    /// any key" set `filter=None` + `allow_open=false`.
+    filter: Option<KeyFp>,
     /// Also accept packets whose `key_fp` is [`KEY_FP_NONE`] (plain
     /// text).  Useful when a paired sender may pick "Open" via the
     /// UI mid-session — RX auto-falls back to plaintext for those
     /// packets without losing the ability to decrypt subsequent
-    /// encrypted ones.  `false` = strict mode: reject any packet
-    /// whose `key_fp` isn't the configured AEAD fingerprint.
+    /// encrypted ones.  `false` = strict: reject plaintext.
     allow_open: bool,
     /// `key_fp` of the most recently *accepted* packet, or `None`
     /// before any packet has passed the fingerprint check.  The
@@ -363,13 +397,13 @@ pub struct LinkReceiver {
 }
 
 impl LinkReceiver {
-    /// Open-mode receiver.  Accepts only plaintext packets
-    /// (`key_fp = KEY_FP_NONE`); any encrypted packet is rejected
+    /// Open-mode receiver.  Empty keyring; accepts only plaintext
+    /// (`key_fp = KEY_FP_NONE`).  Any encrypted packet is rejected
     /// with [`RxDrop::KeyFpMismatch`].
     pub fn no_crypto() -> Self {
         Self {
-            aead_fp: KEY_FP_NONE,
-            aead: None,
+            keyring: heapless::Vec::new(),
+            filter: None,
             allow_open: true,
             last_accepted_key_fp: None,
             boot_session: None,
@@ -381,23 +415,36 @@ impl LinkReceiver {
         }
     }
 
-    /// Construct with AEAD enabled.  The expected `key_fp` is derived
-    /// from `fingerprint(aead.cipher, &aead.key)` so TX and RX agree
-    /// on the wire value without further coordination.  `direction`
-    /// must match the sender's direction byte (one-way TX→RX link:
-    /// both sides use [`Direction::TxToRx`]).
+    /// Construct with a keyring (multiple known keys).  Use this for
+    /// real RX-side decryption — the receiver accepts packets whose
+    /// `key_fp` matches **any** entry in `keys`, gated by `filter`
+    /// and `allow_open`:
     ///
-    /// `allow_open = true` makes the receiver also accept
-    /// plaintext packets (`key_fp = KEY_FP_NONE`), useful when the
-    /// peer's UI lets the operator toggle encryption on/off
-    /// dynamically.  `allow_open = false` is strict-encryption
-    /// mode: any plaintext packet is dropped as a fingerprint
-    /// mismatch.
-    pub fn with_aead(aead: AeadContext, allow_open: bool) -> Self {
-        let fp = osrf_crypto::fingerprint(aead.cipher, &aead.key);
+    /// | `filter`        | `allow_open` | Behaviour                                  |
+    /// |-----------------|--------------|--------------------------------------------|
+    /// | `None`          | `true`       | Permissive: any keyring fp **or** plaintext |
+    /// | `None`          | `false`      | Encrypted-only: any keyring fp, no plaintext |
+    /// | `Some(fp)`      | `false`      | Strict: only `fp`, no plaintext            |
+    /// | `Some(fp)`      | `true`       | Strict-with-fallback: `fp` or plaintext    |
+    ///
+    /// Entries beyond [`MAX_RX_KEYS`] are silently dropped; the
+    /// caller can pre-check the slice length to fail loudly if that
+    /// matters.
+    pub fn with_keyring<I>(keys: I, filter: Option<KeyFp>, allow_open: bool) -> Self
+    where
+        I: IntoIterator<Item = AeadContext>,
+    {
+        let mut keyring: heapless::Vec<KeyringEntry, MAX_RX_KEYS> = heapless::Vec::new();
+        for ctx in keys {
+            let fp = osrf_crypto::fingerprint(ctx.cipher, &ctx.key);
+            let _ = keyring.push(KeyringEntry {
+                fp: fp_to_bytes(fp),
+                ctx,
+            });
+        }
         Self {
-            aead_fp: fp_to_bytes(fp),
-            aead: Some(aead),
+            keyring,
+            filter,
             allow_open,
             last_accepted_key_fp: None,
             boot_session: None,
@@ -409,6 +456,15 @@ impl LinkReceiver {
         }
     }
 
+    /// Single-key convenience wrapper around [`Self::with_keyring`]
+    /// — kept for backward compatibility with callers that have
+    /// exactly one key.  Equivalent to `with_keyring([aead], None,
+    /// allow_open)`: the lone key is always in scope, no strict
+    /// filter.
+    pub fn with_aead(aead: AeadContext, allow_open: bool) -> Self {
+        Self::with_keyring([aead], None, allow_open)
+    }
+
     /// Called by the watchdog timer when no packet has been received for
     /// `WATCHDOG_MS`.  Marks the link as down so the next packet
     /// triggers a full session reset (clearing both replay windows and
@@ -417,32 +473,27 @@ impl LinkReceiver {
         self.link_down = true;
     }
 
-    /// Hot-swap the AEAD context the receiver decrypts with, plus
-    /// the `allow_open` mode flag.  Use cases:
+    /// Hot-swap the strict-mode filter + `allow_open` flag.  The
+    /// **keyring stays fixed** — these are the keys the receiver
+    /// has material for, which doesn't change at runtime today
+    /// (Stage 4 BLE provisioning will eventually call a separate
+    /// path to add/remove keyring entries).  What can change live
+    /// is the operator's *selection*:
     ///
-    /// * Operator toggles Open ↔ Specific Key in the UI: the UI
-    ///   runtime pushes a new pair (cipher/key + `allow_open=false`
-    ///   for strict mode, or the current key + `allow_open=true`
-    ///   for permissive mode).
-    /// * Operator picks a different key entirely: same flow, just
-    ///   with new bytes.
+    /// * Operator picks Open / Auto in the UI → `set_filter(None,
+    ///   true)`: permissive, any keyring key OR plaintext.
+    /// * Operator picks a specific key → `set_filter(Some(fp),
+    ///   false)`: strict, only that key.
+    /// * Operator picks a fp that isn't in this receiver's keyring
+    ///   → `set_filter(Some(unknown_fp), false)`: refuses
+    ///   everything (lookup will mismatch).
     ///
     /// Marks the link as down so the next accepted packet triggers a
-    /// full session reset — different key implies (almost certainly)
-    /// a different paired peer, so any old replay-window or pressed-
-    /// notes state would be stale.
-    pub fn set_aead(&mut self, aead: Option<AeadContext>, allow_open: bool) {
-        match aead {
-            Some(ctx) => {
-                let fp = osrf_crypto::fingerprint(ctx.cipher, &ctx.key);
-                self.aead_fp = fp_to_bytes(fp);
-                self.aead = Some(ctx);
-            }
-            None => {
-                self.aead_fp = KEY_FP_NONE;
-                self.aead = None;
-            }
-        }
+    /// full session reset; different filter implies (almost
+    /// certainly) a different paired peer, so any old replay-window
+    /// or pressed-notes state would be stale.
+    pub fn set_filter(&mut self, filter: Option<KeyFp>, allow_open: bool) {
+        self.filter = filter;
         self.allow_open = allow_open;
         self.last_accepted_key_fp = None;
         self.link_down = true;
@@ -495,23 +546,46 @@ impl LinkReceiver {
         // 1. Parse header.
         let (hdr, body) = proto::decode(wire)?;
 
-        // 2. Key fingerprint check.  Accept packets whose `key_fp`
-        //    matches either (a) the receiver's configured AEAD key,
-        //    or (b) `KEY_FP_NONE` if `allow_open` is set.  Anything
-        //    else is a fingerprint mismatch.
+        // 2. Key fingerprint check + keyring lookup.
         //
-        //    `incoming_aead` is `true` iff the packet body should be
-        //    decrypted before dispatch; carried forward into step 5
-        //    below.
-        let incoming_aead = if hdr.key_fp == KEY_FP_NONE {
+        // Three accept paths:
+        //   (a) Plaintext (`key_fp == KEY_FP_NONE`): allowed iff
+        //       `allow_open` AND the filter doesn't pin a specific
+        //       non-NONE fp.
+        //   (b) Encrypted, filter unset: allowed iff `key_fp`
+        //       appears in the keyring.
+        //   (c) Encrypted, filter set to this fp: allowed iff
+        //       `key_fp` matches the filter AND appears in the
+        //       keyring.
+        //
+        // `aead_idx` is `Some(i)` when the packet should be decrypted
+        // using keyring entry `i` in step 5 below; `None` for the
+        // plaintext path.
+        let aead_idx: Option<usize> = if hdr.key_fp == KEY_FP_NONE {
             if !self.allow_open {
                 return Ok(Err(RxDrop::KeyFpMismatch(hdr.key_fp)));
             }
-            false
-        } else if self.aead.is_some() && hdr.key_fp == self.aead_fp {
-            true
+            // A strict filter on a specific non-NONE fp blocks
+            // plaintext too — operator wanted that exact key only.
+            if let Some(filter_fp) = self.filter {
+                if filter_fp != KEY_FP_NONE {
+                    return Ok(Err(RxDrop::KeyFpMismatch(hdr.key_fp)));
+                }
+            }
+            None
         } else {
-            return Ok(Err(RxDrop::KeyFpMismatch(hdr.key_fp)));
+            // Strict filter must match the incoming fp.
+            if let Some(filter_fp) = self.filter {
+                if filter_fp != hdr.key_fp {
+                    return Ok(Err(RxDrop::KeyFpMismatch(hdr.key_fp)));
+                }
+            }
+            // Look up the key material in the keyring.  Miss → drop
+            // (we have no way to decrypt).
+            match self.keyring.iter().position(|e| e.fp == hdr.key_fp) {
+                Some(i) => Some(i),
+                None => return Ok(Err(RxDrop::KeyFpMismatch(hdr.key_fp))),
+            }
         };
         // Record the accepted fingerprint so the runtime can surface
         // Open↔AEAD transitions without instrumenting every packet.
@@ -552,12 +626,11 @@ impl LinkReceiver {
         //    dispatch calls that take `&mut self`.
         //
         //    Whether we enter the AEAD branch is determined by step 2's
-        //    `incoming_aead` flag, not just by whether the receiver
-        //    has a key configured — an `allow_open` RX with a key
-        //    configured still bypasses decrypt for `KEY_FP_NONE`
-        //    packets.
+        //    `aead_idx` — `Some(i)` means decrypt with keyring entry
+        //    `i`; `None` means the packet was plaintext (only
+        //    reachable when `allow_open` permits it).
         let mut aead_scratch = [0u8; MAX_BODY_LEN];
-        let body = if let (true, Some(aead)) = (incoming_aead, &self.aead) {
+        let body = if let Some(aead) = aead_idx.map(|i| &self.keyring[i].ctx) {
             if body.len() < TAG_LEN {
                 return Ok(Err(RxDrop::AeadFail));
             }

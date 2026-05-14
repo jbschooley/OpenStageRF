@@ -18,6 +18,17 @@ osrf-app-midi-node             = { workspace = true }
 osrf-app-link-bench            = { workspace = true }
 osrf-app-ui-runtime            = { workspace = true }
 osrf-panic-log                 = { workspace = true, features = ["defmt"] }
+# Hardware-AES (SoftDevice `sd_ecb_block_encrypt`) is **not**
+# enabled on this profile.  The link runtime task runs on the
+# interrupt executor at priority P2; SD's SVCall handler sits at
+# priority 4; calling any SD SVC from a higher-priority context
+# (lower numeric value) HardFaults.  Software AES is invisible in
+# practice (≈100 µs per packet, comfortably under the MIDI cadence
+# budget).  Hardware AES is feasible from thread mode, but moving
+# the link runtime there would lose the radio-IRQ → packet
+# preemption that motivated P2.  Revisit on Stage 4 hardware
+# (nRF5340 + CryptoCell CC312, different threading story).
+# osrf-crypto                  = { workspace = true, features = ["aes-hw-sd"] }
 
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
 embassy-time     = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }

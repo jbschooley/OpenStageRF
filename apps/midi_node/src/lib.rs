@@ -31,9 +31,9 @@ pub mod uart;
 // `run_tx` / `run_rx` and reference [`LinkConfig`] without depending
 // on `osrf-link-runtime` directly.
 pub use osrf_link_runtime::{
-    configure_radio, osrf_crypto, run_rx, run_tx, AeadConfig, AeadUpdate, AeadUpdateSignal,
-    CipherId, Direction, LinkConfig, LinkConfigSignal, LinkStats, LinkStatsCell, ScanController,
-    RF_PAYLOAD_MAX, SCAN_MAX_CHANNELS, SCAN_RSSI_NONE,
+    aead_fp, configure_radio, fp_to_bytes, osrf_crypto, run_rx, run_tx, AeadConfig, AeadUpdate,
+    AeadUpdateSignal, CipherId, Direction, KeyFp, LinkConfig, LinkConfigSignal, LinkStats,
+    LinkStatsCell, ScanController, MAX_RX_KEYS, RF_PAYLOAD_MAX, SCAN_MAX_CHANNELS, SCAN_RSSI_NONE,
 };
 
 pub use uart::{UartMidiSink, UartMidiSource};

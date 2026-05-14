@@ -12,6 +12,10 @@ board = "t114"
 [dependencies]
 osrf-board-t114     = { workspace = true, features = ["defmt"] }
 osrf-app-link-bench = { workspace = true }
+heapless            = { workspace = true }
+# Hardware-AES disabled — see `profiles/t114_ui/Cargo.toml` for the
+# SVCall-vs-link-runtime-priority rationale.
+# osrf-crypto       = { workspace = true, features = ["aes-hw-sd"] }
 
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
 

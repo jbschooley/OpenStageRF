@@ -12,6 +12,7 @@ board = "t114"
 [dependencies]
 osrf-board-t114    = { workspace = true, features = ["defmt"] }
 osrf-app-midi-node = { workspace = true }
+heapless           = { workspace = true }
 
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
 

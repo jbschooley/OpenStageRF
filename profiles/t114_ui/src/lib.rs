@@ -76,28 +76,36 @@ const POWER_POLICY: PowerPolicy = PowerPolicy::Wired;
 
 const KEY_SHARED: [u8; 32] = [0x42; 32];
 const KEY_SHARED_NAME: &str = "Shared";
+const KEY_SHARED_AES: [u8; 32] = [0x55; 32];
+const KEY_SHARED_AES_NAME: &str = "Shared (AES)";
 const KEY_TX_ONLY: [u8; 32] = [0x99; 32];
 const KEY_TX_ONLY_NAME: &str = "TX-Only";
+/// Default cipher for the `KEY_SHARED` / `KEY_TX_ONLY` entries
+/// (software ChaCha20-Poly1305 on the nRF52840 — no hardware
+/// support).  `KEY_SHARED_AES` uses [`CipherId::Aes128Ccm`] so the
+/// `aes-hw-sd` feature's hardware AES path (`sd_ecb_block_encrypt`
+/// SVC) gets exercised when the operator picks it.
 const TEST_CIPHER: CipherId = CipherId::ChaCha20Poly1305;
+const TEST_CIPHER_AES: CipherId = CipherId::Aes128Ccm;
 /// Hardcoded device_id so paired units agree without exchanging
 /// FICR.DEVICEID values out-of-band.  Stage 4 / multi-device
 /// deployments will switch this to `board::device_id::device_id()`
 /// + an RX-side allowlist.
 const TEST_DEVICE_ID: u32 = 0x0000_0001;
 
-/// Build the AEAD context for a given hardcoded key.  Cipher,
-/// device_id and direction are profile-wide constants.
-fn ctx_for_key(key: [u8; 32]) -> AeadConfig {
+/// Build the AEAD context for a given hardcoded key + cipher.
+/// `device_id` and `direction` are profile-wide constants.
+fn ctx_for_key(key: [u8; 32], cipher: CipherId) -> AeadConfig {
     AeadConfig {
-        cipher: TEST_CIPHER,
+        cipher,
         key,
         device_id: TEST_DEVICE_ID,
         direction: Direction::TxToRx,
     }
 }
 
-fn fp_for_key(key: &[u8; 32]) -> u32 {
-    osrf_app_midi_node::osrf_crypto::fingerprint(TEST_CIPHER, key) & 0x00FF_FFFF
+fn fp_for_key(key: &[u8; 32], cipher: CipherId) -> u32 {
+    osrf_app_midi_node::osrf_crypto::fingerprint(cipher, key) & 0x00FF_FFFF
 }
 
 /// Resolver for the **TX** side: operator selects a key in the UI →
@@ -106,8 +114,9 @@ fn fp_for_key(key: &[u8; 32]) -> u32 {
 /// since the keystore only contains the keys we know) falls back to
 /// plaintext as a safe default.
 fn tx_aead_resolver(active_fp: Option<u32>) -> AeadUpdate {
-    let shared_fp = fp_for_key(&KEY_SHARED);
-    let tx_only_fp = fp_for_key(&KEY_TX_ONLY);
+    let shared_fp = fp_for_key(&KEY_SHARED, TEST_CIPHER);
+    let shared_aes_fp = fp_for_key(&KEY_SHARED_AES, TEST_CIPHER_AES);
+    let tx_only_fp = fp_for_key(&KEY_TX_ONLY, TEST_CIPHER);
     let masked = active_fp.map(|fp| fp & 0x00FF_FFFF);
     match masked {
         None => AeadUpdate {
@@ -115,11 +124,15 @@ fn tx_aead_resolver(active_fp: Option<u32>) -> AeadUpdate {
             allow_open: true,
         },
         Some(fp) if fp == shared_fp => AeadUpdate {
-            aead: Some(ctx_for_key(KEY_SHARED)),
+            aead: Some(ctx_for_key(KEY_SHARED, TEST_CIPHER)),
+            allow_open: false,
+        },
+        Some(fp) if fp == shared_aes_fp => AeadUpdate {
+            aead: Some(ctx_for_key(KEY_SHARED_AES, TEST_CIPHER_AES)),
             allow_open: false,
         },
         Some(fp) if fp == tx_only_fp => AeadUpdate {
-            aead: Some(ctx_for_key(KEY_TX_ONLY)),
+            aead: Some(ctx_for_key(KEY_TX_ONLY, TEST_CIPHER)),
             allow_open: false,
         },
         Some(_) => AeadUpdate {
@@ -140,15 +153,25 @@ fn tx_aead_resolver(active_fp: Option<u32>) -> AeadUpdate {
 ///   refuse everything (RX shouldn't actually let this state happen
 ///   in the menu, but the resolver stays defensive).
 fn rx_aead_resolver(active_fp: Option<u32>) -> AeadUpdate {
-    let shared_fp = fp_for_key(&KEY_SHARED);
+    let shared_fp = fp_for_key(&KEY_SHARED, TEST_CIPHER);
+    let shared_aes_fp = fp_for_key(&KEY_SHARED_AES, TEST_CIPHER_AES);
     let masked = active_fp.map(|fp| fp & 0x00FF_FFFF);
     match masked {
         None => AeadUpdate {
-            aead: Some(ctx_for_key(KEY_SHARED)),
+            // Auto/Open mode falls back to whichever key the operator
+            // had picked previously (or defaults to `Shared` ChaCha
+            // on a never-configured boot).  Multi-key keyring is a
+            // follow-up; today RX can only have one cipher armed
+            // simultaneously.
+            aead: Some(ctx_for_key(KEY_SHARED, TEST_CIPHER)),
             allow_open: true,
         },
         Some(fp) if fp == shared_fp => AeadUpdate {
-            aead: Some(ctx_for_key(KEY_SHARED)),
+            aead: Some(ctx_for_key(KEY_SHARED, TEST_CIPHER)),
+            allow_open: false,
+        },
+        Some(fp) if fp == shared_aes_fp => AeadUpdate {
+            aead: Some(ctx_for_key(KEY_SHARED_AES, TEST_CIPHER_AES)),
             allow_open: false,
         },
         Some(_) => AeadUpdate {
@@ -340,17 +363,23 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     // the UI's Key list shows them as selectable entries.
     //
     // Per-role registration:
-    //   * TX gets BOTH keys (Shared + TX-Only) so the operator can
-    //     pick between them and exercise the cross-board rejection
-    //     case (TX-Only on the wire → RX logs KeyFpMismatch).
-    //   * RX gets only `Shared` — `TX-Only` isn't even shown there,
-    //     matching the actual material RX holds.
-    let shared_fp = fp_for_key(&KEY_SHARED);
+    //   * Both TX and RX get `Shared` (ChaCha20) and `Shared (AES)`
+    //     so the operator can switch ciphers while still talking to
+    //     the same peer — useful for exercising the hardware-AES
+    //     path independently from the software-ChaCha path.
+    //   * TX additionally gets `TX-Only` so picking it on TX
+    //     reproduces the documented mismatch case (RX doesn't have
+    //     this key → `RxDrop::KeyFpMismatch` on every packet).
+    let shared_fp = fp_for_key(&KEY_SHARED, TEST_CIPHER);
     if keys.find(shared_fp).is_none() {
         let _ = keys.add(KEY_SHARED_NAME, TEST_CIPHER, shared_fp);
     }
+    let shared_aes_fp = fp_for_key(&KEY_SHARED_AES, TEST_CIPHER_AES);
+    if keys.find(shared_aes_fp).is_none() {
+        let _ = keys.add(KEY_SHARED_AES_NAME, TEST_CIPHER_AES, shared_aes_fp);
+    }
     if matches!(role, Role::Tx) {
-        let tx_only_fp = fp_for_key(&KEY_TX_ONLY);
+        let tx_only_fp = fp_for_key(&KEY_TX_ONLY, TEST_CIPHER);
         if keys.find(tx_only_fp).is_none() {
             let _ = keys.add(KEY_TX_ONLY_NAME, TEST_CIPHER, tx_only_fp);
         }
@@ -367,10 +396,22 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     let initial_update = aead_resolver(settings.active_key_fp);
     let initial_aead = initial_update.aead;
     let initial_allow_open = initial_update.allow_open;
+
+    // RX-side keyring: full set of keys the receiver has material
+    // for, so Auto/Open mode can decrypt any of them.  Built once
+    // at boot — operator key changes only flip the strict filter
+    // (see `rx_aead_resolver`).
+    let mut rx_keyring: heapless::Vec<AeadConfig, { osrf_app_midi_node::MAX_RX_KEYS }> =
+        heapless::Vec::new();
+    let _ = rx_keyring.push(ctx_for_key(KEY_SHARED, TEST_CIPHER));
+    let _ = rx_keyring.push(ctx_for_key(KEY_SHARED_AES, TEST_CIPHER_AES));
+    let rx_initial_filter = initial_aead.as_ref().map(osrf_app_midi_node::aead_fp);
+
     defmt::info!(
-        "t114_ui: boot AEAD aead={=bool} allow_open={=bool}",
+        "t114_ui: boot AEAD aead={=bool} allow_open={=bool} rx_keyring={=usize}",
         initial_aead.is_some(),
         initial_allow_open,
+        rx_keyring.len(),
     );
     let mut widgets: WidgetList = WidgetList::new();
     let mut renderer = Renderer::new();
@@ -455,7 +496,8 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
                     r.status_led,
                     sink,
                     config,
-                    initial_aead,
+                    rx_keyring,
+                    rx_initial_filter,
                     initial_allow_open,
                 )
                 .expect("alloc link_rx_task"),
@@ -571,8 +613,9 @@ async fn link_rx_task(
     mut status_led: Output<'static>,
     mut sink: UartMidiSink<board::MidiUart>,
     config: LinkConfig,
-    aead: Option<AeadConfig>,
-    allow_open: bool,
+    keyring: heapless::Vec<AeadConfig, { osrf_app_midi_node::MAX_RX_KEYS }>,
+    initial_filter: Option<osrf_app_midi_node::KeyFp>,
+    initial_allow_open: bool,
 ) -> ! {
     run_rx(
         &mut radio0,
@@ -583,8 +626,9 @@ async fn link_rx_task(
         Some(&app::CONFIG_UPDATES),
         Some(&app::SCAN),
         Some(&app::SHUTDOWN),
-        aead,
-        allow_open,
+        keyring,
+        initial_filter,
+        initial_allow_open,
         Some(&app::AEAD_UPDATES),
     )
     .await
