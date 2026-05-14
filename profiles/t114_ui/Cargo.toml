@@ -4,10 +4,11 @@ version     = "0.1.0"
 publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
-description = "Milestone 6 UI smoke test — T114 deployment.  Drives the built-in 1.14″ ST7789 TFT plus an externally-wired 5-way joystick through osrf-ui."
+description = "T114 UI deployment — shared library.  Provides `run()` plus all task definitions / signals / AEAD plumbing.  The three flashable binaries (`t114_ui_tx`, `t114_ui_rx`, `t114_ui_bench_tx`) are separate profile crates that depend on this and pick (Role, TxSource) at boot."
 
-[package.metadata.osrf]
-board = "t114"
+# No `[package.metadata.osrf].board` entry — this crate is library-only
+# and is never flashed directly.  The three thin profile crates that
+# wrap `run()` each carry their own `board = "t114"`.
 
 [dependencies]
 osrf-board-t114                = { workspace = true, features = ["defmt", "panic-stage"] }
@@ -43,22 +44,4 @@ defmt-rtt   = "1.1"
 name = "osrf_profile_t114_ui"
 path = "src/lib.rs"
 test = false
-bench = false
-
-[[bin]]
-name  = "ui_rx"
-path  = "src/bin/ui_rx.rs"
-test  = false
-bench = false
-
-[[bin]]
-name  = "ui_tx"
-path  = "src/bin/ui_tx.rs"
-test  = false
-bench = false
-
-[[bin]]
-name  = "ui_bench_tx"
-path  = "src/bin/ui_bench_tx.rs"
-test  = false
 bench = false

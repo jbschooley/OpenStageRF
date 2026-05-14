@@ -712,6 +712,61 @@ TP4054 + NiMH danger.  Only deferred bullet is the optional TP4054 STAT → GPIO
 which is hardware-side-only and can land whenever someone wants charging-state
 distinction in the UI.
 
+### Stage 3 — encryption / authentication (out-of-scope marker promoted to milestone)
+
+**Status:** 🟢 **on-air complete on T114** (2026-05-14).  Originally listed under "Out
+of scope for first prototype" but landed early once the T114 platform pivot made
+hardware AES + a known-good RNG available.
+
+What shipped:
+- `osrf-crypto` crate with **ChaCha20-Poly1305** (RFC 8439 default) and
+  **AES-128-CCM** (software RustCrypto impl), unified `CipherId` dispatch,
+  RFC 8439 + AES round-trip + nonce-length test vectors.
+- `fingerprint()` helper hashing `cipher_id ‖ key` so TX and RX derive the same
+  `key_fp` from the shared `(cipher, key)` pair without further coordination.
+- **Wire-format budget:** 16 bytes reserved for the auth tag in AEAD mode
+  (`MAX_BODY_LEN_AEAD = 37` vs `MAX_BODY_LEN = 53` for the Open path).
+- **Nonce derivation** per design decision #1: `[device_id:4][direction:1]
+  [session_seq:4][boot_counter:2]`, zero-padded to 13 bytes for AES-CCM.
+  `device_id` comes from `FICR.DEVICEID[0]` on the T114.  `boot_counter` stays
+  random-per-boot for testability (flash persistence is wired but the bump-on-
+  boot path is a Stage 4 prerequisite, not a Stage 3 blocker).
+- **LinkSender / LinkReceiver:** `with_aead(...)` constructors, encrypt /
+  decrypt in place around the existing replay-window + session-reset logic,
+  `RxDrop::AeadFail` counter on tamper / wrong-key / bad-nonce, all 9
+  integration tests passing (Open ↔ AEAD interop, tamper, wrong key, etc).
+- **KeyRecord layout** with `cipher_id` carved from the reserved block
+  (64-byte total preserved; pre-Stage-3 records reject as corrupt).
+- **Flash persistence** at `KEY_STORE_RANGE` (8 KB, 2 pages) via
+  `sequential-storage::map` — `load_keys` / `save_key` / `remove_key` in
+  `apps/ui_runtime`, ready for Stage 4 BLE provisioning to call.
+- **CI:** paired `t114_link_tx` / `t114_link_rx` profiles wired with the
+  testability stub key (`apps/link_bench::test_aead_chacha`) cover the AEAD
+  path on every push.
+
+**Hardware verification (2026-05-14):** 187 s on-air test with
+ChaCha20-Poly1305.  **6913 MIDI events** received over 27,524 packets, 0
+missed notes, 0 AEAD failures, 0 link drops, 0 wrong-fingerprint drops, 11
+background CRC errors (0.04% — RF noise floor).  Sub-millisecond timing
+jitter against synthetic scenario schedules.
+
+**Deferred to Stage 4:**
+- Hardware AES via the nRF52840 CCM peripheral or SoftDevice
+  `sd_ecb_block_encrypt` SVCs.  Software is fast enough for current bodies;
+  the CCM peripheral is BLE-reserved while the SoftDevice is enabled.
+- DX-LR30 AEAD.  STM32F103 has no RNG; needs a fallback-entropy decision
+  before this can ship.
+- On-device key-generation / -import UI.  Without BLE there's no
+  out-of-band channel to share a freshly-generated key with the peer,
+  so the menu item stays hidden.  Keys for testing live in
+  `apps/link_bench::test_aead_chacha()` or as `Some(AeadConfig { … })`
+  literals in a profile boot.  Stage 4 BLE GATT writes will call the
+  already-wired `save_key` to populate the keystore.
+- `boot_counter` bump-and-persist (instead of random-per-boot).  Random
+  works for short-lived testing but birthday-collides on a shared key
+  after ~256 reboots; Stage 4 lands this alongside the BLE provisioning
+  flow.
+
 ## Total estimate
 
 **Single-developer first prototype: 4–6 weeks**, plus 1–2 weeks if `osrf-radio-sx126x` is written from scratch instead of integrating an existing crate.
@@ -719,8 +774,8 @@ distinction in the UI.
 ## Out of scope for first prototype
 
 - Diversity (Stage 2)
-- Second platform port to T114 (Stage 2.5)
-- Encryption / authentication (Stage 3)
+- Second platform port to T114 (Stage 2.5) — 🟢 already done in the 2026-05 pivot
+- Encryption / authentication (Stage 3) — 🟢 on-air complete on T114 (2026-05-14)
 - BLE config (Stage 4 / v2 board)
 - Audio (Stage 5 / v3 board)
 - Multi-band switching (just 902–928 MHz US 915 ISM)

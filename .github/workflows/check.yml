@@ -157,10 +157,15 @@ jobs:
           - t114_blink
           - t114_midi_tx
           - t114_midi_rx
-          - t114_ui
+          # Full UI deployment — three bin profiles + the shared lib
+          # `osrf-profile-t114-ui` (the lib is built transitively).
+          # Exercises the AEAD plumbing through the production UI path.
+          - t114_ui_tx
+          - t114_ui_rx
+          - t114_ui_bench_tx
           # Paired link-bench profiles with the Stage-3 AEAD test-stub
           # key wired in.  Exercises the encrypt / decrypt path through
-          # `osrf-link-runtime` end-to-end.
+          # `osrf-link-runtime` end-to-end without the UI stack on top.
           - t114_link_tx
           - t114_link_rx
     steps:

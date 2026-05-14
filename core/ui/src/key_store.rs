@@ -102,7 +102,49 @@ pub struct KeyRecord {
     pub reserved: [u8; 10],
 }
 
+/// On-flash record size, in bytes.  Matches the documented layout
+/// above.  Used by callers that need to size flash-IO scratch
+/// buffers without depending on `core::mem::size_of`.
+pub const KEY_RECORD_BYTES: usize = 64;
+
 impl KeyRecord {
+    /// Serialize the record into the documented 64-byte little-endian
+    /// layout.  Explicit byte placement (rather than relying on
+    /// `repr(C)` field order) protects against future struct re-orders
+    /// or padding changes.  See module docs for the exact byte map.
+    pub fn to_bytes(&self) -> [u8; KEY_RECORD_BYTES] {
+        let mut out = [0u8; KEY_RECORD_BYTES];
+        out[0..4].copy_from_slice(&(self.fingerprint & 0x00FF_FFFF).to_le_bytes());
+        out[4] = self.cipher_id;
+        out[5] = self.name_len;
+        out[6..22].copy_from_slice(&self.name_bytes);
+        out[22..54].copy_from_slice(&self.key_material);
+        out[54..64].copy_from_slice(&self.reserved);
+        out
+    }
+
+    /// Deserialize from the documented 64-byte layout.  Mirror image
+    /// of [`Self::to_bytes`].  Performs no validation — call
+    /// [`Self::to_entry`] afterward to confirm the record decodes to
+    /// a usable [`KeyEntry`].
+    pub fn from_bytes(buf: &[u8; KEY_RECORD_BYTES]) -> Self {
+        let fingerprint = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let mut name_bytes = [0u8; MAX_KEY_NAME];
+        name_bytes.copy_from_slice(&buf[6..22]);
+        let mut key_material = [0u8; KEY_MATERIAL_LEN];
+        key_material.copy_from_slice(&buf[22..54]);
+        let mut reserved = [0u8; 10];
+        reserved.copy_from_slice(&buf[54..64]);
+        Self {
+            fingerprint: fingerprint & 0x00FF_FFFF,
+            cipher_id: buf[4],
+            name_len: buf[5],
+            name_bytes,
+            key_material,
+            reserved,
+        }
+    }
+
     /// Construct a record from a runtime [`KeyEntry`] and the
     /// given key material.  The cipher choice comes from the
     /// entry; the caller is responsible for ensuring the material
@@ -401,6 +443,58 @@ mod tests {
         assert_eq!(record.cipher_id, CipherId::Aes128Ccm as u8);
         let back = record.to_entry().expect("round trips");
         assert_eq!(back.cipher, CipherId::Aes128Ccm);
+    }
+
+    #[test]
+    fn key_record_bytes_roundtrip() {
+        let mut name: String<MAX_KEY_NAME> = String::new();
+        name.push_str("Stage Left").unwrap();
+        let entry = KeyEntry {
+            fingerprint: 0x12_3456,
+            cipher: CipherId::Aes128Ccm,
+            name,
+        };
+        let material: [u8; KEY_MATERIAL_LEN] = core::array::from_fn(|i| i as u8);
+        let rec = KeyRecord::from_entry(&entry, material);
+        let bytes = rec.to_bytes();
+        let back = KeyRecord::from_bytes(&bytes);
+        assert_eq!(back.fingerprint, rec.fingerprint);
+        assert_eq!(back.cipher_id, rec.cipher_id);
+        assert_eq!(back.name_len, rec.name_len);
+        assert_eq!(back.name_bytes, rec.name_bytes);
+        assert_eq!(back.key_material, rec.key_material);
+        assert_eq!(back.reserved, rec.reserved);
+    }
+
+    /// Pin the exact bytes for one known record so a future
+    /// inadvertent layout shuffle fails this test instead of
+    /// silently invalidating every flash-stored key.
+    #[test]
+    fn key_record_bytes_known_layout() {
+        let entry = KeyEntry {
+            fingerprint: 0x00AB_CDEF,
+            cipher: CipherId::ChaCha20Poly1305,
+            name: {
+                let mut n: String<MAX_KEY_NAME> = String::new();
+                n.push_str("A").unwrap();
+                n
+            },
+        };
+        let mut material = [0u8; KEY_MATERIAL_LEN];
+        material[0] = 0xFF;
+        let rec = KeyRecord::from_entry(&entry, material);
+        let bytes = rec.to_bytes();
+        // fingerprint: little-endian 0x00AB_CDEF
+        assert_eq!(&bytes[0..4], &[0xEF, 0xCD, 0xAB, 0x00]);
+        // cipher_id = ChaCha20Poly1305 = 1
+        assert_eq!(bytes[4], 1);
+        // name_len = 1, name_bytes[0] = 'A' = 0x41
+        assert_eq!(bytes[5], 1);
+        assert_eq!(bytes[6], b'A');
+        // key_material[0] = 0xFF (offset 22)
+        assert_eq!(bytes[22], 0xFF);
+        // reserved (offset 54) all zero
+        assert_eq!(&bytes[54..64], &[0u8; 10]);
     }
 
     #[test]

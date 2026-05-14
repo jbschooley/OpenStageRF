@@ -47,7 +47,9 @@ pub use band_plan::{
     BAND_PLANS,
 };
 pub use battery::{BatteryChemistry, BatteryStatus, CRITICAL_THRESHOLD_PCT, LOW_THRESHOLD_PCT};
-pub use key_store::{KeyEntry, KeyRecord, KeyStore, KEY_MATERIAL_LEN, MAX_KEYS, MAX_KEY_NAME};
+pub use key_store::{
+    KeyEntry, KeyRecord, KeyStore, KEY_MATERIAL_LEN, KEY_RECORD_BYTES, MAX_KEYS, MAX_KEY_NAME,
+};
 pub use osrf_crypto::CipherId;
 pub use render::{render, Renderer};
 // (PowerPolicy + WIRED_USB_LOSS_GRACE_SECS are already public at the
@@ -321,8 +323,7 @@ pub static MAIN_MENU_TX: MenuNode = MenuNode {
         MenuItem { label: "Scan", action: ItemAction::Custom(ScreenId::Scan) },
         MenuItem { label: "Band Plan", action: ItemAction::List(ListKind::BandPlan) },
         MenuItem { label: "TX Power", action: ItemAction::Value(ValueKind::TxPower) },
-        // Key entry hidden until AEAD lands (Stage 3 in ROADMAP.md).
-        // MenuItem { label: "Key",        action: ItemAction::List(ListKind::Key) },
+        MenuItem { label: "Key", action: ItemAction::List(ListKind::Key) },
         MenuItem { label: "About", action: ItemAction::Custom(ScreenId::About) },
         MenuItem { label: "Force panic", action: ItemAction::Trigger(Command::ForcePanic) },
         MenuItem { label: "Force WDT", action: ItemAction::Trigger(Command::ForceWdtHang) },
@@ -338,7 +339,7 @@ pub static MAIN_MENU_RX: MenuNode = MenuNode {
         MenuItem { label: "Channel", action: ItemAction::List(ListKind::Channel) },
         MenuItem { label: "Scan", action: ItemAction::Custom(ScreenId::Scan) },
         MenuItem { label: "Band Plan", action: ItemAction::List(ListKind::BandPlan) },
-        // MenuItem { label: "Key",        action: ItemAction::List(ListKind::Key) },
+        MenuItem { label: "Key", action: ItemAction::List(ListKind::Key) },
         MenuItem { label: "Link Stats", action: ItemAction::Custom(ScreenId::LinkStats) },
         MenuItem { label: "About", action: ItemAction::Custom(ScreenId::About) },
         MenuItem { label: "Force panic", action: ItemAction::Trigger(Command::ForcePanic) },

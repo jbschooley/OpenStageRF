@@ -142,6 +142,27 @@ impl LinkSender {
         self.key_fp
     }
 
+    /// Hot-swap the AEAD context the sender encrypts with.  `None`
+    /// drops back to plaintext (Open mode); `Some(ctx)` switches to
+    /// the new key.  The wire `key_fp` field is recomputed from the
+    /// new key so the receiver picks up the change on the next
+    /// packet.  `packet_seq` and `boot_counter` are preserved — the
+    /// receiver's replay window keeps protecting against re-orderings
+    /// across the key change.
+    pub fn set_aead(&mut self, aead: Option<AeadContext>) {
+        match aead {
+            Some(ctx) => {
+                let fp = osrf_crypto::fingerprint(ctx.cipher, &ctx.key);
+                self.key_fp = fp_to_bytes(fp);
+                self.aead = Some(ctx);
+            }
+            None => {
+                self.key_fp = KEY_FP_NONE;
+                self.aead = None;
+            }
+        }
+    }
+
     /// Encode header + body into `out`, allocating a fresh `packet_seq`.
     /// Returns the number of bytes written.
     ///
@@ -316,8 +337,21 @@ pub enum RxEvent<'a> {
 /// for strict ordering.  Not implemented today — single antenna is the
 /// supported deployment.
 pub struct LinkReceiver {
-    expected_key_fp: KeyFp,
+    aead_fp: KeyFp,
     aead: Option<AeadContext>,
+    /// Also accept packets whose `key_fp` is [`KEY_FP_NONE`] (plain
+    /// text).  Useful when a paired sender may pick "Open" via the
+    /// UI mid-session — RX auto-falls back to plaintext for those
+    /// packets without losing the ability to decrypt subsequent
+    /// encrypted ones.  `false` = strict mode: reject any packet
+    /// whose `key_fp` isn't the configured AEAD fingerprint.
+    allow_open: bool,
+    /// `key_fp` of the most recently *accepted* packet, or `None`
+    /// before any packet has passed the fingerprint check.  The
+    /// runtime polls this on every iteration so it can log a single
+    /// line on Open↔AEAD transitions without spamming the log on
+    /// every packet.
+    last_accepted_key_fp: Option<KeyFp>,
     boot_session: Option<u16>,
     packet_replay: PacketReplayWindow32,
     event_replay: EventReplayWindow16,
@@ -329,10 +363,15 @@ pub struct LinkReceiver {
 }
 
 impl LinkReceiver {
-    pub fn new(expected_key_fp: KeyFp) -> Self {
+    /// Open-mode receiver.  Accepts only plaintext packets
+    /// (`key_fp = KEY_FP_NONE`); any encrypted packet is rejected
+    /// with [`RxDrop::KeyFpMismatch`].
+    pub fn no_crypto() -> Self {
         Self {
-            expected_key_fp,
+            aead_fp: KEY_FP_NONE,
             aead: None,
+            allow_open: true,
+            last_accepted_key_fp: None,
             boot_session: None,
             packet_replay: PacketReplayWindow32::new(),
             event_replay: EventReplayWindow16::new(),
@@ -342,19 +381,25 @@ impl LinkReceiver {
         }
     }
 
-    pub fn no_crypto() -> Self {
-        Self::new(KEY_FP_NONE)
-    }
-
-    /// Construct with AEAD enabled.  Like [`LinkSender::with_aead`],
-    /// the expected `key_fp` is derived from `fingerprint(cipher,
-    /// &key)`.  `direction` must match the sender's direction byte
-    /// (one-way TX→RX link: both sides use [`Direction::TxToRx`]).
-    pub fn with_aead(aead: AeadContext) -> Self {
+    /// Construct with AEAD enabled.  The expected `key_fp` is derived
+    /// from `fingerprint(aead.cipher, &aead.key)` so TX and RX agree
+    /// on the wire value without further coordination.  `direction`
+    /// must match the sender's direction byte (one-way TX→RX link:
+    /// both sides use [`Direction::TxToRx`]).
+    ///
+    /// `allow_open = true` makes the receiver also accept
+    /// plaintext packets (`key_fp = KEY_FP_NONE`), useful when the
+    /// peer's UI lets the operator toggle encryption on/off
+    /// dynamically.  `allow_open = false` is strict-encryption
+    /// mode: any plaintext packet is dropped as a fingerprint
+    /// mismatch.
+    pub fn with_aead(aead: AeadContext, allow_open: bool) -> Self {
         let fp = osrf_crypto::fingerprint(aead.cipher, &aead.key);
         Self {
-            expected_key_fp: fp_to_bytes(fp),
+            aead_fp: fp_to_bytes(fp),
             aead: Some(aead),
+            allow_open,
+            last_accepted_key_fp: None,
             boot_session: None,
             packet_replay: PacketReplayWindow32::new(),
             event_replay: EventReplayWindow16::new(),
@@ -370,6 +415,51 @@ impl LinkReceiver {
     /// any in-flight SysEx reassembly state).  See SPEC.md § "Watchdog".
     pub fn mark_link_down(&mut self) {
         self.link_down = true;
+    }
+
+    /// Hot-swap the AEAD context the receiver decrypts with, plus
+    /// the `allow_open` mode flag.  Use cases:
+    ///
+    /// * Operator toggles Open ↔ Specific Key in the UI: the UI
+    ///   runtime pushes a new pair (cipher/key + `allow_open=false`
+    ///   for strict mode, or the current key + `allow_open=true`
+    ///   for permissive mode).
+    /// * Operator picks a different key entirely: same flow, just
+    ///   with new bytes.
+    ///
+    /// Marks the link as down so the next accepted packet triggers a
+    /// full session reset — different key implies (almost certainly)
+    /// a different paired peer, so any old replay-window or pressed-
+    /// notes state would be stale.
+    pub fn set_aead(&mut self, aead: Option<AeadContext>, allow_open: bool) {
+        match aead {
+            Some(ctx) => {
+                let fp = osrf_crypto::fingerprint(ctx.cipher, &ctx.key);
+                self.aead_fp = fp_to_bytes(fp);
+                self.aead = Some(ctx);
+            }
+            None => {
+                self.aead_fp = KEY_FP_NONE;
+                self.aead = None;
+            }
+        }
+        self.allow_open = allow_open;
+        self.last_accepted_key_fp = None;
+        self.link_down = true;
+    }
+
+    /// `key_fp` of the most recently *accepted* packet (post key-
+    /// fingerprint check, regardless of whether the packet survived
+    /// later replay / decode steps).  Returns `None` before any
+    /// packet has been processed.
+    ///
+    /// `KEY_FP_NONE` here means the last accepted packet was
+    /// plaintext (Open mode); any other value means it was decrypted
+    /// with the matching configured key.  The runtime polls this to
+    /// surface Open↔AEAD transitions without instrumenting the link
+    /// layer with its own defmt logging.
+    pub fn last_accepted_key_fp(&self) -> Option<KeyFp> {
+        self.last_accepted_key_fp
     }
 
     pub fn last_boot_counter(&self) -> Option<u16> {
@@ -405,10 +495,27 @@ impl LinkReceiver {
         // 1. Parse header.
         let (hdr, body) = proto::decode(wire)?;
 
-        // 2. Key fingerprint check.
-        if hdr.key_fp != self.expected_key_fp {
+        // 2. Key fingerprint check.  Accept packets whose `key_fp`
+        //    matches either (a) the receiver's configured AEAD key,
+        //    or (b) `KEY_FP_NONE` if `allow_open` is set.  Anything
+        //    else is a fingerprint mismatch.
+        //
+        //    `incoming_aead` is `true` iff the packet body should be
+        //    decrypted before dispatch; carried forward into step 5
+        //    below.
+        let incoming_aead = if hdr.key_fp == KEY_FP_NONE {
+            if !self.allow_open {
+                return Ok(Err(RxDrop::KeyFpMismatch(hdr.key_fp)));
+            }
+            false
+        } else if self.aead.is_some() && hdr.key_fp == self.aead_fp {
+            true
+        } else {
             return Ok(Err(RxDrop::KeyFpMismatch(hdr.key_fp)));
-        }
+        };
+        // Record the accepted fingerprint so the runtime can surface
+        // Open↔AEAD transitions without instrumenting every packet.
+        self.last_accepted_key_fp = Some(hdr.key_fp);
 
         // 3. Session reset detection.  Trigger reset on either:
         //    (a) boot_counter mismatch (primary signal for TX restart)
@@ -443,8 +550,14 @@ impl LinkReceiver {
         //    here on the stack so the borrow stays disjoint from the
         //    rest of `self` for the downstream channel-voice / sysex
         //    dispatch calls that take `&mut self`.
+        //
+        //    Whether we enter the AEAD branch is determined by step 2's
+        //    `incoming_aead` flag, not just by whether the receiver
+        //    has a key configured — an `allow_open` RX with a key
+        //    configured still bypasses decrypt for `KEY_FP_NONE`
+        //    packets.
         let mut aead_scratch = [0u8; MAX_BODY_LEN];
-        let body = if let Some(aead) = &self.aead {
+        let body = if let (true, Some(aead)) = (incoming_aead, &self.aead) {
             if body.len() < TAG_LEN {
                 return Ok(Err(RxDrop::AeadFail));
             }
@@ -803,8 +916,18 @@ mod tests {
 
     #[test]
     fn receiver_drops_wrong_key_fp() {
+        // Strict-AEAD receiver, plaintext sender — RX should drop with
+        // `KeyFpMismatch(KEY_FP_NONE)` because the wire's `key_fp` is
+        // `[0,0,0]` and `allow_open = false` rejects it.
+        let key = [0xAAu8; osrf_crypto::KEY_LEN];
+        let ctx = AeadContext {
+            cipher: CipherId::ChaCha20Poly1305,
+            key,
+            device_id: 1,
+            direction: Direction::TxToRx,
+        };
         let mut s = LinkSender::no_crypto(0);
-        let mut r = LinkReceiver::new([0x01, 0x02, 0x03]);
+        let mut r = LinkReceiver::with_aead(ctx, false);
         let mut buf = [0u8; 64];
         let n = s.encode(EventType::Heartbeat, &[], &mut buf).unwrap();
         let r1 = r.process(&buf[..n], now(), |_| {}).unwrap();
@@ -993,7 +1116,12 @@ mod tests {
             device_id,
             direction: Direction::TxToRx,
         };
-        (LinkSender::with_aead(7, ctx), LinkReceiver::with_aead(ctx))
+        // Strict-encryption RX (allow_open = false) — all round-trip
+        // tests assume the receiver rejects plaintext.
+        (
+            LinkSender::with_aead(7, ctx),
+            LinkReceiver::with_aead(ctx, false),
+        )
     }
 
     /// One channel-voice event survives encrypt → decrypt and arrives
@@ -1124,9 +1252,73 @@ mod tests {
                 device_id: 0xDEAD_BEEF,
                 direction: Direction::TxToRx,
             };
-            LinkReceiver::with_aead(ctx)
+            LinkReceiver::with_aead(ctx, false)
         };
         let (wire, n) = encode_cv(&mut s, &[(0, &[0x90, 60, 100])]);
+        let outcome = r.process(&wire[..n], now(), |_| {}).unwrap();
+        assert!(matches!(outcome, Err(RxDrop::KeyFpMismatch(_))));
+    }
+
+    /// With `allow_open = true` an AEAD-configured receiver also
+    /// accepts plaintext packets — the dual-mode behaviour the UI
+    /// profile relies on for "operator toggles encryption on/off
+    /// mid-session without rebooting the RX side."
+    #[test]
+    fn aead_allow_open_accepts_plain_and_encrypted() {
+        let key = [0x42u8; osrf_crypto::KEY_LEN];
+        let ctx = AeadContext {
+            cipher: CipherId::ChaCha20Poly1305,
+            key,
+            device_id: 1,
+            direction: Direction::TxToRx,
+        };
+        let mut r = LinkReceiver::with_aead(ctx, true);
+
+        // Plaintext TX (no_crypto).  RX must accept and pass through.
+        let mut plain_tx = LinkSender::no_crypto(7);
+        let (wire, n) = encode_cv(&mut plain_tx, &[(0, &[0x90, 60, 100])]);
+        let mut events: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
+        r.process(&wire[..n], now(), |ev| {
+            if let RxEvent::ChannelVoice(m) = ev {
+                events.push(m.to_vec());
+            }
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(events, vec![vec![0x90, 60, 100]]);
+
+        // Encrypted TX with the same key.  RX must also accept.
+        // (Use a fresh receiver to avoid the replay window rejecting
+        // the new packet's seq=0 as a duplicate of the plaintext one
+        // above — different scenario, not what we're testing here.)
+        let mut r2 = LinkReceiver::with_aead(ctx, true);
+        let mut enc_tx = LinkSender::with_aead(7, ctx);
+        let (wire, n) = encode_cv(&mut enc_tx, &[(0, &[0x91, 64, 100])]);
+        events.clear();
+        r2.process(&wire[..n], now(), |ev| {
+            if let RxEvent::ChannelVoice(m) = ev {
+                events.push(m.to_vec());
+            }
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(events, vec![vec![0x91, 64, 100]]);
+    }
+
+    /// `allow_open = false` (strict) rejects plaintext even when the
+    /// receiver has the right AEAD key — protects against downgrade.
+    #[test]
+    fn aead_strict_rejects_plain() {
+        let key = [0x42u8; osrf_crypto::KEY_LEN];
+        let ctx = AeadContext {
+            cipher: CipherId::ChaCha20Poly1305,
+            key,
+            device_id: 1,
+            direction: Direction::TxToRx,
+        };
+        let mut r = LinkReceiver::with_aead(ctx, false);
+        let mut plain_tx = LinkSender::no_crypto(7);
+        let (wire, n) = encode_cv(&mut plain_tx, &[(0, &[0x90, 60, 100])]);
         let outcome = r.process(&wire[..n], now(), |_| {}).unwrap();
         assert!(matches!(outcome, Err(RxDrop::KeyFpMismatch(_))));
     }

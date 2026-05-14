@@ -2,15 +2,14 @@
 #![no_std]
 #![no_main]
 
-//! Transmitter-side UI binary for the T114.  Top menu shows
-//! Channel, Scan, Band Plan, TX Power, About.  Idle banner shows
-//! TX power + channel.  Drives the same `osrf-ui` core as `ui_rx`
-//! but constructed with [`Role::Tx`].
+//! T114 UI transmitter binary.  Drives the production UART MIDI
+//! source via `osrf_profile_t114_ui::run(spawner, Role::Tx,
+//! TxSource::Uart)`.  All UI / link / soft-off logic lives in the
+//! shared lib — this binary is just the role + source pick.
 
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use osrf_board_t114 as board;
-// Panic handler lives in `osrf_profile_t114_ui` (lib).
 use osrf_profile_t114_ui::{run, TxSource};
 use osrf_ui::Role;
 
