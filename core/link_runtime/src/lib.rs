@@ -1607,12 +1607,14 @@ where
                     arrived.duration_since(last_rx_at).as_millis(),
                 );
                 last_rx_at = arrived;
-                wd.kick();
-                let was_down = !link_up;
-                link_up = true;
-                if was_down {
-                    defmt::info!("link RX: link UP");
-                }
+                // RSSI updates on any radio receive (signal-strength
+                // panel should keep ticking even on rejected packets
+                // — the operator is still pulling RF in).  But the
+                // watchdog and the link-UP flag stay gated on
+                // `process()` actually *accepting* the packet (see
+                // the `Ok(Ok(()))` arm below) — a wrong-key TX is
+                // an effectively-dead link from the application's
+                // POV, even though radio packets keep arriving.
                 last_rssi = Some(pkt.rssi_dbm);
 
                 let n = pkt.len.min(radio_buf.len());
@@ -1740,6 +1742,20 @@ where
                     Ok(Ok(())) => {
                         accepted = accepted.wrapping_add(1);
                         let _ = led.toggle();
+                        // Mark the link as alive only on acceptance —
+                        // a wrong-key TX produces a steady stream of
+                        // KeyFpMismatch drops that should *not* keep
+                        // the link "UP", because no MIDI is making it
+                        // through.  Watchdog kick lives here too for
+                        // the same reason: it should fire after
+                        // `watchdog_ms` of no *accepted* traffic, not
+                        // of no radio activity.
+                        wd.kick();
+                        let was_down = !link_up;
+                        link_up = true;
+                        if was_down {
+                            defmt::info!("link RX: link UP");
+                        }
                         // Log Open↔AEAD transitions exactly once per
                         // crossover — quiet during steady state, but
                         // gives a clear audit trail when the operator

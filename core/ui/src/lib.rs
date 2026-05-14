@@ -1307,7 +1307,6 @@ fn build_idle(
     status: &LinkStatus,
     out: &mut WidgetList,
 ) {
-    let _ = keys;
     // Title carries the role suffix ("OpenStageRF TX" / "RX") so
     // the user can tell at a glance which side they're holding.
     let mut title: String<24> = String::new();
@@ -1350,9 +1349,10 @@ fn build_idle(
     let mut row3: String<24> = String::new();
     let _ = write!(&mut row3, "{}", ch.format_frequency());
     out.push(Widget::Text { row: 3, text: row3 }).ok();
-    // Row 4: RSSI on RX (only meaningful here); blank on TX
-    // until we have something else worth showing (battery,
-    // packet rate, etc.).
+    // Row 4 on RX: RSSI (most-glanced operational value during a
+    // show).  TX has no RSSI to display so its row 4 is the key row
+    // — same physical position as RX's RSSI, different content,
+    // which keeps the layout dense without an awkward gap.
     if state.role == Role::Rx {
         let mut row4: String<24> = String::new();
         match status.last_rssi_dbm {
@@ -1364,6 +1364,42 @@ fn build_idle(
             }
         }
         out.push(Widget::Text { row: 4, text: row4 }).ok();
+    }
+    // Active-key indicator — only rendered when a key *is* active.
+    // Open mode (the default + most common state) leaves the row
+    // blank rather than adding visual noise that says "you haven't
+    // configured anything".  Formats when shown:
+    //   `Key: <name>`             — encrypted with the keystore
+    //                                entry of that name (e.g. `Key:
+    //                                Shared`).
+    //   `Key: ??? <fp>`           — selection points at a
+    //                                fingerprint we don't have in
+    //                                the keystore (corrupted
+    //                                settings or roster drift);
+    //                                shows the bare 24-bit hex so
+    //                                the operator can compare.
+    if let Some(fp) = settings.active_key_fp {
+        let key_row: u8 = match state.role {
+            Role::Tx => 4,
+            Role::Rx => 5,
+        };
+        let mut key_text: String<24> = String::new();
+        match keys.find(fp) {
+            Some(entry) => {
+                let _ = write!(&mut key_text, "Key: ");
+                for c in entry.name.chars().take(MAX_KEY_NAME) {
+                    let _ = key_text.push(c);
+                }
+            }
+            None => {
+                let _ = write!(&mut key_text, "Key: ??? {:06x}", fp & 0x00FF_FFFF);
+            }
+        }
+        out.push(Widget::Text {
+            row: key_row,
+            text: key_text,
+        })
+        .ok();
     }
     out.push(Widget::Footer(s("Center: menu"))).ok();
 }
