@@ -46,7 +46,7 @@ async fn main(_spawner: Spawner) {
     // header fingerprint or a failed tag fires `RxDrop::AeadFail` /
     // `KeyFpMismatch` and is logged + counted.
     let aead = Some(test_aead_chacha());
-    defmt::info!("link bench RX: AEAD = ChaCha20-Poly1305 (test stub key)");
+    defmt::info!("link bench RX: AEAD = ChaCha20-Poly1305 (test stub key, strict)");
     run_rx(
         &mut r.radio0,
         &mut r.status_led,
@@ -57,6 +57,10 @@ async fn main(_spawner: Spawner) {
         None,
         None,
         aead,
+        // Strict — link-bench is a paired AEAD test, plaintext from
+        // the bench TX would be a test setup error not a feature.
+        false,
+        None, // No UI on the link bench — AEAD config is fixed at boot.
     )
     .await
 }

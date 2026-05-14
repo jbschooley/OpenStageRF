@@ -37,7 +37,7 @@ use osrf_link::{
 };
 // Re-export the AEAD types so callers configure encryption without
 // depending on `osrf-link` directly.
-pub use osrf_link::{AeadContext as AeadConfig, CipherId, Direction};
+pub use osrf_link::{osrf_crypto, AeadContext as AeadConfig, CipherId, Direction};
 use osrf_radio_sx126x::{
     Error as RadioErrorKind, GfskBandwidth, GfskPulseShape, RadioError, RfSwitchControl,
     Sx1262Radio,
@@ -158,6 +158,64 @@ impl LinkConfigSignal {
 }
 
 impl Default for LinkConfigSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Live AEAD update sent from the UI when the operator picks a
+/// different key (or Open) in the Key menu.  Both `run_tx` and
+/// `run_rx` consume the same signal — each takes the parts it cares
+/// about.
+///
+/// * **TX:** uses `aead` only.  `Some(ctx)` → encrypt subsequent
+///   packets with this key; `None` → drop to plaintext.  `allow_open`
+///   is meaningless on the TX side.
+/// * **RX:** uses both.  `aead` configures which key the receiver
+///   can decrypt with (single-key keyring for now); `allow_open`
+///   gates whether plaintext packets also pass through.  Typical
+///   profile mapping:
+///   * operator selects Open / Auto → `aead = Some(known_key)`,
+///     `allow_open = true` (permissive — accept the known key OR
+///     plaintext);
+///   * operator selects a specific key → `aead = Some(that_key)`,
+///     `allow_open = false` (strict — only that key, plaintext
+///     rejected);
+///   * operator selects a key the receiver has no material for →
+///     `aead = None`, `allow_open = false` (refuse everything; a
+///     warning indicator on the UI is the right follow-up).
+#[derive(Clone, Copy)]
+pub struct AeadUpdate {
+    pub aead: Option<AeadContext>,
+    pub allow_open: bool,
+}
+
+/// Embassy [`Signal`] wrapper for [`AeadUpdate`].  Same shape as
+/// [`LinkConfigSignal`] — latest-wins; consumed by the runtime
+/// inside its top-of-loop `try_take` poll and inside its `select`
+/// arm so updates that land mid-blocking-await still apply.
+pub struct AeadUpdateSignal {
+    inner: Signal<CriticalSectionRawMutex, AeadUpdate>,
+}
+
+impl AeadUpdateSignal {
+    pub const fn new() -> Self {
+        Self {
+            inner: Signal::new(),
+        }
+    }
+    pub fn signal(&self, u: AeadUpdate) {
+        self.inner.signal(u);
+    }
+    pub async fn wait(&self) -> AeadUpdate {
+        self.inner.wait().await
+    }
+    pub fn try_take(&self) -> Option<AeadUpdate> {
+        self.inner.try_take()
+    }
+}
+
+impl Default for AeadUpdateSignal {
     fn default() -> Self {
         Self::new()
     }
@@ -793,6 +851,7 @@ pub async fn run_tx<Spi, Busy, Dio1, Reset, Switch, Led, Source>(
     scan: Option<&ScanController>,
     shutdown: Option<&ShutdownSignal>,
     aead: Option<AeadContext>,
+    aead_updates: Option<&'static AeadUpdateSignal>,
 ) -> !
 where
     Spi: SpiDevice,
@@ -855,6 +914,28 @@ where
 
     loop {
         let now = Instant::now();
+
+        // Apply any pending live AEAD update from the UI.  Latest-wins;
+        // poll at loop-top so a key change that landed while we were
+        // blocked in `select` gets applied before the next packet
+        // ships.  Logged once per change so the RTT trail shows
+        // when the operator toggled.
+        if let Some(sig) = aead_updates {
+            if let Some(update) = sig.try_take() {
+                sender.set_aead(update.aead);
+                if update.aead.is_some() {
+                    let fp = sender.key_fp();
+                    defmt::info!(
+                        "link TX: key changed → AEAD on (key_fp={=u8:02x}{=u8:02x}{=u8:02x})",
+                        fp[2],
+                        fp[1],
+                        fp[0],
+                    );
+                } else {
+                    defmt::info!("link TX: key changed → Open (plaintext)");
+                }
+            }
+        }
 
         // Reconcile scan mode.  Single point where the chip transitions
         // between TX/heartbeat duty and channel-sweep duty.
@@ -1212,6 +1293,8 @@ pub async fn run_rx<Spi, Busy, Dio1, Reset, Switch, Led, Sink>(
     scan: Option<&ScanController>,
     shutdown: Option<&ShutdownSignal>,
     aead: Option<AeadContext>,
+    allow_open: bool,
+    aead_updates: Option<&'static AeadUpdateSignal>,
 ) -> !
 where
     Spi: SpiDevice,
@@ -1243,11 +1326,16 @@ where
     );
 
     let mut receiver = match aead {
-        Some(ctx) => LinkReceiver::with_aead(ctx),
+        Some(ctx) => LinkReceiver::with_aead(ctx, allow_open),
         None => LinkReceiver::no_crypto(),
     };
     let mut wd = WatchdogTimer::new(Duration::from_millis(current.watchdog_ms));
     let mut radio_buf = [0u8; RF_PAYLOAD_MAX as usize];
+    // Tracks the last `key_fp` we observed on a successfully-decoded
+    // packet so we log once on each Open↔AEAD transition rather than
+    // on every packet.  `None` = haven't heard anything yet; the
+    // first accepted packet always logs.
+    let mut last_logged_key_fp: Option<osrf_link::KeyFp> = None;
     let mut accepted: u32 = 0;
     let mut accepted_heartbeats: u32 = 0;
     let mut accepted_midi: u32 = 0;
@@ -1350,6 +1438,29 @@ where
         midi_events.clear();
         sysex_events.clear();
         debug_assert!(midi_events.is_empty() && sysex_events.is_empty());
+
+        // Apply any pending live AEAD update from the UI.  Same
+        // latest-wins try_take pattern as the TX side.  The receiver's
+        // `set_aead` resets the link-down flag so the next accepted
+        // packet drives a clean session reset under the new key.
+        if let Some(sig) = aead_updates {
+            if let Some(update) = sig.try_take() {
+                receiver.set_aead(update.aead, update.allow_open);
+                last_logged_key_fp = None;
+                match (update.aead.is_some(), update.allow_open) {
+                    (true, true) => defmt::info!(
+                        "link RX: key changed → auto (key + plaintext both accepted)",
+                    ),
+                    (true, false) => defmt::info!(
+                        "link RX: key changed → strict (specific key only, plaintext rejected)",
+                    ),
+                    (false, true) => defmt::info!("link RX: key changed → Open (plaintext only)"),
+                    (false, false) => defmt::info!(
+                        "link RX: key changed → refusing all (no key configured, plaintext rejected)",
+                    ),
+                }
+            }
+        }
 
         // Reconcile our local `scanning` flag against the controller's
         // public `enabled`.  This is the single point where we walk the
@@ -1629,6 +1740,26 @@ where
                     Ok(Ok(())) => {
                         accepted = accepted.wrapping_add(1);
                         let _ = led.toggle();
+                        // Log Open↔AEAD transitions exactly once per
+                        // crossover — quiet during steady state, but
+                        // gives a clear audit trail when the operator
+                        // flips the Key menu on the TX side.
+                        let observed = receiver.last_accepted_key_fp();
+                        if observed != last_logged_key_fp {
+                            match observed {
+                                None => {}
+                                Some(fp) if fp == osrf_link::KEY_FP_NONE => {
+                                    defmt::info!("link RX: accepting plaintext (key_fp=000000)",)
+                                }
+                                Some(fp) => defmt::info!(
+                                    "link RX: accepting AEAD key_fp={=u8:02x}{=u8:02x}{=u8:02x}",
+                                    fp[2],
+                                    fp[1],
+                                    fp[0],
+                                ),
+                            }
+                            last_logged_key_fp = observed;
+                        }
                     }
                     Ok(Err(reason)) => {
                         dropped = dropped.wrapping_add(1);

@@ -54,6 +54,8 @@ async fn main(_spawner: Spawner) {
         None,
         None,
         None, // AEAD off — production midi_node profile, no key wiring yet.
+        true, // allow_open is a no-op when aead is None; pass true for consistency.
+        None, // No UI on midi_node — no live AEAD update channel.
     )
     .await
 }

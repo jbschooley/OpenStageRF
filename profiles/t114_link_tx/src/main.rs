@@ -80,6 +80,7 @@ async fn main(_spawner: Spawner) {
         None,
         None,
         aead,
+        None, // No UI on the link bench — AEAD config is fixed at boot.
     )
     .await
 }

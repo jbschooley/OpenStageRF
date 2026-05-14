@@ -28,13 +28,16 @@ use embassy_executor::{InterruptExecutor, Spawner};
 use embassy_futures::select::{select3, Either3};
 use embassy_time::Timer;
 use osrf_app_link_bench::synthetic::ScenarioSource;
-use osrf_app_midi_node::{run_rx, run_tx, LinkConfig, UartMidiSink, UartMidiSource};
+use osrf_app_midi_node::{
+    run_rx, run_tx, AeadConfig, AeadUpdate, CipherId, Direction, LinkConfig, UartMidiSink,
+    UartMidiSource,
+};
 use osrf_app_ui_runtime as app;
 use osrf_board_t114 as board;
 use osrf_driver_input_joystick5way::Joystick5Way;
 use osrf_ui::{
-    BatteryChemistry, BatteryStatus, CipherId, KeyStore, PowerPolicy, Renderer, Role, Settings,
-    UiState, Widget, WidgetList,
+    BatteryChemistry, BatteryStatus, KeyStore, PowerPolicy, Renderer, Role, Settings, UiState,
+    Widget, WidgetList,
 };
 
 use board::embassy_nrf::gpio::{Input, Output, Pull};
@@ -56,6 +59,104 @@ const CHEMISTRY: BatteryChemistry = BatteryChemistry::LiPoSingle;
 /// tracks the host's USB power and auto-soft-offs ~10 s after USB
 /// is lost.
 const POWER_POLICY: PowerPolicy = PowerPolicy::Wired;
+
+// ── Stage 3: hardcoded AEAD test keys (paired-units testing) ──────
+//
+// Until Stage 4 BLE provisioning lands there's no out-of-band way to
+// transfer a key between paired units, so testing AEAD on the full
+// UI profile uses these compiled-in keys.  TX gets BOTH so the
+// operator can flip between them in the Key menu; RX gets only
+// `KEY_SHARED` — `KEY_TX_ONLY` is intentionally missing on RX so
+// you can demonstrate the rejection path by picking it on TX and
+// watching RX log `KeyFpMismatch`.
+//
+// Same bytes on both ends → same fingerprint → packets accepted.
+// Different bytes → `RxDrop::KeyFpMismatch` (or `AeadFail` if
+// fingerprints happen to collide).
+
+const KEY_SHARED: [u8; 32] = [0x42; 32];
+const KEY_SHARED_NAME: &str = "Shared";
+const KEY_TX_ONLY: [u8; 32] = [0x99; 32];
+const KEY_TX_ONLY_NAME: &str = "TX-Only";
+const TEST_CIPHER: CipherId = CipherId::ChaCha20Poly1305;
+/// Hardcoded device_id so paired units agree without exchanging
+/// FICR.DEVICEID values out-of-band.  Stage 4 / multi-device
+/// deployments will switch this to `board::device_id::device_id()`
+/// + an RX-side allowlist.
+const TEST_DEVICE_ID: u32 = 0x0000_0001;
+
+/// Build the AEAD context for a given hardcoded key.  Cipher,
+/// device_id and direction are profile-wide constants.
+fn ctx_for_key(key: [u8; 32]) -> AeadConfig {
+    AeadConfig {
+        cipher: TEST_CIPHER,
+        key,
+        device_id: TEST_DEVICE_ID,
+        direction: Direction::TxToRx,
+    }
+}
+
+fn fp_for_key(key: &[u8; 32]) -> u32 {
+    osrf_app_midi_node::osrf_crypto::fingerprint(TEST_CIPHER, key) & 0x00FF_FFFF
+}
+
+/// Resolver for the **TX** side: operator selects a key in the UI →
+/// link sender encrypts subsequent packets with it.  Picking Open
+/// drops to plaintext.  An unknown fingerprint (shouldn't happen
+/// since the keystore only contains the keys we know) falls back to
+/// plaintext as a safe default.
+fn tx_aead_resolver(active_fp: Option<u32>) -> AeadUpdate {
+    let shared_fp = fp_for_key(&KEY_SHARED);
+    let tx_only_fp = fp_for_key(&KEY_TX_ONLY);
+    let masked = active_fp.map(|fp| fp & 0x00FF_FFFF);
+    match masked {
+        None => AeadUpdate {
+            aead: None,
+            allow_open: true,
+        },
+        Some(fp) if fp == shared_fp => AeadUpdate {
+            aead: Some(ctx_for_key(KEY_SHARED)),
+            allow_open: false,
+        },
+        Some(fp) if fp == tx_only_fp => AeadUpdate {
+            aead: Some(ctx_for_key(KEY_TX_ONLY)),
+            allow_open: false,
+        },
+        Some(_) => AeadUpdate {
+            aead: None,
+            allow_open: true,
+        },
+    }
+}
+
+/// Resolver for the **RX** side.  RX only holds the `Shared` key
+/// material; that's the only fingerprint it can decrypt.
+///
+/// * Open / Auto (`active_fp = None`): permissive — accept the
+///   `Shared` key OR plaintext.  No filter.
+/// * Specific selection matching `Shared`: strict — accept that
+///   fingerprint only, reject plaintext.
+/// * Specific selection that doesn't match anything we hold:
+///   refuse everything (RX shouldn't actually let this state happen
+///   in the menu, but the resolver stays defensive).
+fn rx_aead_resolver(active_fp: Option<u32>) -> AeadUpdate {
+    let shared_fp = fp_for_key(&KEY_SHARED);
+    let masked = active_fp.map(|fp| fp & 0x00FF_FFFF);
+    match masked {
+        None => AeadUpdate {
+            aead: Some(ctx_for_key(KEY_SHARED)),
+            allow_open: true,
+        },
+        Some(fp) if fp == shared_fp => AeadUpdate {
+            aead: Some(ctx_for_key(KEY_SHARED)),
+            allow_open: false,
+        },
+        Some(_) => AeadUpdate {
+            aead: None,
+            allow_open: false,
+        },
+    }
+}
 
 /// Which `MidiSource` flavour the TX-role build drives the runtime
 /// with.  `Uart` reads real DIN MIDI from the FeatherWing UART
@@ -233,12 +334,44 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     let mut settings = Settings::default();
     app::load_settings(&mut flash, board::storage::SETTINGS_RANGE, &mut settings).await;
     let mut keys = KeyStore::new();
-    // Seed demo entries so the KeySelect screen shows something
-    // during bring-up.  These have no flash record yet — task #17
-    // (flash persistence) replaces this with a real load_from_flash
-    // call once the boot path wires sequential-storage::map.
-    let _ = keys.add("Studio A", CipherId::ChaCha20Poly1305, 0x111111);
-    let _ = keys.add("Backup", CipherId::ChaCha20Poly1305, 0x222222);
+    app::load_keys(&mut flash, board::storage::KEY_STORE_RANGE, &mut keys).await;
+
+    // Register the hardcoded test keys in the runtime keystore so
+    // the UI's Key list shows them as selectable entries.
+    //
+    // Per-role registration:
+    //   * TX gets BOTH keys (Shared + TX-Only) so the operator can
+    //     pick between them and exercise the cross-board rejection
+    //     case (TX-Only on the wire → RX logs KeyFpMismatch).
+    //   * RX gets only `Shared` — `TX-Only` isn't even shown there,
+    //     matching the actual material RX holds.
+    let shared_fp = fp_for_key(&KEY_SHARED);
+    if keys.find(shared_fp).is_none() {
+        let _ = keys.add(KEY_SHARED_NAME, TEST_CIPHER, shared_fp);
+    }
+    if matches!(role, Role::Tx) {
+        let tx_only_fp = fp_for_key(&KEY_TX_ONLY);
+        if keys.find(tx_only_fp).is_none() {
+            let _ = keys.add(KEY_TX_ONLY_NAME, TEST_CIPHER, tx_only_fp);
+        }
+    }
+
+    // Pick the per-role resolver + compute the boot-time AEAD config
+    // from the persisted `active_key_fp`.  Subsequent operator key
+    // changes are applied live by `ui_state_loop` → `AEAD_UPDATES`
+    // → the runtime's top-of-loop `try_take`; no reboot needed.
+    let aead_resolver: fn(Option<u32>) -> AeadUpdate = match role {
+        Role::Tx => tx_aead_resolver,
+        Role::Rx => rx_aead_resolver,
+    };
+    let initial_update = aead_resolver(settings.active_key_fp);
+    let initial_aead = initial_update.aead;
+    let initial_allow_open = initial_update.allow_open;
+    defmt::info!(
+        "t114_ui: boot AEAD aead={=bool} allow_open={=bool}",
+        initial_aead.is_some(),
+        initial_allow_open,
+    );
     let mut widgets: WidgetList = WidgetList::new();
     let mut renderer = Renderer::new();
 
@@ -317,7 +450,15 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
         Role::Rx => {
             let sink = UartMidiSink::new(r.midi_uart);
             spawner_link.spawn(
-                link_rx_task(r.radio0, r.status_led, sink, config).expect("alloc link_rx_task"),
+                link_rx_task(
+                    r.radio0,
+                    r.status_led,
+                    sink,
+                    config,
+                    initial_aead,
+                    initial_allow_open,
+                )
+                .expect("alloc link_rx_task"),
             );
         }
         Role::Tx => {
@@ -326,15 +467,28 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
                 TxSource::Uart => {
                     let source = UartMidiSource::new(r.midi_uart);
                     spawner_link.spawn(
-                        link_tx_uart_task(r.radio0, r.status_led, source, boot_counter, config)
-                            .expect("alloc link_tx_uart_task"),
+                        link_tx_uart_task(
+                            r.radio0,
+                            r.status_led,
+                            source,
+                            boot_counter,
+                            config,
+                            initial_aead,
+                        )
+                        .expect("alloc link_tx_uart_task"),
                     );
                 }
                 TxSource::Scenario => {
                     defmt::info!("ui_bench_tx: synthetic scenario source running");
                     spawner_link.spawn(
-                        link_tx_scenario_task(r.radio0, r.status_led, boot_counter, config)
-                            .expect("alloc link_tx_scenario_task"),
+                        link_tx_scenario_task(
+                            r.radio0,
+                            r.status_led,
+                            boot_counter,
+                            config,
+                            initial_aead,
+                        )
+                        .expect("alloc link_tx_scenario_task"),
                     );
                 }
             }
@@ -364,6 +518,7 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
         board::storage::PANIC_RING_RANGE,
         vbus_present_fn,
         board::power::enter_system_off,
+        aead_resolver,
     )
     .await
 }
@@ -416,6 +571,8 @@ async fn link_rx_task(
     mut status_led: Output<'static>,
     mut sink: UartMidiSink<board::MidiUart>,
     config: LinkConfig,
+    aead: Option<AeadConfig>,
+    allow_open: bool,
 ) -> ! {
     run_rx(
         &mut radio0,
@@ -426,7 +583,9 @@ async fn link_rx_task(
         Some(&app::CONFIG_UPDATES),
         Some(&app::SCAN),
         Some(&app::SHUTDOWN),
-        None, // AEAD off — full UI profile, key plumbing lands with task #17/#18.
+        aead,
+        allow_open,
+        Some(&app::AEAD_UPDATES),
     )
     .await
 }
@@ -438,6 +597,7 @@ async fn link_tx_uart_task(
     mut source: UartMidiSource<board::MidiUart>,
     boot_counter: u16,
     config: LinkConfig,
+    aead: Option<AeadConfig>,
 ) -> ! {
     run_tx(
         &mut radio0,
@@ -449,7 +609,8 @@ async fn link_tx_uart_task(
         Some(&app::CONFIG_UPDATES),
         Some(&app::SCAN),
         Some(&app::SHUTDOWN),
-        None, // AEAD off — see link_rx_task.
+        aead,
+        Some(&app::AEAD_UPDATES),
     )
     .await
 }
@@ -460,6 +621,7 @@ async fn link_tx_scenario_task(
     mut status_led: Output<'static>,
     boot_counter: u16,
     config: LinkConfig,
+    aead: Option<AeadConfig>,
 ) -> ! {
     let mut source = ScenarioSource::new();
     run_tx(
@@ -472,7 +634,8 @@ async fn link_tx_scenario_task(
         Some(&app::CONFIG_UPDATES),
         Some(&app::SCAN),
         Some(&app::SHUTDOWN),
-        None, // AEAD off — see link_rx_task.
+        aead,
+        Some(&app::AEAD_UPDATES),
     )
     .await
 }

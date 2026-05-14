@@ -50,13 +50,14 @@ use embassy_time::{Duration, Instant, Timer};
 use osrf_app_midi_node::LinkConfig;
 use osrf_driver_input_joystick5way::JoystickEvent;
 use osrf_link_runtime::{
-    LinkConfigSignal, LinkStats, LinkStatsCell, ScanController, ShutdownSignal,
+    AeadUpdate, AeadUpdateSignal, LinkConfigSignal, LinkStats, LinkStatsCell, ScanController,
+    ShutdownSignal,
 };
 use osrf_ui::{
     band_plan_channel, band_plan_index, build_screen, max_channel_index, AboutData, BandPlan,
-    BatteryChemistry, BatteryStatus, Command, KeyStore, LinkStatus, PowerPolicy, ScanState,
-    ScreenId, Settings, UiState, Widget, WidgetList, BAND_PLANS, MAX_SCAN_CHANNELS,
-    WIRED_USB_LOSS_GRACE_SECS,
+    BatteryChemistry, BatteryStatus, Command, KeyRecord, KeyStore, LinkStatus, PowerPolicy,
+    ScanState, ScreenId, Settings, UiState, Widget, WidgetList, BAND_PLANS, KEY_RECORD_BYTES,
+    MAX_KEY_NAME, MAX_SCAN_CHANNELS, WIRED_USB_LOSS_GRACE_SECS,
 };
 use sequential_storage::cache::NoCache;
 use sequential_storage::map;
@@ -83,6 +84,14 @@ pub static STATS: LinkStatsCell = LinkStatsCell::new();
 /// for RX).  Latest-wins, so two rapid changes collapse to the most
 /// recent.
 pub static CONFIG_UPDATES: LinkConfigSignal = LinkConfigSignal::new();
+
+/// Live AEAD-update channel from ui_state → link runtime.  Fires on
+/// `Command::ApplySetActiveKey`: the profile's `aead_resolver`
+/// translates the new `active_key_fp` (or `None`) into the right
+/// pair of `(Option<AeadContext>, allow_open)` for both TX and RX
+/// sides, and ui_state publishes it here.  The runtime picks up the
+/// update at the top of its next loop iteration (latest-wins).
+pub static AEAD_UPDATES: AeadUpdateSignal = AeadUpdateSignal::new();
 
 /// Channel-scan handoff between ui_state and link runtime.  When
 /// the user enters the Scan screen, ui_state calls `start()` with
@@ -224,7 +233,7 @@ const WIRED_GRACE: Duration = Duration::from_secs(WIRED_USB_LOSS_GRACE_SECS);
 ///   - Poll [`POWEROFF_REASON`] for deep-soft-off triggers and
 ///     dispatch into [`enter_soft_off`].
 ///   - In [`PowerPolicy::Wired`] mode, run the VBUS-loss grace timer.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // Top-level state-machine driver; HAL handles + ranges + hooks are all inherent.
 pub async fn ui_state_loop<BL, F, W>(
     backlight: &mut BL,
     flash: &mut F,
@@ -243,6 +252,11 @@ pub async fn ui_state_loop<BL, F, W>(
     panic_ring_range: Range<u32>,
     vbus_present: fn() -> bool,
     system_off: fn() -> !,
+    // `aead_resolver` maps the operator-selected `active_key_fp` (in
+    // `Settings`) to the `AeadUpdate` both the TX-side encrypt path
+    // and the RX-side decrypt path will use.  Implemented per-profile
+    // per-role — see the t114_ui profile for the canonical example.
+    aead_resolver: fn(Option<u32>) -> AeadUpdate,
 ) -> !
 where
     BL: embedded_hal::digital::OutputPin,
@@ -337,8 +351,16 @@ where
                             save_tx_power(flash, settings_range.clone(), dbm).await;
                         }
                         Command::ApplySetActiveKey(fp) => {
-                            // No live-config update (AEAD not wired into
-                            // LinkConfig yet); persist for next boot.
+                            // Resolve the operator's selection into a
+                            // concrete TX-encrypt / RX-decrypt
+                            // configuration, push it to the link
+                            // runtime, and persist the choice so the
+                            // next boot picks up where we left off.
+                            // Both ends of the link see the same
+                            // signal — `run_tx` uses `aead`, `run_rx`
+                            // uses `aead + allow_open`.
+                            let update = aead_resolver(fp);
+                            AEAD_UPDATES.signal(update);
                             save_active_key(flash, settings_range.clone(), fp).await;
                         }
                         Command::PowerOff => {
@@ -947,6 +969,136 @@ where
         "soft_off_intent",
     )
     .await;
+}
+
+/// Scratch buffer size for [`load_keys`] / [`save_key`] /
+/// [`remove_key`].  Holds one [`KEY_RECORD_BYTES`]-byte value plus
+/// the `u32` key plus the sequential-storage map framing (length
+/// prefix + CRC).  128 has comfortable headroom over the ~70-byte
+/// minimum and matches the next nor-flash word-size multiple.
+const KEY_STORE_BUF_LEN: usize = 128;
+
+/// Populate `keys` from the flash key store.  Iterates every map item
+/// in `range` and inserts records that round-trip cleanly back to a
+/// [`KeyEntry`].  Corrupt / pre-Stage-3 records (`to_entry()` returns
+/// `None`) are skipped — safer to ignore a single bad record than to
+/// fail the whole boot.
+///
+/// `range` is the board crate's `KEY_STORE_RANGE`.  See
+/// `boards/t114/src/storage.rs` for the layout.
+pub async fn load_keys<F>(flash: &mut F, range: Range<u32>, keys: &mut KeyStore)
+where
+    F: embedded_storage_async::nor_flash::MultiwriteNorFlash,
+{
+    let mut buf = [0u8; KEY_STORE_BUF_LEN];
+    let mut cache = NoCache::new();
+    let mut iter = match map::fetch_all_items::<u32, _, _>(flash, range, &mut cache, &mut buf).await
+    {
+        Ok(it) => it,
+        Err(e) => {
+            defmt::warn!(
+                "persist: fetch_all keys failed: {:?}",
+                defmt::Debug2Format(&e)
+            );
+            return;
+        }
+    };
+
+    let mut loaded: u32 = 0;
+    let mut skipped: u32 = 0;
+    let mut iter_buf = [0u8; KEY_STORE_BUF_LEN];
+    loop {
+        match iter.next::<[u8; KEY_RECORD_BYTES]>(&mut iter_buf).await {
+            Ok(Some((fp, bytes))) => {
+                let record = KeyRecord::from_bytes(&bytes);
+                // Cross-check: the map's key (fp) must agree with the
+                // fingerprint stored inside the value.  Diverging values
+                // mean either bit-rot or a layout drift; skip rather
+                // than trust either side.
+                if (record.fingerprint & 0x00FF_FFFF) != (fp & 0x00FF_FFFF) {
+                    defmt::warn!(
+                        "persist: key fp mismatch (map={:x} record={:x}); skipping",
+                        fp,
+                        record.fingerprint,
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                let Some(entry) = record.to_entry() else {
+                    defmt::warn!("persist: key record fp={:x} failed to decode; skipping", fp);
+                    skipped += 1;
+                    continue;
+                };
+                let mut tmp_name = heapless::String::<MAX_KEY_NAME>::new();
+                let _ = tmp_name.push_str(&entry.name);
+                if keys
+                    .add(&tmp_name, entry.cipher, entry.fingerprint)
+                    .is_err()
+                {
+                    defmt::warn!(
+                        "persist: key fp={:x} rejected by KeyStore (full or duplicate); skipping",
+                        entry.fingerprint,
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                loaded += 1;
+            }
+            Ok(None) => break,
+            Err(e) => {
+                defmt::warn!("persist: key iter failed: {:?}", defmt::Debug2Format(&e));
+                break;
+            }
+        }
+    }
+    defmt::info!("persist: loaded {} key(s), skipped {}", loaded, skipped);
+}
+
+/// Write one key record to flash.  Idempotent — overwrites any
+/// prior record with the same fingerprint (typical use: rename or
+/// rotate material under the same fingerprint, though renaming will
+/// typically pair with a new fingerprint since `fingerprint` is a
+/// hash of `(cipher_id, material)`).
+pub async fn save_key<F>(flash: &mut F, range: Range<u32>, record: &KeyRecord)
+where
+    F: embedded_storage_async::nor_flash::MultiwriteNorFlash,
+{
+    let mut buf = [0u8; KEY_STORE_BUF_LEN];
+    let mut cache = NoCache::new();
+    let fp = record.fingerprint & 0x00FF_FFFF;
+    let bytes = record.to_bytes();
+    if let Err(e) = map::store_item::<u32, [u8; KEY_RECORD_BYTES], _>(
+        flash, range, &mut cache, &mut buf, &fp, &bytes,
+    )
+    .await
+    {
+        defmt::warn!(
+            "persist: save key fp={:x} failed: {:?}",
+            fp,
+            defmt::Debug2Format(&e)
+        );
+    } else {
+        defmt::info!("persist: saved key fp={:x}", fp);
+    }
+}
+
+/// Remove a key record by fingerprint.  No-op if no record matches.
+pub async fn remove_key<F>(flash: &mut F, range: Range<u32>, fingerprint: u32)
+where
+    F: embedded_storage_async::nor_flash::MultiwriteNorFlash,
+{
+    let mut buf = [0u8; KEY_STORE_BUF_LEN];
+    let mut cache = NoCache::new();
+    let fp = fingerprint & 0x00FF_FFFF;
+    if let Err(e) = map::remove_item::<u32, _>(flash, range, &mut cache, &mut buf, &fp).await {
+        defmt::warn!(
+            "persist: remove key fp={:x} failed: {:?}",
+            fp,
+            defmt::Debug2Format(&e)
+        );
+    } else {
+        defmt::info!("persist: removed key fp={:x}", fp);
+    }
 }
 
 /// Read the persisted soft-off intent flag.  Returns `false` on

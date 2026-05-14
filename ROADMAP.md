@@ -40,6 +40,13 @@ T114 also unlocks experimentation with hardware AES-CCM (native to the nRF CCM p
 ### Stage 3 — encryption + authentication
 Add AEAD with a sequence-number nonce. Default cipher: ChaCha20-Poly1305 (works on every chip; F103 has no crypto hardware). On targets with AES acceleration (nRF52/53 CCM peripheral, others), AES-128-CCM is selectable and faster. Replay protection comes from the AEAD nonce; tamper detection from the auth tag. RustCrypto crates (`chacha20poly1305`, `ccm`) are well-audited and `no_std` compatible. See *Encryption* and *Key distribution* in the README.
 
+**Status (2026-05): on-air complete on T114.** `osrf-crypto` ships both ciphers behind a unified `CipherId` dispatch; `LinkSender::with_aead` / `LinkReceiver::with_aead` plug into the link layer with the auth tag appended after the body; nonce derivation matches the PLAN.md scheme (`[device_id:4][direction:1][session_seq:4][boot_counter:2]` with zero-padding for AES-CCM's 13-byte nonce); flash key-store persistence is wired (`apps/ui_runtime::{load_keys, save_key, remove_key}` over `sequential-storage::map` at the 8 KB `KEY_STORE_RANGE`).  Hardware verification: paired `t114_link_tx` / `t114_link_rx` profiles ran 6913 MIDI events under ChaCha20-Poly1305 with 0 missed notes, 0 AEAD failures, 11 background CRC errors across 27,524 packets (0.04%).
+
+**Deferred to Stage 4:**
+- Hardware AES via SoftDevice SVCs.  Software AES-CCM is fast enough for the per-packet body sizes we use; the CCM peripheral is BLE-reserved while the SoftDevice is enabled anyway.
+- DX-LR30 AEAD (no RNG peripheral on STM32F103; needs a fallback-entropy decision).
+- On-device key generation UI.  Until Stage 4 BLE lands there's no out-of-band way to share a freshly-generated key with the peer, so the menu item stays hidden — keys for testing live in `apps/link_bench::test_aead_chacha()` (a `[0x42; 32]` stub) or get hardcoded per-profile.
+
 **AES-256 roadmap note:** AES-256-CCM is planned as a future selectable cipher (`cipher_id = AES_256_CCM`). It is hardware-accelerated on nRF5340 (CryptoCell CC312 supports AES-256) and will be a software fallback via RustCrypto on all other targets (including nRF52840, whose hardware CCM peripheral is 128-bit only). AES-256 adds no wire-format changes — it slots in as another `cipher_id` value in the local key entry. Deferred until Stage 4 (nRF5340 hardware) so the hardware path is tested first; software path can land earlier if there is demand.
 
 ### Stage 4 — v2 custom MIDI board (nRF5340 + 2× SX1262)
