@@ -751,11 +751,28 @@ background CRC errors (0.04% — RF noise floor).  Sub-millisecond timing
 jitter against synthetic scenario schedules.
 
 **Deferred to Stage 4:**
-- Hardware AES via the nRF52840 CCM peripheral or SoftDevice
-  `sd_ecb_block_encrypt` SVCs.  Software is fast enough for current bodies;
-  the CCM peripheral is BLE-reserved while the SoftDevice is enabled.
-- DX-LR30 AEAD.  STM32F103 has no RNG; needs a fallback-entropy decision
-  before this can ship.
+- Hardware AES.  The `osrf-crypto` crate ships an `aes-hw-sd` feature
+  with the SoftDevice-backed `sd_ecb_block_encrypt` plumbing (see
+  `crypto/src/aes_hw.rs`), but it's **not enabled on any shipping
+  profile** — the link runtime task runs on the interrupt executor
+  at priority P2, and SD's SVCall handler is at priority 4, so SVCs
+  from the link path HardFault.  Software AES is invisible in
+  practice (~100 µs per packet, comfortably under the MIDI cadence
+  budget).  Three plausible paths to enable it later: lower the
+  link-runtime priority (loses radio-IRQ preemption), defer AES
+  calls to thread mode via a channel (latency cost per packet), or
+  wait for Stage 4 hardware with a different SD priority story.
+  The CCM peripheral is BLE-reserved while the SoftDevice is enabled
+  so direct access isn't an option either.
+- Multi-key keyring on RX.  Today's `LinkReceiver` holds one
+  `AeadContext` at a time; "Auto" mode on a multi-cipher build can't
+  decrypt both ChaCha *and* AES packets simultaneously.  Operator
+  workaround: pick the same cipher on both ends.  Proper fix is a
+  small refactor of the receiver to hold `Vec<AeadContext, N>` and
+  look up by `key_fp`; a half-day's work whenever it becomes a real
+  ergonomic block.
+- DX-LR30 AEAD.  STM32F103 has no RNG; needs a fallback-entropy
+  decision before this can ship.
 - On-device key-generation / -import UI.  Without BLE there's no
   out-of-band channel to share a freshly-generated key with the peer,
   so the menu item stays hidden.  Keys for testing live in
