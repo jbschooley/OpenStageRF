@@ -1044,11 +1044,22 @@ where
             match source.try_next(&mut midi_buf) {
                 Ok(Some(n)) => {
                     let msg = &midi_buf[..n];
-                    if queue.push_channel_voice(msg, now) {
-                        // Track the note-count change so the next
-                        // heartbeat carries an accurate active mask.
-                        tx_state.observe(msg);
-                    } else {
+                    // Always reflect the operator's intent in
+                    // `tx_state` — even when the queue refuses the
+                    // event.  If we skip the observe on overflow,
+                    // `tx_state` keeps a NoteOff'd key marked as
+                    // pressed, the heartbeat mask lies, and RX's
+                    // divergence-based stuck-note recovery never
+                    // fires — note rings until the next watchdog
+                    // wipes everything via all-notes-off.  Observing
+                    // unconditionally means `tx_state` agrees with
+                    // the controller; RX recovery now does its job
+                    // for queue-dropped NoteOffs in ~20 ms instead of
+                    // hanging the note out for the full watchdog
+                    // window.  No new wire traffic on the happy
+                    // path; same code path on the overflow path.
+                    tx_state.observe(msg);
+                    if !queue.push_channel_voice(msg, now) {
                         overflow_count = overflow_count.wrapping_add(1);
                         defmt::error!(
                             "link TX: queue overflow! dropping (overflows={})",
