@@ -22,5 +22,5 @@ unsafe fn pre_init() {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     // `tx_source` is meaningless for Rx; pass any value.
-    run(spawner, Role::Rx, TxSource::Uart).await;
+    run(spawner, Role::Rx, TxSource::Uart, false).await;
 }

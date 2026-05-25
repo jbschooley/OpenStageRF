@@ -114,9 +114,10 @@ pub fn rand_bytes(buf: &mut [u8]) -> u32 {
 /// drivers (Spim, BufferedUarte) leave their IRQ priorities at the
 /// chip default (P0, SD-reserved).
 fn lower_app_interrupt_priorities() {
-    interrupt::TWISPI0.set_priority(Priority::P2); // SX1262 radio SPIM
+    interrupt::TWISPI0.set_priority(Priority::P2); // SX1262 radio0 SPIM
     interrupt::TWISPI1.set_priority(Priority::P2); // bound but unused; harmless
     interrupt::SPI2.set_priority(Priority::P2); // ST7789 display SPIM
+    interrupt::SPIM3.set_priority(Priority::P2); // SX1262 radio1 (diversity) SPIM
     interrupt::UARTE1.set_priority(Priority::P2); // DIN MIDI UART
     interrupt::SAADC.set_priority(Priority::P2); // Battery ADC
 }
