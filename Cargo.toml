@@ -46,6 +46,7 @@ members = [
     "profiles/t114_ui_bench_tx",
     "profiles/t114_ui_demo",
     "profiles/t114_ui_rx",
+    "profiles/t114_ui_rx_diversity",
     "profiles/t114_ui_tx",
     "protocols/midi_packet_v1",
     "xtask",
@@ -127,6 +128,7 @@ osrf-profile-t114-ui              = { path = "profiles/t114_ui" }
 osrf-profile-t114-ui-bench-tx     = { path = "profiles/t114_ui_bench_tx" }
 osrf-profile-t114-ui-demo         = { path = "profiles/t114_ui_demo" }
 osrf-profile-t114-ui-rx           = { path = "profiles/t114_ui_rx" }
+osrf-profile-t114-ui-rx-diversity = { path = "profiles/t114_ui_rx_diversity" }
 osrf-profile-t114-ui-tx           = { path = "profiles/t114_ui_tx" }
 defmt                             = "1.0"
 embedded-hal                      = "1.0"

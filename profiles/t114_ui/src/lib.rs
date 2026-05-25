@@ -29,8 +29,8 @@ use embassy_futures::select::{select3, Either3};
 use embassy_time::Timer;
 use osrf_app_link_bench::synthetic::ScenarioSource;
 use osrf_app_midi_node::{
-    run_rx, run_tx, AeadConfig, AeadUpdate, CipherId, Direction, LinkConfig, UartMidiSink,
-    UartMidiSource,
+    run_rx, run_rx_diversity, run_rx_secondary, run_tx, AeadConfig, AeadUpdate, CipherId, Direction,
+    DiversityRxChannel, LinkConfig, LinkConfigSignal, UartMidiSink, UartMidiSource,
 };
 use osrf_app_ui_runtime as app;
 use osrf_board_t114 as board;
@@ -181,6 +181,14 @@ static mut FRAMEBUFFER: Framebuffer = Framebuffer::new();
 /// IRQ → packet handling preempts UI rendering on the main task.
 static EXECUTOR_LINK: InterruptExecutor = InterruptExecutor::new();
 
+/// Diversity handoff (RX builds only): the secondary radio's drain task
+/// (`link_rx_secondary_task`) pushes frames here; the consumer
+/// (`link_rx_diversity_task`) reads them. Unused on single-radio builds.
+static RADIO1_CH: DiversityRxChannel = DiversityRxChannel::new();
+/// Live `LinkConfig` forward from the consumer loop to the secondary radio's
+/// task, so a UI channel change retunes both radios.
+static SECONDARY_CFG: LinkConfigSignal = LinkConfigSignal::new();
+
 #[cortex_m_rt::interrupt]
 #[allow(non_snake_case)]
 unsafe fn EGU0_SWI0() {
@@ -234,7 +242,12 @@ const WDT_TIMEOUT_TICKS: u32 = 5 * 32_768;
 /// Bring up the board, dispatch the wake path, spawn all tasks,
 /// run the UI state machine forever.  Called from each binary's
 /// `#[embassy_executor::main]`.
-pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
+/// `diversity` (RX only): when `true` and `role == Role::Rx`, bring up the
+/// second SX1262 (radio1, on SPI3) and run the receiver with dual-radio
+/// receive diversity via `run_rx_diversity`.  Ignored for `Role::Tx`
+/// (single-radio TX).  Single-radio builds pass `false` and never claim
+/// SPI3 / the radio1 header pins.
+pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource, diversity: bool) -> ! {
     // Clear DEMCR — see `t114_dap_idle_freeze.md` memory note.
     // Without this, transient HardFaults halt the core forever
     // post-`cargo run` once the probe is detached.
@@ -252,7 +265,17 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
 
     // embassy_nrf::init (inside board::resources) must precede SD
     // enable — SD claims CLOCK + POWER on activation.
-    let r = board::resources();
+    //
+    // Diversity (RX only) additionally constructs radio1 on SPI3.  Gated
+    // on `role == Rx` so a TX build never claims the second radio's
+    // peripheral/pins.  `radio1` is threaded to the Rx spawn below.
+    let want_diversity = diversity && matches!(role, Role::Rx);
+    let (r, radio1) = if want_diversity {
+        let (r, r1) = board::resources_with_diversity();
+        (r, Some(r1))
+    } else {
+        (board::resources(), None)
+    };
 
     // Identify the RAM-side wake signal before SD enable — direct
     // register reads, SD-safe, and keeps Center-press race latency
@@ -449,17 +472,41 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource) -> ! {
     match role {
         Role::Rx => {
             let sink = UartMidiSink::new(r.midi_uart);
-            spawner_link.spawn(
-                link_rx_task(
-                    r.radio0,
-                    r.status_led,
-                    sink,
-                    config,
-                    initial_aead,
-                    initial_allow_open,
-                )
-                .expect("alloc link_rx_task"),
-            );
+            match radio1 {
+                Some(radio1) => {
+                    defmt::info!("ui: RX receive-diversity ON (radio0 + radio1 on SPI3)");
+                    // Producer: radio1 drains into RADIO1_CH on its own task.
+                    spawner_link.spawn(
+                        link_rx_secondary_task(radio1, config)
+                            .expect("alloc link_rx_secondary_task"),
+                    );
+                    // Consumer: radio0 + the shared decode/stats loop.
+                    spawner_link.spawn(
+                        link_rx_diversity_task(
+                            r.radio0,
+                            r.status_led,
+                            sink,
+                            config,
+                            initial_aead,
+                            initial_allow_open,
+                        )
+                        .expect("alloc link_rx_diversity_task"),
+                    );
+                }
+                None => {
+                    spawner_link.spawn(
+                        link_rx_task(
+                            r.radio0,
+                            r.status_led,
+                            sink,
+                            config,
+                            initial_aead,
+                            initial_allow_open,
+                        )
+                        .expect("alloc link_rx_task"),
+                    );
+                }
+            }
         }
         Role::Tx => {
             let boot_counter = session_id;
@@ -588,6 +635,47 @@ async fn link_rx_task(
         Some(&app::AEAD_UPDATES),
     )
     .await
+}
+
+/// Receive-diversity **consumer** (on-board radio0): runs its own receive
+/// plus the shared decode/dedup/stats, consuming the secondary radio's
+/// frames from `RADIO1_CH`.  Same UI-signal wiring as the single-radio task;
+/// a live channel change is forwarded to the secondary via `SECONDARY_CFG`.
+/// Paired with [`link_rx_secondary_task`].
+#[embassy_executor::task]
+async fn link_rx_diversity_task(
+    mut radio0: board::Radio0,
+    mut status_led: Output<'static>,
+    mut sink: UartMidiSink<board::MidiUart>,
+    config: LinkConfig,
+    aead: Option<AeadConfig>,
+    allow_open: bool,
+) -> ! {
+    run_rx_diversity(
+        &mut radio0,
+        RADIO1_CH.receiver(),
+        &SECONDARY_CFG,
+        &mut status_led,
+        &mut sink,
+        &config,
+        &app::STATS,
+        Some(&app::CONFIG_UPDATES),
+        Some(&app::SCAN),
+        Some(&app::SHUTDOWN),
+        aead,
+        allow_open,
+        Some(&app::AEAD_UPDATES),
+    )
+    .await
+}
+
+/// Receive-diversity **producer** (SPI3 radio1, DX-LR30): drains its radio
+/// into `RADIO1_CH`. Lives in its own task so its `rx_recv` is never
+/// cancelled → DIO1 IRQ always cleared → no GPIOTE-PORT spurious-wake storm.
+/// Retunes when the consumer forwards a config change via `SECONDARY_CFG`.
+#[embassy_executor::task]
+async fn link_rx_secondary_task(mut radio1: board::Radio1, config: LinkConfig) -> ! {
+    run_rx_secondary(&mut radio1, &config, Some(&SECONDARY_CFG), RADIO1_CH.sender()).await
 }
 
 #[embassy_executor::task]

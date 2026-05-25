@@ -25,6 +25,7 @@
 
 use embassy_futures::select::{select, select5, Either, Either5};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::{Channel, Receiver, Sender};
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer};
 use embedded_hal::digital::StatefulOutputPin;
@@ -39,7 +40,7 @@ use osrf_link::{
 // depending on `osrf-link` directly.
 pub use osrf_link::{osrf_crypto, AeadContext as AeadConfig, CipherId, Direction};
 use osrf_radio_sx126x::{
-    Error as RadioErrorKind, GfskBandwidth, GfskPulseShape, RadioError, RfSwitchControl,
+    Error as RadioErrorKind, GfskBandwidth, GfskPulseShape, RadioError, RfSwitchControl, RxPacket,
     Sx1262Radio,
 };
 
@@ -49,6 +50,37 @@ use osrf_radio_sx126x::{
 /// wire / radio buffers.  The runtime payload length is set by
 /// [`LinkConfig::payload_max`] and MUST be ≤ this.
 pub const RF_PAYLOAD_MAX: u8 = 64;
+
+/// Depth of the diversity-radio handoff channel.  A handful of slots
+/// absorbs the consumer being briefly busy (sink writes, stuck-note
+/// recovery) without the producer ever blocking — the producer uses
+/// `try_send` and drops on full, so a backed-up channel never stalls the
+/// secondary radio's drain loop (which is what must keep running to avoid
+/// a stuck DIO1 IRQ).
+const DIVERSITY_CH_DEPTH: usize = 4;
+
+/// One received frame handed from the secondary (diversity) radio's drain
+/// task to the primary receive loop.  Owns its bytes (fixed array, no
+/// borrow) so it can live in the channel independent of the radio buffer.
+#[derive(Clone)]
+pub struct DiversityRxFrame {
+    /// Raw wire bytes, valid for `len`.
+    pub buf: [u8; RF_PAYLOAD_MAX as usize],
+    pub len: usize,
+    pub rssi_dbm: i16,
+}
+
+/// Channel carrying [`DiversityRxFrame`]s from [`run_rx_secondary`] (the
+/// diversity radio's drain task) to [`run_rx_diversity`] (the primary
+/// receive loop).  A profile declares one as a `static` and hands a
+/// `.receiver()` to the consumer and a `.sender()` to the producer.
+pub type DiversityRxChannel = Channel<CriticalSectionRawMutex, DiversityRxFrame, DIVERSITY_CH_DEPTH>;
+/// Receiver half of [`DiversityRxChannel`] (consumed by the primary loop).
+pub type DiversityRxReceiver =
+    Receiver<'static, CriticalSectionRawMutex, DiversityRxFrame, DIVERSITY_CH_DEPTH>;
+/// Sender half of [`DiversityRxChannel`] (used by the secondary drain task).
+pub type DiversityRxSender =
+    Sender<'static, CriticalSectionRawMutex, DiversityRxFrame, DIVERSITY_CH_DEPTH>;
 
 /// All link-runtime tunables in one struct.  RF parameters (frequency,
 /// modulation, sync word, TX power) and link-layer timing
@@ -1281,6 +1313,91 @@ async fn apply_rx_reconfig<Spi, Busy, Dio1, Reset, Switch>(
     );
 }
 
+/// Drain loop for the **secondary (diversity) radio**, run as its own task.
+///
+/// This is the heart of the storm-free diversity design: the secondary
+/// radio's `rx_recv` runs to completion in a dedicated task and is **never
+/// cancelled** during steady-state, so its DIO1 IRQ is always cleared.
+/// (The earlier race-and-cancel design left the loser radio's level-
+/// sensitive DIO1 stuck high, which storms embassy-nrf's shared GPIOTE PORT
+/// interrupt and wrecks the primary's reception — exactly the 50%-loss +
+/// `unexpected IRQ 0x0000` failure.)
+///
+/// Each crc-ok packet is pushed to the primary loop via `tx.try_send`
+/// (dropping on a full channel rather than blocking — the drain must keep
+/// running no matter what the consumer is doing).  The primary's
+/// `LinkReceiver` replay window dedups the copies the primary also caught.
+///
+/// `cfg_updates` is a signal the **primary** forwards live `LinkConfig`
+/// changes through, so the secondary retunes to the same channel.  The only
+/// `rx_recv` cancellation happens on such a change, and it's immediately
+/// followed by `configure_radio` (a full reset), which clears any
+/// transiently-stuck state — so no sustained storm.
+pub async fn run_rx_secondary<Spi, Busy, Dio1, Reset, Switch>(
+    radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
+    config: &LinkConfig,
+    cfg_updates: Option<&'static LinkConfigSignal>,
+    tx: DiversityRxSender,
+) -> !
+where
+    Spi: SpiDevice,
+    Busy: Wait,
+    Dio1: Wait,
+    Reset: embedded_hal::digital::OutputPin,
+    Switch: RfSwitchControl,
+{
+    if configure_radio(radio, config).await.is_err() || radio.rx_start().await.is_err() {
+        defmt::error!("diversity RX (secondary): init failed; this radio will not contribute");
+        loop {
+            Timer::after_millis(1000).await;
+        }
+    }
+    // SPI presence probe — same honesty as the primary's init.
+    match radio.verify_present().await {
+        Ok(true) => defmt::info!("diversity RX (secondary): present + in RX"),
+        Ok(false) => {
+            defmt::error!("diversity RX (secondary): NOT responding on SPI — check wiring/power")
+        }
+        Err(_) => defmt::error!("diversity RX (secondary): SPI error during presence check"),
+    }
+    let mut buf = [0u8; RF_PAYLOAD_MAX as usize];
+    loop {
+        let cfg_wait = async {
+            match cfg_updates {
+                Some(s) => s.wait().await,
+                None => core::future::pending::<LinkConfig>().await,
+            }
+        };
+        match select(radio.rx_recv(&mut buf), cfg_wait).await {
+            Either::First(Ok(pkt)) if pkt.crc_ok => {
+                let len = pkt.len.min(buf.len());
+                let mut frame = DiversityRxFrame {
+                    buf: [0u8; RF_PAYLOAD_MAX as usize],
+                    len,
+                    rssi_dbm: pkt.rssi_dbm,
+                };
+                frame.buf[..len].copy_from_slice(&buf[..len]);
+                // Drop on full — never block the drain loop (a blocked drain
+                // would stop servicing DIO1 → stuck IRQ → the storm we're
+                // avoiding).  A dropped diversity copy is harmless: the
+                // primary likely caught it too, or it's one missed packet.
+                let _ = tx.try_send(frame);
+            }
+            // crc-fail / radio error: rx_recv completed (IRQ cleared); just
+            // re-arm on the next loop.  Not forwarded — the primary counts
+            // its own crc/error stats.
+            Either::First(_) => {}
+            Either::Second(new_cfg) => {
+                if configure_radio(radio, &new_cfg).await.is_err()
+                    || radio.rx_start().await.is_err()
+                {
+                    defmt::error!("diversity RX (secondary): reconfigure failed; off-channel");
+                }
+            }
+        }
+    }
+}
+
 /// Run the RX side: receive packets, dedup at packet + event level,
 /// reassemble SysEx, hand each surviving event to the sink.  On
 /// watchdog expiry call `sink.all_notes_off` and mark the receiver as
@@ -1296,23 +1413,21 @@ async fn apply_rx_reconfig<Spi, Busy, Dio1, Reset, Switch>(
 #[allow(clippy::too_many_arguments)] // Top-level orchestrator: HAL handles + channels are inherent.
 async fn run_rx_inner<Spi, Busy, Dio1, Reset, Switch, Led, Sink>(
     radio: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
-    // Optional diversity radio.  Same concrete type as `radio` (on the
-    // T114 both SX1262s are `Spim<'static>` + `Output` reset +
-    // `Dio2RfSwitch`).  When `Some`, both radios are configured
-    // identically and listen on the same channel; whichever demodulates a
-    // given packet first feeds the shared `LinkReceiver`, and the
-    // replay-window dedup discards the duplicate copy from the other
-    // radio.  When `None`, this is the verified single-radio path —
-    // behaviour is byte-for-byte unchanged (the second receive future
-    // becomes `pending()` and the biased `select` always resolves to the
-    // primary radio).
-    //
-    // Caveats for the diversity path (acceptable for v1, see
-    // `run_rx_diversity`): channel-scan and live RX reconfig touch only
-    // `radio` (the primary).  `run_rx_diversity` therefore passes `None`
-    // for `scan` / `config_updates`, so the secondary never drifts out of
-    // sync with the primary's channel.
-    mut radio2: Option<&mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>>,
+    // Optional diversity (secondary) radio's handoff channel.  When `Some`,
+    // a separately-spawned [`run_rx_secondary`] task drains the second
+    // SX1262 and pushes crc-ok frames here; this loop consumes them
+    // alongside the primary's own receives and feeds both into the shared
+    // `LinkReceiver` (replay window dedups the duplicate copies).  The
+    // secondary lives in its own task — never cancelled — so its DIO1 IRQ
+    // is always cleared (avoids the GPIOTE-PORT spurious-wake storm that
+    // racing two `rx_recv` futures in one task caused).  When `None`, this
+    // is the verified single-radio path: the second select future is
+    // `pending()` and behaviour is byte-for-byte unchanged.
+    secondary: Option<DiversityRxReceiver>,
+    // When `Some`, live `LinkConfig` reconfigures are forwarded here so the
+    // secondary radio's task retunes to the same channel.  Paired with
+    // `secondary`; `None` on the single-radio path.
+    secondary_cfg: Option<&'static LinkConfigSignal>,
     led: &mut Led,
     sink: &mut Sink,
     config: &LinkConfig,
@@ -1356,26 +1471,11 @@ where
             Timer::after_millis(1000).await;
         }
     }
-    // Bring the diversity radio up identically.  A failure here is
-    // non-fatal: we log and fall back to single-radio reception rather
-    // than halting, so a flaky second module never takes down the link.
-    // The explicit `verify_present` SPI probe means a not-actually-wired
-    // second module is reported as such, instead of silently "up" (init is
-    // all blind writes) and then showing up as a radio that never receives.
-    if let Some(r2) = radio2.as_deref_mut() {
-        let configured = configure_radio(r2, &current).await.is_ok();
-        let present = configured && r2.verify_present().await.unwrap_or(false);
-        if !present {
-            defmt::error!(
-                "link RX: diversity radio not responding on SPI (check wiring/power); continuing single-radio"
-            );
-            radio2 = None;
-        } else if r2.rx_start().await.is_err() {
-            defmt::error!("link RX: diversity radio rx_start failed; continuing single-radio");
-            radio2 = None;
-        } else {
-            defmt::info!("link RX: diversity radio present + in RX (2-radio receive)");
-        }
+    // The diversity (secondary) radio, if any, is brought up and drained by
+    // its own `run_rx_secondary` task (spawned by the profile) — see the
+    // `secondary` channel arm below.  Nothing to init here.
+    if secondary.is_some() {
+        defmt::info!("link RX: diversity enabled (consuming secondary radio channel)");
     }
     defmt::info!(
         "link RX: listening on {} Hz / {} bps GFSK, watchdog={}ms",
@@ -1390,12 +1490,6 @@ where
     };
     let mut wd = WatchdogTimer::new(Duration::from_millis(current.watchdog_ms));
     let mut radio_buf = [0u8; RF_PAYLOAD_MAX as usize];
-    // Scratch buffer the diversity radio receives into.  On a secondary-
-    // radio win its bytes are copied into `radio_buf` so the shared
-    // packet-processing body below reads from one place regardless of
-    // which radio caught the frame.  Unused (but harmlessly present) on
-    // the single-radio path.
-    let mut radio_buf2 = [0u8; RF_PAYLOAD_MAX as usize];
     // Tracks the last `key_fp` we observed on a successfully-decoded
     // packet so we log once on each Open↔AEAD transition rather than
     // on every packet.  `None` = haven't heard anything yet; the
@@ -1557,6 +1651,12 @@ where
                 if radio.set_standby_rc().await.is_err() {
                     defmt::error!("link RX: set_standby_rc failed entering scan");
                 }
+                // The secondary radio stays on the operating channel in its
+                // own task during scan; we just stop draining its channel
+                // (the `continue` below skips the consume), so its frames
+                // age out via the bounded channel's drop-on-full.  Scan
+                // doesn't change the operating frequency, so it's still
+                // correctly tuned when we resume.
                 // Scan keeps the operating IF bandwidth — we want
                 // each channel's RSSI to reflect what a real link
                 // there would see, including the TX's full ~400 kHz
@@ -1577,6 +1677,11 @@ where
                 // from TX will trigger a full session reset.
                 let _ = configure_radio(radio, &current).await;
                 let _ = radio.rx_start().await;
+                // Operating channel is unchanged across a scan, so the
+                // secondary (still tuned + receiving in its task) needs no
+                // retune here.  A channel *change* made during scan is
+                // deferred and applied via the config block below, which
+                // forwards it to the secondary.
                 receiver.mark_link_down();
                 link_up = false;
                 rx_state.reset();
@@ -1616,6 +1721,10 @@ where
                         &mut link_up,
                     )
                     .await;
+                    // Forward to the secondary radio's task so it retunes.
+                    if let Some(s) = secondary_cfg {
+                        s.signal(current);
+                    }
                 }
             }
         }
@@ -1680,22 +1789,30 @@ where
         // only meaningful when a packet (not a timer/signal) wins.
         let mut from_radio1 = false;
         let recv_any = async {
-            match radio2.as_deref_mut() {
-                Some(r2) => {
-                    match select(radio.rx_recv(&mut radio_buf), r2.rx_recv(&mut radio_buf2)).await {
-                        Either::First(res) => res,
-                        Either::Second(res) => {
-                            from_radio1 = true;
-                            if let Ok(pkt) = &res {
-                                if pkt.crc_ok {
-                                    let n = pkt.len.min(radio_buf2.len()).min(radio_buf.len());
-                                    radio_buf[..n].copy_from_slice(&radio_buf2[..n]);
-                                }
-                            }
-                            res
-                        }
+            match secondary.as_ref() {
+                // Race the primary's own receive against a frame handed over
+                // from the secondary radio's drain task.  `select` polls the
+                // primary first, so the channel only wins when the primary is
+                // *pending* (no packet of its own) — cancelling a pending
+                // `rx_recv` (DIO1 still low) is harmless, so the primary's
+                // IRQ is never left stuck.  The secondary never gets cancelled
+                // at all (it lives in its own task).
+                Some(rx) => match select(radio.rx_recv(&mut radio_buf), rx.receive()).await {
+                    Either::First(res) => res,
+                    Either::Second(frame) => {
+                        from_radio1 = true;
+                        let n = frame.len.min(radio_buf.len());
+                        radio_buf[..n].copy_from_slice(&frame.buf[..n]);
+                        // Synthesize the same packet metadata `rx_recv` would
+                        // return; the producer only forwards crc-ok frames.
+                        Ok(RxPacket {
+                            len: n,
+                            rssi_dbm: frame.rssi_dbm,
+                            snr_db: 0,
+                            crc_ok: true,
+                        })
                     }
-                }
+                },
                 None => radio.rx_recv(&mut radio_buf).await,
             }
         };
@@ -2016,6 +2133,10 @@ where
                     &mut link_up,
                 )
                 .await;
+                // Forward to the secondary radio's task so it retunes.
+                if let Some(s) = secondary_cfg {
+                    s.signal(current);
+                }
                 continue;
             }
             Either5::Fourth(()) => {
@@ -2191,6 +2312,7 @@ where
     run_rx_inner(
         radio,
         None,
+        None,
         led,
         sink,
         config,
@@ -2205,38 +2327,45 @@ where
     .await
 }
 
-/// Two-radio diversity receive loop (ROADMAP Stage 2, dual-SPI variant).
+/// Primary half of two-radio diversity receive (ROADMAP Stage 2, dual-SPI).
 ///
-/// Both radios must be the **same concrete type** and are tuned to the same
-/// channel from the shared `config`.  Each demodulates independently;
-/// whichever catches a given packet first feeds the single
-/// [`osrf_link::LinkReceiver`], whose packet-`seq` replay window discards
-/// the duplicate copy from the other radio.  That replay window *is* the
-/// diversity arbitration — no separate dedupe logic is needed.  All the
-/// decode / decrypt / stuck-note-failsafe / stats machinery is shared with
-/// [`run_rx`] (one code path in [`run_rx_inner`]).
+/// Drives the **primary** radio and consumes frames the **secondary** radio's
+/// [`run_rx_secondary`] task pushes over `secondary` (a [`DiversityRxChannel`]
+/// receiver).  Both sources feed the single [`osrf_link::LinkReceiver`], whose
+/// packet-`seq` replay window discards the duplicate copies — that *is* the
+/// diversity arbitration.  All decode / decrypt / stuck-note-failsafe / stats
+/// machinery is shared with [`run_rx`] (one code path in `run_rx_inner`).
 ///
-/// Ordering: both radios hear the same transmission with microsecond-scale
-/// skew while the inter-packet interval is milliseconds, so packets reach
-/// the shared receiver in send order in practice; no reorder buffer (see
-/// `LinkReceiver` docs for the truncated-note failsafe that covers the
-/// rare exception).
+/// **Topology:** the profile spawns two tasks — this one (owns radio0) and a
+/// [`run_rx_secondary`] task (owns radio1) — plus a `static`
+/// [`DiversityRxChannel`].  Each radio's `rx_recv` runs to completion in its
+/// own task and is never cancelled mid-wait, so neither DIO1 IRQ is ever left
+/// asserted.  (Racing both `rx_recv`s in one task with `select` left the loser's
+/// level-sensitive DIO1 stuck high → embassy-nrf GPIOTE-PORT spurious-wake
+/// storm → 50% loss + `unexpected IRQ 0x0000`.  This split structurally avoids
+/// it.)
 ///
-/// v1 scope: fixed config — no live reconfig, channel-scan, or AEAD-key
-/// updates (those arms touch only the primary radio, which would desync the
-/// secondary's channel).  Use [`run_rx`] for a single radio with the full
-/// UI-driven feature set.
+/// Full feature parity with [`run_rx`]: live `config_updates`, `scan`,
+/// `shutdown`, `aead_updates`.  A live `LinkConfig` change is forwarded to the
+/// secondary task via `secondary_cfg` so it retunes to the same channel.
+/// During a channel scan only the primary samples RSSI; the secondary stays on
+/// the (unchanged) operating channel and its frames simply age out of the
+/// bounded channel until the scan ends.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_rx_diversity<Spi, Busy, Dio1, Reset, Switch, Led, Sink>(
     radio0: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
-    radio1: &mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>,
+    secondary: DiversityRxReceiver,
+    secondary_cfg: &'static LinkConfigSignal,
     led: &mut Led,
     sink: &mut Sink,
     config: &LinkConfig,
     stats: &LinkStatsCell,
+    config_updates: Option<&LinkConfigSignal>,
+    scan: Option<&ScanController>,
     shutdown: Option<&ShutdownSignal>,
     aead: Option<AeadContext>,
     allow_open: bool,
+    aead_updates: Option<&'static AeadUpdateSignal>,
 ) -> !
 where
     Spi: SpiDevice,
@@ -2249,17 +2378,18 @@ where
 {
     run_rx_inner(
         radio0,
-        Some(radio1),
+        Some(secondary),
+        Some(secondary_cfg),
         led,
         sink,
         config,
         stats,
-        None, // config_updates: fixed config in v1 diversity
-        None, // scan: primary-only, would desync secondary
+        config_updates,
+        scan,
         shutdown,
         aead,
         allow_open,
-        None, // aead_updates: fixed key in v1 diversity
+        aead_updates,
     )
     .await
 }

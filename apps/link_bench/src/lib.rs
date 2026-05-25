@@ -21,8 +21,9 @@ pub mod synthetic;
 // (`profiles/t114_link_{rx,tx}` etc.) continue to compile against
 // `osrf_app_link_bench::*`.
 pub use osrf_link_runtime::{
-    configure_radio, run_rx, run_rx_diversity, run_tx, AeadConfig, CipherId, Direction, LinkConfig,
-    LinkConfigSignal, LinkStats, LinkStatsCell, MidiSink, MidiSource, ScanController,
+    configure_radio, run_rx, run_rx_diversity, run_rx_secondary, run_tx, AeadConfig, CipherId,
+    Direction, DiversityRxChannel, DiversityRxFrame, DiversityRxReceiver, DiversityRxSender,
+    LinkConfig, LinkConfigSignal, LinkStats, LinkStatsCell, MidiSink, MidiSource, ScanController,
     RF_PAYLOAD_MAX, SCAN_MAX_CHANNELS, SCAN_RSSI_NONE,
 };
 
