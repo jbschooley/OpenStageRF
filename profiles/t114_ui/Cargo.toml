@@ -40,6 +40,10 @@ defmt-rtt   = "1.1"
 # **Do not** add `panic-probe` here — Rust enforces a single
 # `#[panic_handler]` per binary.
 
+[build-dependencies]
+# Parse the TOML key file in build.rs to bake AEAD keys into the firmware.
+toml = "0.8"
+
 [lib]
 name = "osrf_profile_t114_ui"
 path = "src/lib.rs"

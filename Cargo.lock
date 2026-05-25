@@ -1853,6 +1853,7 @@ dependencies = [
  "osrf-panic-log",
  "osrf-ui",
  "sequential-storage",
+ "toml",
 ]
 
 [[package]]

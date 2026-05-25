@@ -1,0 +1,27 @@
+# OpenStageRF AEAD key file — copy to `osrf-keys.toml` and fill in real keys.
+#
+# Read by `profiles/t114_ui/build.rs`; every key here is BAKED INTO THE
+# FIRMWARE at build time and shows up as a selectable entry in the device's
+# Key menu. Gitignored — never commit real keys. Override the path with the
+# `OSRF_KEYS_FILE` env var, e.g.:
+#   OSRF_KEYS_FILE=/secrets/show-a.toml cargo xtask run t114_ui_tx
+#
+# Each top-level table is one key: the table name is the display name (a
+# `name = ` field overrides it), and `hex` is the 32-byte key.
+# Generate a random key with:  openssl rand -hex 32
+#
+# To talk, the TX and RX units must build with the same key AND have it
+# selected (boot default = the `active` key below, else the first key).
+#
+# With no key file present, the build falls back to insecure TEST keys and
+# prints a cargo:warning. Do not ship test-key builds.
+
+device_id = 1            # u32; paired units must match
+active     = "SchoolZone" # optional: key selected at boot (by display name)
+
+[SchoolZone]
+hex = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[Backup]
+name = "Backup Key"      # optional display-name override (else the table name)
+hex  = "1111111111111111111111111111111111111111111111111111111111111111"

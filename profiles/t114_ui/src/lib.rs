@@ -60,101 +60,73 @@ const CHEMISTRY: BatteryChemistry = BatteryChemistry::LiPoSingle;
 /// is lost.
 const POWER_POLICY: PowerPolicy = PowerPolicy::Wired;
 
-// ── Stage 3: hardcoded AEAD test keys (paired-units testing) ──────
+// ── AEAD keys: baked at build time from the key file ─────────────
 //
-// Until Stage 4 BLE provisioning lands there's no out-of-band way to
-// transfer a key between paired units, so testing AEAD on the full
-// UI profile uses these compiled-in keys.  TX gets BOTH so the
-// operator can flip between them in the Key menu; RX gets only
-// `KEY_SHARED` — `KEY_TX_ONLY` is intentionally missing on RX so
-// you can demonstrate the rejection path by picking it on TX and
-// watching RX log `KeyFpMismatch`.
+// Until Stage 4 BLE provisioning lands there's no on-device way to
+// transfer a key between paired units, so the keys are compiled in.
+// `build.rs` reads `<workspace>/osrf-keys.toml` (override path with the
+// `OSRF_KEYS_FILE` env var) and generates `KEY_SHARED` / `KEY_SHARED_NAME`
+// / `KEY_TX_ONLY` / `KEY_TX_ONLY_NAME` / `TEST_DEVICE_ID` into
+// `$OUT_DIR/keys.rs`, included below.  With no key file the build falls
+// back to the historical TEST keys ([0x42;32]/[0x99;32]) and prints a
+// `cargo:warning` — see `build.rs`.
 //
-// Same bytes on both ends → same fingerprint → packets accepted.
-// Different bytes → `RxDrop::KeyFpMismatch` (or `AeadFail` if
-// fingerprints happen to collide).
+// Both paired units must build with the **same `shared` key** (same bytes →
+// same fingerprint → packets accepted).  TX registers both keys so the
+// operator can flip between them in the Key menu; RX registers only
+// `KEY_SHARED`, so picking `TX-Only` on TX demonstrates the `KeyFpMismatch`
+// rejection path on RX.  `TEST_DEVICE_ID` ties the AEAD nonce to a fixed
+// device id so paired units agree without exchanging FICR.DEVICEID
+// out-of-band (Stage 4 will switch to real per-device ids + an allowlist).
+include!(concat!(env!("OUT_DIR"), "/keys.rs"));
 
-const KEY_SHARED: [u8; 32] = [0x42; 32];
-const KEY_SHARED_NAME: &str = "Shared";
-const KEY_TX_ONLY: [u8; 32] = [0x99; 32];
-const KEY_TX_ONLY_NAME: &str = "TX-Only";
-const TEST_CIPHER: CipherId = CipherId::ChaCha20Poly1305;
-/// Hardcoded device_id so paired units agree without exchanging
-/// FICR.DEVICEID values out-of-band.  Stage 4 / multi-device
-/// deployments will switch this to `board::device_id::device_id()`
-/// + an RX-side allowlist.
-const TEST_DEVICE_ID: u32 = 0x0000_0001;
+/// Cipher used for every baked key.  (The key file doesn't pick a cipher
+/// per key yet; ChaCha20-Poly1305 works on every target.)
+const KEY_CIPHER: CipherId = CipherId::ChaCha20Poly1305;
 
-/// Build the AEAD context for a given hardcoded key.  Cipher,
-/// device_id and direction are profile-wide constants.
+/// Build the AEAD context for a given key.  Cipher, device_id and
+/// direction are profile-wide.
 fn ctx_for_key(key: [u8; 32]) -> AeadConfig {
     AeadConfig {
-        cipher: TEST_CIPHER,
+        cipher: KEY_CIPHER,
         key,
-        device_id: TEST_DEVICE_ID,
+        device_id: KEY_DEVICE_ID,
         direction: Direction::TxToRx,
     }
 }
 
 fn fp_for_key(key: &[u8; 32]) -> u32 {
-    osrf_app_midi_node::osrf_crypto::fingerprint(TEST_CIPHER, key) & 0x00FF_FFFF
+    osrf_app_midi_node::osrf_crypto::fingerprint(KEY_CIPHER, key) & 0x00FF_FFFF
 }
 
-/// Resolver for the **TX** side: operator selects a key in the UI →
-/// link sender encrypts subsequent packets with it.  Picking Open
-/// drops to plaintext.  An unknown fingerprint (shouldn't happen
-/// since the keystore only contains the keys we know) falls back to
-/// plaintext as a safe default.
-fn tx_aead_resolver(active_fp: Option<u32>) -> AeadUpdate {
-    let shared_fp = fp_for_key(&KEY_SHARED);
-    let tx_only_fp = fp_for_key(&KEY_TX_ONLY);
-    let masked = active_fp.map(|fp| fp & 0x00FF_FFFF);
-    match masked {
-        None => AeadUpdate {
-            aead: None,
-            allow_open: true,
-        },
-        Some(fp) if fp == shared_fp => AeadUpdate {
-            aead: Some(ctx_for_key(KEY_SHARED)),
-            allow_open: false,
-        },
-        Some(fp) if fp == tx_only_fp => AeadUpdate {
-            aead: Some(ctx_for_key(KEY_TX_ONLY)),
-            allow_open: false,
-        },
-        Some(_) => AeadUpdate {
-            aead: None,
-            allow_open: true,
-        },
-    }
-}
-
-/// Resolver for the **RX** side.  RX only holds the `Shared` key
-/// material; that's the only fingerprint it can decrypt.
+/// Resolve the UI-selected key fingerprint to an AEAD config.  Used by
+/// **both** roles now that the whole keyring is registered on each end:
 ///
-/// * Open / Auto (`active_fp = None`): permissive — accept the
-///   `Shared` key OR plaintext.  No filter.
-/// * Specific selection matching `Shared`: strict — accept that
-///   fingerprint only, reject plaintext.
-/// * Specific selection that doesn't match anything we hold:
-///   refuse everything (RX shouldn't actually let this state happen
-///   in the menu, but the resolver stays defensive).
-fn rx_aead_resolver(active_fp: Option<u32>) -> AeadUpdate {
-    let shared_fp = fp_for_key(&KEY_SHARED);
-    let masked = active_fp.map(|fp| fp & 0x00FF_FFFF);
-    match masked {
+/// * `None` (operator picked **Open**) → plaintext, no encryption.
+/// * `Some(fp)` matching a baked key → strict: encrypt/decrypt with that
+///   key only, reject plaintext.
+/// * `Some(fp)` matching nothing we hold → refuse everything (defensive;
+///   the menu only offers fingerprints we registered).
+fn aead_resolver(active_fp: Option<u32>) -> AeadUpdate {
+    match active_fp.map(|fp| fp & 0x00FF_FFFF) {
         None => AeadUpdate {
-            aead: Some(ctx_for_key(KEY_SHARED)),
+            aead: None,
             allow_open: true,
         },
-        Some(fp) if fp == shared_fp => AeadUpdate {
-            aead: Some(ctx_for_key(KEY_SHARED)),
-            allow_open: false,
-        },
-        Some(_) => AeadUpdate {
-            aead: None,
-            allow_open: false,
-        },
+        Some(fp) => {
+            for (_name, key) in BAKED_KEYS {
+                if fp_for_key(key) == fp {
+                    return AeadUpdate {
+                        aead: Some(ctx_for_key(*key)),
+                        allow_open: false,
+                    };
+                }
+            }
+            AeadUpdate {
+                aead: None,
+                allow_open: false,
+            }
+        }
     }
 }
 
@@ -359,34 +331,30 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource, diversity: b
     let mut keys = KeyStore::new();
     app::load_keys(&mut flash, board::storage::KEY_STORE_RANGE, &mut keys).await;
 
-    // Register the hardcoded test keys in the runtime keystore so
-    // the UI's Key list shows them as selectable entries.
-    //
-    // Per-role registration:
-    //   * TX gets BOTH keys (Shared + TX-Only) so the operator can
-    //     pick between them and exercise the cross-board rejection
-    //     case (TX-Only on the wire → RX logs KeyFpMismatch).
-    //   * RX gets only `Shared` — `TX-Only` isn't even shown there,
-    //     matching the actual material RX holds.
-    let shared_fp = fp_for_key(&KEY_SHARED);
-    if keys.find(shared_fp).is_none() {
-        let _ = keys.add(KEY_SHARED_NAME, TEST_CIPHER, shared_fp);
-    }
-    if matches!(role, Role::Tx) {
-        let tx_only_fp = fp_for_key(&KEY_TX_ONLY);
-        if keys.find(tx_only_fp).is_none() {
-            let _ = keys.add(KEY_TX_ONLY_NAME, TEST_CIPHER, tx_only_fp);
+    // Register the whole baked keyring in the runtime keystore so every
+    // key shows up as a selectable entry in the UI's Key list — on both
+    // TX and RX (either end can select any key; both must select the same
+    // one to talk).  `keys.add` caps at `MAX_KEYS`; extras are dropped.
+    for (name, key) in BAKED_KEYS {
+        let fp = fp_for_key(key);
+        if keys.find(fp).is_none() && keys.add(name, KEY_CIPHER, fp).is_err() {
+            defmt::warn!("t114_ui: keystore full; key {} not registered", name);
         }
     }
 
-    // Pick the per-role resolver + compute the boot-time AEAD config
-    // from the persisted `active_key_fp`.  Subsequent operator key
-    // changes are applied live by `ui_state_loop` → `AEAD_UPDATES`
-    // → the runtime's top-of-loop `try_take`; no reboot needed.
-    let aead_resolver: fn(Option<u32>) -> AeadUpdate = match role {
-        Role::Tx => tx_aead_resolver,
-        Role::Rx => rx_aead_resolver,
-    };
+    // Boot-default key: if nothing is persisted yet, select the key file's
+    // `active` entry (the first key by default) so a freshly-flashed device
+    // comes up encrypted rather than in the clear.  Once the operator picks
+    // a key (or Open) in the menu, that choice persists and wins here.
+    if settings.active_key_fp.is_none() {
+        if let Some(idx) = ACTIVE_KEY_IDX {
+            settings.active_key_fp = Some(fp_for_key(&BAKED_KEYS[idx].1));
+        }
+    }
+
+    // Single `aead_resolver` (top-level fn) for both roles.  Live key
+    // changes from the menu are applied via `ui_state_loop` →
+    // `AEAD_UPDATES` → the runtime's top-of-loop `try_take`; no reboot.
     let initial_update = aead_resolver(settings.active_key_fp);
     let initial_aead = initial_update.aead;
     let initial_allow_open = initial_update.allow_open;
