@@ -21,16 +21,42 @@ needs them** — the active path is T114 → v2 nRF5340 board.
 
 **SX1262 GFSK rate limit (300 kbps):** the SX1262 silicon caps GFSK at 300 kbps per datasheet. This is fine for MIDI (a few kbps of sustained traffic, lots of headroom for retries/diversity) and is the firm reason audio profiles in Stage 5 below run on Si4463 instead — see *Stage 5* and *Tier 2 — Pro wireless audio* for the chip-swap rationale.
 
-### Stage 2 — diversity (UART slave first)
-Add a second DX-LR30 to the receive end as a **UART slave**: it runs nearly the same firmware as the master, receives RF independently, and forwards `RxReport` frames (seq, RSSI, payload) to the master over UART. Master runs the dedupe/arbitration logic.
+### Stage 2 — diversity (dual-SPI on T114, active)
+**As of 2026-05 the active diversity path is dual-SPI on a single T114**, not the
+UART-slave approach originally planned here. A second SX1262 (a header-wired
+DX-LR30-900M22S) sits on the nRF52840's dedicated SPI3 bus alongside the on-board
+LR1262 on TWISPI0. Both radios listen on the same channel and feed one shared
+`LinkReceiver`; whichever demodulates a packet first is accepted, and the receiver's
+existing packet-`seq` replay window discards the duplicate from the other radio. That
+replay window **is** the diversity arbitration — no separate dedupe layer was needed.
 
-Why UART-slave before dual-SPI on one MCU:
-- both boards run nearly identical code; no radio-driver hacks
-- diversity arbitration is developed in isolation on the master
-- the slave can sit physically apart for real spatial diversity
-- the dual-SPI implementation gets done once, on the v2 custom board
+Why the switch to dual-SPI-first:
+- the dedupe/arbitration logic already existed in `core/link` (replay windows), so
+  diversity reduced to plumbing a second radio into the verified RX loop
+- both SX1262s are the same concrete type on the T114 (`Spim<'static>` erases the
+  peripheral instance), so `run_rx_diversity` reuses the single-radio runtime with no
+  new monomorphisation or driver hacks
+- it lands real diversity on the *current* first-edition hardware (a custom T114 carrier
+  PCB) rather than waiting for the v2 board
+- the DX-LR30 drives its RF switch from DIO2 and its TCXO from DIO3 exactly like the
+  on-board module, so it uses the same `Dio2RfSwitch` impl with zero driver changes
 
-Dual-SPI (both SX1262s on one MCU's SPI bus) is also a supported profile and becomes the default on the v2 custom board.
+Implementation (landed pre-hardware, pending PCB bring-up):
+- board: `osrf_board_t114::resources_with_diversity()` builds `radio1` on SPI3 from the
+  `dual_spi_diff_bus_radio1` pinout; single-radio profiles drop the `Radio1Tokens` and
+  never claim SPI3 or the radio1 header pins
+- runtime: `osrf_link_runtime::run_rx_diversity` wraps the verified `run_rx_inner` with an
+  optional second radio; the single-radio `run_rx` path is behaviour-identical (the second
+  receive future is `pending()`)
+- profile: `profiles/t114_link_rx_diversity`
+- v1 scope: fixed config — live reconfig / channel-scan / AEAD-key updates stay
+  single-radio (those arms touch only the primary radio and would desync the secondary's
+  channel)
+
+The **UART-slave** variant (a second board forwarding `RxReport` frames over UART, for
+true spatial separation) remains a valid future option — the arbitration logic is
+transport-independent, so it would reuse the same shared-receiver merge. Dual-SPI also
+becomes the default on the v2 custom board.
 
 ### Stage 2.5 — second platform (Heltec T114 / nRF52840)
 Port the firmware to **Heltec T114** (nRF52840 + SX1262) via `embassy-nrf`. This is where the multi-vendor portability boundary gets validated: the same `core/`, `drivers/`, `protocols/` crates compile against a different HAL with only board and port code changing. Anything that doesn't compile cleanly is a portability bug to fix in core, not in the port.

@@ -1,0 +1,28 @@
+[package]
+name        = "osrf-profile-t114-link-rx-diversity"
+version     = "0.1.0"
+publish     = false
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "Stage 2 dual-SPI diversity RX — T114 with the on-board SX1262 (radio0) plus a header-wired DX-LR30 (radio1) feeding one shared LinkReceiver."
+
+[package.metadata.osrf]
+board = "t114"
+
+[dependencies]
+osrf-board-t114     = { workspace = true, features = ["defmt"] }
+osrf-app-link-bench = { workspace = true }
+
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+
+cortex-m    = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+defmt       = "1.0"
+defmt-rtt   = "1.1"
+panic-probe = { version = "1.0", features = ["print-defmt"] }
+
+[[bin]]
+name  = "link_rx_diversity"
+path  = "src/main.rs"
+test  = false
+bench = false
