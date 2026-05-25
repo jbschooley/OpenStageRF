@@ -2,3 +2,5 @@ target/
 *.bin
 *.uf2
 *.log
+# AEAD key file baked into firmware at build time — never commit real keys
+osrf-keys.toml
