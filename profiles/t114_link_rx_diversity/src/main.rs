@@ -49,19 +49,13 @@ async fn main(_spawner: Spawner) {
     // Same paired AEAD stub key/device_id/direction as `t114_link_rx`.
     let aead = Some(test_aead_chacha());
     defmt::info!("diversity RX: AEAD = ChaCha20-Poly1305 (test stub key, strict)");
-    // ── DIAGNOSTIC SWAP (revert before shipping) ────────────────────
-    // radio1 (DX-LR30) is in the PRIMARY slot so its receptions show up
-    // as `rx0` in the stats line, isolating its RF path from the
-    // select-bias that otherwise lets the on-board radio win every race.
-    //   rx0 climbs  → DX-LR30 is receiving (the earlier rx1=0 was just
-    //                 the on-board radio hogging the biased select).
-    //   rx0 == 0    → DX-LR30 isn't demodulating; debug its DIO1 / SPI /
-    //                 TCXO wiring (the on-board radio, now secondary,
-    //                 will be carrying the link as rx1).
-    // Normal order is `(&mut r.radio0, &mut radio1, …)`.
+    // Normal order: on-board radio0 is primary (rx0), DX-LR30 radio1 is
+    // the diversity radio (rx1).  (A diagnostic build once swapped these
+    // to isolate the DX-LR30's RF path — see git history if that's needed
+    // again.)
     run_rx_diversity(
-        &mut radio1,
         &mut r.radio0,
+        &mut radio1,
         &mut r.status_led,
         &mut sink,
         &config,
