@@ -248,13 +248,17 @@ pub fn resources() -> Resources {
     // Reset pulse + post-reset wait now happen inside `Sx1262Radio::init()`,
     // which uses `Timer::after` and `wait_busy` for the proper sequence.
 
+    // DX-LR30-900M22SP uses a plain 32 MHz crystal (no TCXO) — skip
+    // `SetDio3AsTcxoCtrl`, which would otherwise put the SX1262 in a TCXO
+    // mode it can't satisfy, leaving it unable to demodulate.
     let radio0 = osrf_radio_sx126x::Sx1262Radio::new(
         spi_dev,
         busy,
         dio1,
         reset,
         osrf_radio_sx126x::PinRfSwitch::new(txen, rxen),
-    );
+    )
+    .without_tcxo();
 
     // ── MIDI UART: USART3 @ 31250 baud 8N1, interrupt-driven ──────────────
     // Static ring-buffer storage for the BufferedUart.  Sizes picked to

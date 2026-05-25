@@ -50,6 +50,9 @@ bind_interrupts!(pub struct Irqs {
     TWISPI0 => spim::InterruptHandler<peripherals::TWISPI0>;
     TWISPI1 => spim::InterruptHandler<peripherals::TWISPI1>;
     SPI2    => spim::InterruptHandler<peripherals::SPI2>;
+    // radio1 diversity bus: peripheral is SPI3 but its IRQ line is SPIM3
+    // (`impl_spim!(SPI3, SPIM3, SPIM3)` in embassy-nrf's nrf52840 chip def).
+    SPIM3   => spim::InterruptHandler<peripherals::SPI3>;
     UARTE1  => buffered_uarte::InterruptHandler<peripherals::UARTE1>;
     SAADC   => saadc::InterruptHandler;
 });
@@ -70,8 +73,22 @@ pub mod radio0 {
 }
 
 // ── Default radio1 pinout for dual_spi_diff_bus (SPI3, dedicated) ────────────
-// Second SX1262 wired to the GPIO header pins (P0_28..P0_31 + P1_xx).
-// Profiles can override by defining their own radio1 module.
+// Second SX1262 (DX-LR30-900M22S diversity module) wired to the GPIO header
+// pins (P0_28..P0_31 + P1_xx).  Profiles can override by defining their own
+// radio1 module.
+//
+// RF switch: the DX-LR30 drives its on-module RF switch from the SX1262's
+// own DIO2 line, and the on-module TCXO from DIO3 — neither pin is wired to
+// the MCU.  So the default switch impl is `Dio2RfSwitch`, identical to
+// radio0, and `Txen`/`Rxen` below stay parked (unused GPIO).
+//
+// `Txen`/`Rxen` are routed on the v1 carrier PCB (to the two free pins that
+// aren't trapped in the GPS connector) purely as a hardware fallback: if
+// DIO2-as-RF-switch misbehaves on this module's switch IC, a profile can
+// swap radio1 to `osrf_radio_sx126x::PinRfSwitch<Txen, Rxen>` and drive the
+// switch explicitly — no PCB respin.  They double as scope test points.
+// Neither collides with `joystick` (P1_14/P1_12/P0_07/P0_08/P0_13), the
+// display, MIDI UART, or the SPI3 pins above.
 pub mod dual_spi_diff_bus_radio1 {
     use embassy_nrf::peripherals;
     pub type Spi = peripherals::SPI3;
@@ -82,6 +99,9 @@ pub mod dual_spi_diff_bus_radio1 {
     pub type Busy = peripherals::P1_13;
     pub type Dio1 = peripherals::P1_15;
     pub type Nrst = peripherals::P0_05;
+    // RF-switch fallback pins (parked unless a profile uses PinRfSwitch).
+    pub type Txen = peripherals::P0_16;
+    pub type Rxen = peripherals::P1_01;
 }
 
 // dual_spi_same_bus_radio1 is intentionally absent — T114 has only one SPI
@@ -213,6 +233,17 @@ pub type Radio0 = osrf_radio_sx126x::Sx1262Radio<
     osrf_radio_sx126x::Dio2RfSwitch,
 >;
 
+/// Second SX1262 (DX-LR30-900M22S) for receive diversity, on SPI3.
+/// **Identical concrete type to [`Radio0`]** — `Spim<'static>` erases the
+/// peripheral instance (TWISPI0 vs SPI3), and the DX-LR30 drives its RF
+/// switch from DIO2 + its TCXO from DIO3 exactly like the on-board module,
+/// so it uses the same [`osrf_radio_sx126x::Dio2RfSwitch`].  Because the
+/// types match, `osrf_link_runtime::run_rx_diversity` can take `radio0` and
+/// `radio1` as the same generic radio with no extra monomorphisation.
+/// Built only by [`resources_with_diversity()`]; single-radio profiles
+/// never claim SPI3 or the radio1 header pins.
+pub type Radio1 = Radio0;
+
 /// Built-in 1.14" ST7789 TFT (240×135) on TWISPI1 @ 8 MHz.
 ///
 /// Hand-rolled driver in [`display::St7789Display`].  The init sequence
@@ -318,7 +349,7 @@ pub fn resources() -> Resources {
 /// [`resources_and_usbd_with()`] instead.
 pub fn resources_with(config: embassy_nrf::config::Config) -> Resources {
     let p = init_with(config);
-    let (r, _usbd) = build_resources(p);
+    let (r, _radio1, _usbd) = build_resources(p);
     r
 }
 
@@ -334,17 +365,56 @@ pub fn resources_and_usbd_with(
     embassy_nrf::Peri<'static, embassy_nrf::peripherals::USBD>,
 ) {
     let p = init_with(config);
-    build_resources(p)
+    let (r, _radio1, usbd) = build_resources(p);
+    (r, usbd)
 }
 
-/// Internal: take an `embassy_nrf::Peripherals`, peel off USBD, build
-/// `Resources` from the rest.  Inlined into both public entry points so
-/// we never have to pass a partially-moved `Peripherals` across a
+/// Like [`resources()`] but also builds the second SX1262 (radio1) for
+/// receive diversity.  Use with `osrf_link_runtime::run_rx_diversity`.
+/// Both radios come back **un-initialised** — call `radio0.init().await`
+/// and `radio1.init().await` before configuring modulation (same pattern
+/// as the single-radio path).
+pub fn resources_with_diversity() -> (Resources, Radio1) {
+    resources_with_diversity_config(clocks::default_config())
+}
+
+/// [`resources_with_diversity()`] with a caller-supplied clock config.
+pub fn resources_with_diversity_config(
+    config: embassy_nrf::config::Config,
+) -> (Resources, Radio1) {
+    let p = init_with(config);
+    let (r, radio1_tokens, _usbd) = build_resources(p);
+    (r, build_radio1(radio1_tokens))
+}
+
+/// Raw peripheral tokens for the diversity radio (radio1), peeled off
+/// `Peripherals` by [`build_resources`] but **not configured**.  Holding a
+/// `Peri` token claims the peripheral/pin without driving it — single-radio
+/// profiles drop this bundle and the SPI3 peripheral + radio1 header pins
+/// stay in their reset (high-Z) state, costing nothing.  Diversity profiles
+/// pass it to [`build_radio1`].  Pins match the [`dual_spi_diff_bus_radio1`]
+/// module; the RF-switch is DIO2-driven on-module so TXEN/RXEN (P0_16/P1_01)
+/// are intentionally absent here.
+pub struct Radio1Tokens {
+    spi: embassy_nrf::Peri<'static, dual_spi_diff_bus_radio1::Spi>,
+    sck: embassy_nrf::Peri<'static, dual_spi_diff_bus_radio1::Sck>,
+    miso: embassy_nrf::Peri<'static, dual_spi_diff_bus_radio1::Miso>,
+    mosi: embassy_nrf::Peri<'static, dual_spi_diff_bus_radio1::Mosi>,
+    cs: embassy_nrf::Peri<'static, dual_spi_diff_bus_radio1::Cs>,
+    busy: embassy_nrf::Peri<'static, dual_spi_diff_bus_radio1::Busy>,
+    dio1: embassy_nrf::Peri<'static, dual_spi_diff_bus_radio1::Dio1>,
+    nrst: embassy_nrf::Peri<'static, dual_spi_diff_bus_radio1::Nrst>,
+}
+
+/// Internal: take an `embassy_nrf::Peripherals`, peel off USBD + the radio1
+/// tokens, build `Resources` from the rest.  Inlined into both public entry
+/// points so we never have to pass a partially-moved `Peripherals` across a
 /// function boundary.
 fn build_resources(
     p: embassy_nrf::Peripherals,
 ) -> (
     Resources,
+    Radio1Tokens,
     embassy_nrf::Peri<'static, embassy_nrf::peripherals::USBD>,
 ) {
     use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
@@ -353,6 +423,20 @@ fn build_resources(
     // Move USBD out first — Rust accepts partial moves of a struct so long
     // as we only access (not move) the rest of the fields below.
     let usbd = p.USBD;
+
+    // Peel the radio1 (diversity) tokens.  Just ownership moves — no GPIO
+    // or SPI config happens until `build_radio1` is called, so dropping
+    // these (single-radio profiles) leaves the pins in reset state.
+    let radio1_tokens = Radio1Tokens {
+        spi: p.SPI3,
+        sck: p.P0_28,
+        miso: p.P0_29,
+        mosi: p.P0_30,
+        cs: p.P0_31,
+        busy: p.P1_13,
+        dio1: p.P1_15,
+        nrst: p.P0_05,
+    };
 
     // ── Status LED (P1_03, **active LOW**) ──────────────────────────────────
     // Drive LOW at boot so the LED is *on* as a "device is awake"
@@ -567,6 +651,50 @@ fn build_resources(
             battery,
             wdt,
         },
+        radio1_tokens,
         usbd,
     )
+}
+
+/// Construct the diversity radio (radio1) from peeled [`Radio1Tokens`].
+/// Mirrors radio0's construction exactly — SPIM @ 8 MHz MODE_0, GPIO
+/// BUSY/DIO1, GPIO NRESET (un-pulsed; `Sx1262Radio::init()` does the reset),
+/// and a DIO2-driven RF switch.  Only the peripheral instance (SPI3) and
+/// pins differ.  Call from a diversity profile, then `radio1.init().await`
+/// alongside `radio0`.
+pub fn build_radio1(tokens: Radio1Tokens) -> Radio1 {
+    use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
+    use embassy_nrf::spim::{Config as SpimConfig, Frequency, Spim, MODE_0};
+
+    let mut spi_cfg = SpimConfig::default();
+    spi_cfg.frequency = Frequency::M8;
+    spi_cfg.mode = MODE_0;
+    let spi = Spim::new(
+        tokens.spi,
+        Irqs,
+        tokens.sck,
+        tokens.miso,
+        tokens.mosi,
+        spi_cfg,
+    );
+    let cs = Output::new(tokens.cs, Level::High, OutputDrive::Standard);
+    let spi_dev = embedded_hal_bus::spi::ExclusiveDevice::new(spi, cs, embassy_time::Delay)
+        .expect("CS pin set_high cannot fail (Infallible)");
+    let busy = Input::new(tokens.busy, Pull::None);
+    let dio1 = Input::new(tokens.dio1, Pull::Down);
+    let reset = Output::new(tokens.nrst, Level::High, OutputDrive::Standard);
+
+    // The DX-LR30-900M22S uses a plain 32 MHz crystal, not a TCXO (per its
+    // manual: "non-temperature compensated crystal oscillator").  Mark it so
+    // `init()` skips `SetDio3AsTcxoCtrl` — otherwise the chip is put in TCXO
+    // mode it can't satisfy and never demodulates.  The on-board radio0
+    // (LR1262) does have a TCXO, so it keeps the default.
+    osrf_radio_sx126x::Sx1262Radio::new(
+        spi_dev,
+        busy,
+        dio1,
+        reset,
+        osrf_radio_sx126x::Dio2RfSwitch,
+    )
+    .without_tcxo()
 }

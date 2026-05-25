@@ -1671,6 +1671,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "osrf-profile-t114-link-rx-diversity"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "defmt 1.0.1",
+ "defmt-rtt",
+ "embassy-executor",
+ "osrf-app-link-bench",
+ "osrf-board-t114",
+ "panic-probe",
+]
+
+[[package]]
 name = "osrf-profile-t114-link-tx"
 version = "0.1.0"
 dependencies = [

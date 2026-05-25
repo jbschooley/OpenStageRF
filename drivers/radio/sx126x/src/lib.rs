@@ -232,6 +232,15 @@ where
     sync_word_bits: u8,
     payload_max_len: u8,
     crc_on: bool,
+    /// Whether `init()` issues `SetDio3AsTcxoCtrl` to power an external TCXO
+    /// from DIO3.  `true` for modules with a TCXO (e.g. the Heltec T114's
+    /// LR1262); `false` for modules with a plain crystal (e.g. the
+    /// DX-LR30-900M22S, whose manual states it "uses a non-temperature
+    /// compensated crystal oscillator").  Forcing TCXO mode on a crystal
+    /// module mis-gates the clock-ready / image-calibration logic and the
+    /// radio never demodulates.  Defaults to `true`; clear with
+    /// [`Self::without_tcxo`].
+    tcxo_dio3: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -303,7 +312,18 @@ where
             sync_word_bits: 0,
             payload_max_len: 255,
             crc_on: true,
+            tcxo_dio3: true,
         }
+    }
+
+    /// Mark this module as crystal-clocked (no external TCXO on DIO3), so
+    /// `init()` skips `SetDio3AsTcxoCtrl` and the chip stays in its default
+    /// XTAL mode.  Required for modules like the DX-LR30-900M22S; calling
+    /// `SetDio3AsTcxoCtrl` on a crystal module leaves it unable to
+    /// demodulate.  Builder-style — chain after [`Self::new`].
+    pub fn without_tcxo(mut self) -> Self {
+        self.tcxo_dio3 = false;
+        self
     }
 
     pub fn release(self) -> (Spi, Busy, Dio1, Reset, Switch) {
@@ -493,10 +513,15 @@ where
         self.cmd(CMD_SET_REGULATOR_MODE, &[0x01]).await?;
 
         // SetDio3AsTcxoCtrl: voltage = V1_8 (0x02), delay = 320 (5 ms in
-        // 15.625 µs steps) — Heltec T114 wires DIO3 to TCXO power.  MUST
-        // come before any RF or calibration command.
-        self.cmd(CMD_SET_DIO3_AS_TCXO_CTRL, &[0x02, 0x00, 0x00, 0x01, 0x40])
-            .await?;
+        // 15.625 µs steps) — for modules that wire DIO3 to TCXO power (e.g.
+        // the Heltec T114's LR1262).  MUST come before any RF or calibration
+        // command.  Skipped for crystal-clocked modules (see `tcxo_dio3` /
+        // `without_tcxo`): issuing it on a plain-XTAL module like the
+        // DX-LR30 mis-configures the clock and the radio never demodulates.
+        if self.tcxo_dio3 {
+            self.cmd(CMD_SET_DIO3_AS_TCXO_CTRL, &[0x02, 0x00, 0x00, 0x01, 0x40])
+                .await?;
+        }
 
         // SetRxTxFallbackMode(FS = 0x40): after TX_DONE / RX_DONE, chip
         // returns to FS (PLL locked) instead of STBY_RC.  Faster restart
@@ -607,6 +632,30 @@ where
         }
         self.switch.init().await.map_err(Error::Switch)?;
         Ok(())
+    }
+
+    /// Probe whether a chip is actually present and answering on SPI.
+    ///
+    /// `init()` is all blind writes — it never reads anything back, so it
+    /// "succeeds" even with no chip attached (MOSI clocks into the void).
+    /// This does a **non-destructive** write/read/restore round-trip on the
+    /// sync-word register: a live chip echoes the test pattern back, while an
+    /// empty socket or a broken SPI link reads all-`0x00` or all-`0xFF`.
+    /// Returns `Ok(true)` if the chip answered correctly, `Ok(false)` if the
+    /// readback didn't match (no/dead chip or miswired SPI), `Err` on a HAL
+    /// transfer failure.  Call after `init()` (chip must be out of reset and
+    /// in standby); the prior register contents are restored, so it's safe to
+    /// call mid-configuration.
+    pub async fn verify_present(&mut self) -> Result<bool, RadioError<Reset, Switch>> {
+        let mut orig = [0u8; 2];
+        self.read_register(REG_SYNC_WORD_BASE, &mut orig).await?;
+        const PAT: [u8; 2] = [0xA5, 0x5A];
+        self.write_register(REG_SYNC_WORD_BASE, &PAT).await?;
+        let mut back = [0u8; 2];
+        self.read_register(REG_SYNC_WORD_BASE, &mut back).await?;
+        // Restore whatever was there before the probe.
+        self.write_register(REG_SYNC_WORD_BASE, &orig).await?;
+        Ok(back == PAT)
     }
 
     // ---- TX / RX / status ----
