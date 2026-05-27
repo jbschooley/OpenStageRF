@@ -1,0 +1,7 @@
+# T114 UI receiver, single radio, 470–514 MHz (CN470/SX1268).
+app       = "t114_ui"
+board     = "t114"
+role      = "rx"
+diversity = false
+band      = "470"
+keys      = "osrf-keys.toml"

@@ -1857,7 +1857,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "osrf-profile-t114-ui-bench-tx"
+name = "osrf-profile-t114-ui-app"
 version = "0.1.0"
 dependencies = [
  "cortex-m",
@@ -1867,19 +1867,7 @@ dependencies = [
  "osrf-board-t114",
  "osrf-profile-t114-ui",
  "osrf-ui",
-]
-
-[[package]]
-name = "osrf-profile-t114-ui-bench-tx-470"
-version = "0.1.0"
-dependencies = [
- "cortex-m",
- "cortex-m-rt",
- "defmt-rtt",
- "embassy-executor",
- "osrf-board-t114",
- "osrf-profile-t114-ui",
- "osrf-ui",
+ "toml",
 ]
 
 [[package]]
@@ -1897,71 +1885,6 @@ dependencies = [
  "osrf-app-ui-bench",
  "osrf-board-t114",
  "panic-probe",
-]
-
-[[package]]
-name = "osrf-profile-t114-ui-rx"
-version = "0.1.0"
-dependencies = [
- "cortex-m",
- "cortex-m-rt",
- "defmt-rtt",
- "embassy-executor",
- "osrf-board-t114",
- "osrf-profile-t114-ui",
- "osrf-ui",
-]
-
-[[package]]
-name = "osrf-profile-t114-ui-rx-470"
-version = "0.1.0"
-dependencies = [
- "cortex-m",
- "cortex-m-rt",
- "defmt-rtt",
- "embassy-executor",
- "osrf-board-t114",
- "osrf-profile-t114-ui",
- "osrf-ui",
-]
-
-[[package]]
-name = "osrf-profile-t114-ui-rx-diversity"
-version = "0.1.0"
-dependencies = [
- "cortex-m",
- "cortex-m-rt",
- "defmt-rtt",
- "embassy-executor",
- "osrf-board-t114",
- "osrf-profile-t114-ui",
- "osrf-ui",
-]
-
-[[package]]
-name = "osrf-profile-t114-ui-tx"
-version = "0.1.0"
-dependencies = [
- "cortex-m",
- "cortex-m-rt",
- "defmt-rtt",
- "embassy-executor",
- "osrf-board-t114",
- "osrf-profile-t114-ui",
- "osrf-ui",
-]
-
-[[package]]
-name = "osrf-profile-t114-ui-tx-470"
-version = "0.1.0"
-dependencies = [
- "cortex-m",
- "cortex-m-rt",
- "defmt-rtt",
- "embassy-executor",
- "osrf-board-t114",
- "osrf-profile-t114-ui",
- "osrf-ui",
 ]
 
 [[package]]

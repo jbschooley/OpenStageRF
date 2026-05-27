@@ -1,0 +1,8 @@
+# T114 UI transmitter on the synthetic scenario source, 470–514 MHz.
+app       = "t114_ui"
+board     = "t114"
+role      = "tx"
+tx_source = "scenario"
+diversity = false
+band      = "470"
+keys      = "osrf-keys.toml"

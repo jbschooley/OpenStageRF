@@ -1,0 +1,7 @@
+# T114 UI receiver, single radio, 902–928 MHz.
+app       = "t114_ui"
+board     = "t114"
+role      = "rx"
+diversity = false
+band      = "915"
+keys      = "osrf-keys.toml"
