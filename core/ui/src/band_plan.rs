@@ -121,13 +121,46 @@ pub enum BandPlan {
     /// (SX1268, not SX1262) — build a 470 profile, don't switch to it
     /// on 915 hardware (the radio can't tune here).
     Band470,
-    /// 470 MHz coexistence plan aligned to **Sennheiser ew G4 band A1**
-    /// (470–516 MHz; we span 471–506 within our 470–510 hardware range).
-    /// For an OpenStageRF link running alongside Sennheiser A1 gear.
-    /// **Channels are evenly spaced within A1, not Sennheiser's
-    /// proprietary intermod-coordinated bank frequencies** — same stub
-    /// caveat as [`BandPlan::Sennheiser`]; refine with real coordination data.
-    SennheiserA1,
+    /// Sennheiser ew IEM G4 **A1 Bank 1** — 16 intermod-free presets.
+    SennheiserA1B1,
+    /// Sennheiser ew IEM G4 **A1 Bank 2** — 15 intermod-free presets.
+    SennheiserA1B2,
+    /// Sennheiser ew IEM G4 **A1 Bank 3** — 16 intermod-free presets.
+    SennheiserA1B3,
+    /// Sennheiser ew IEM G4 **A1 Bank 4** — 16 intermod-free presets.
+    SennheiserA1B4,
+    /// Sennheiser ew IEM G4 **A1 Bank 5** — 16 intermod-free presets.
+    SennheiserA1B5,
+    /// Sennheiser ew IEM G4 **A1 Bank 6** — 15 intermod-free presets.
+    SennheiserA1B6,
+    /// Sennheiser ew IEM G4 **A1 Bank 7** — 16 intermod-free presets.
+    SennheiserA1B7,
+    /// Sennheiser ew IEM G4 **A1 Bank 8** — 16 intermod-free presets.
+    SennheiserA1B8,
+    /// Sennheiser ew IEM G4 **A1 Bank 9** — 16 intermod-free presets.
+    SennheiserA1B9,
+    /// Sennheiser ew IEM G4 **A1 Bank 10** — 15 intermod-free presets.
+    SennheiserA1B10,
+    /// Sennheiser ew IEM G4 **A1 Bank 11** — 16 intermod-free presets.
+    SennheiserA1B11,
+    /// Sennheiser ew IEM G4 **A1 Bank 12** — 16 intermod-free presets.
+    SennheiserA1B12,
+    /// Sennheiser ew IEM G4 **A1 Bank 13** — 16 intermod-free presets.
+    SennheiserA1B13,
+    /// Sennheiser ew IEM G4 **A1 Bank 14** — 16 intermod-free presets.
+    SennheiserA1B14,
+    /// Sennheiser ew IEM G4 **A1 Bank 15** — 16 intermod-free presets.
+    SennheiserA1B15,
+    /// Sennheiser ew IEM G4 **A1 Bank 16** — 16 intermod-free presets.
+    SennheiserA1B16,
+    /// Sennheiser ew IEM G4 **A1 Bank 17** — 16 intermod-free presets.
+    SennheiserA1B17,
+    /// Sennheiser ew IEM G4 **A1 Bank 18** — 16 intermod-free presets.
+    SennheiserA1B18,
+    /// Sennheiser ew IEM G4 **A1 Bank 19** — 16 intermod-free presets.
+    SennheiserA1B19,
+    /// Sennheiser ew IEM G4 **A1 Bank 20** — 16 intermod-free presets.
+    SennheiserA1B20,
     /// Shure SLX-D **G58 Group 1 (Full Range 1)** — 31 channels.
     ShureG58G1,
     /// Shure SLX-D **G58 Group 2 (Full Range 2)** — 30 channels.
@@ -182,7 +215,26 @@ impl BandPlan {
             BandPlan::DenseHi => &DENSE_HI,
             BandPlan::Wide => &WIDE,
             BandPlan::Band470 => &BAND_470,
-            BandPlan::SennheiserA1 => &BAND_470_SENNHEISER_A1,
+            BandPlan::SennheiserA1B1 => &BAND_470_SENN_A1_B1,
+            BandPlan::SennheiserA1B2 => &BAND_470_SENN_A1_B2,
+            BandPlan::SennheiserA1B3 => &BAND_470_SENN_A1_B3,
+            BandPlan::SennheiserA1B4 => &BAND_470_SENN_A1_B4,
+            BandPlan::SennheiserA1B5 => &BAND_470_SENN_A1_B5,
+            BandPlan::SennheiserA1B6 => &BAND_470_SENN_A1_B6,
+            BandPlan::SennheiserA1B7 => &BAND_470_SENN_A1_B7,
+            BandPlan::SennheiserA1B8 => &BAND_470_SENN_A1_B8,
+            BandPlan::SennheiserA1B9 => &BAND_470_SENN_A1_B9,
+            BandPlan::SennheiserA1B10 => &BAND_470_SENN_A1_B10,
+            BandPlan::SennheiserA1B11 => &BAND_470_SENN_A1_B11,
+            BandPlan::SennheiserA1B12 => &BAND_470_SENN_A1_B12,
+            BandPlan::SennheiserA1B13 => &BAND_470_SENN_A1_B13,
+            BandPlan::SennheiserA1B14 => &BAND_470_SENN_A1_B14,
+            BandPlan::SennheiserA1B15 => &BAND_470_SENN_A1_B15,
+            BandPlan::SennheiserA1B16 => &BAND_470_SENN_A1_B16,
+            BandPlan::SennheiserA1B17 => &BAND_470_SENN_A1_B17,
+            BandPlan::SennheiserA1B18 => &BAND_470_SENN_A1_B18,
+            BandPlan::SennheiserA1B19 => &BAND_470_SENN_A1_B19,
+            BandPlan::SennheiserA1B20 => &BAND_470_SENN_A1_B20,
             BandPlan::ShureG58G1 => &BAND_470_SHURE_G58_G1,
             BandPlan::ShureG58G2 => &BAND_470_SHURE_G58_G2,
             BandPlan::ShureG58G3 => &BAND_470_SHURE_G58_G3,
@@ -223,7 +275,26 @@ pub const BAND_PLANS: &[BandPlan] = &[
     BandPlan::DenseHi,
     BandPlan::Wide,
     BandPlan::Band470,
-    BandPlan::SennheiserA1,
+    BandPlan::SennheiserA1B1,
+    BandPlan::SennheiserA1B2,
+    BandPlan::SennheiserA1B3,
+    BandPlan::SennheiserA1B4,
+    BandPlan::SennheiserA1B5,
+    BandPlan::SennheiserA1B6,
+    BandPlan::SennheiserA1B7,
+    BandPlan::SennheiserA1B8,
+    BandPlan::SennheiserA1B9,
+    BandPlan::SennheiserA1B10,
+    BandPlan::SennheiserA1B11,
+    BandPlan::SennheiserA1B12,
+    BandPlan::SennheiserA1B13,
+    BandPlan::SennheiserA1B14,
+    BandPlan::SennheiserA1B15,
+    BandPlan::SennheiserA1B16,
+    BandPlan::SennheiserA1B17,
+    BandPlan::SennheiserA1B18,
+    BandPlan::SennheiserA1B19,
+    BandPlan::SennheiserA1B20,
     BandPlan::ShureG58G1,
     BandPlan::ShureG58G2,
     BandPlan::ShureG58G3,
@@ -260,7 +331,26 @@ pub const BAND_PLANS_915: &[BandPlan] = &[
 /// Menu band-plan list for 470–510 MHz (SX1268) builds.
 pub const BAND_PLANS_470: &[BandPlan] = &[
     BandPlan::Band470,
-    BandPlan::SennheiserA1,
+    BandPlan::SennheiserA1B1,
+    BandPlan::SennheiserA1B2,
+    BandPlan::SennheiserA1B3,
+    BandPlan::SennheiserA1B4,
+    BandPlan::SennheiserA1B5,
+    BandPlan::SennheiserA1B6,
+    BandPlan::SennheiserA1B7,
+    BandPlan::SennheiserA1B8,
+    BandPlan::SennheiserA1B9,
+    BandPlan::SennheiserA1B10,
+    BandPlan::SennheiserA1B11,
+    BandPlan::SennheiserA1B12,
+    BandPlan::SennheiserA1B13,
+    BandPlan::SennheiserA1B14,
+    BandPlan::SennheiserA1B15,
+    BandPlan::SennheiserA1B16,
+    BandPlan::SennheiserA1B17,
+    BandPlan::SennheiserA1B18,
+    BandPlan::SennheiserA1B19,
+    BandPlan::SennheiserA1B20,
     BandPlan::ShureG58G1,
     BandPlan::ShureG58G2,
     BandPlan::ShureG58G3,
@@ -830,22 +920,500 @@ static BAND_470: BandPlanInfo = BandPlanInfo {
     ],
 };
 
-/// 470 MHz coexistence plan aligned to Sennheiser ew G4 band A1
-/// (470–516 MHz).  8 channels evenly spaced within our 470–510 hardware
-/// range (471–506 MHz, 5 MHz apart).  See [`BandPlan::SennheiserA1`] for
-/// the stub caveat (not Sennheiser's coordinated bank frequencies).
-#[rustfmt::skip] // Channel table; one-line entries read as a frequency map.
-static BAND_470_SENNHEISER_A1: BandPlanInfo = BandPlanInfo {
-    label: "Senn A1",
+/// Sennheiser ew IEM G4 A1 Bank 1 (16 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B1: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-1",
     channels: &[
-        ChannelInfo { label: "01", frequency_khz: 471_000 },
-        ChannelInfo { label: "02", frequency_khz: 476_000 },
-        ChannelInfo { label: "03", frequency_khz: 481_000 },
-        ChannelInfo { label: "04", frequency_khz: 486_000 },
-        ChannelInfo { label: "05", frequency_khz: 491_000 },
-        ChannelInfo { label: "06", frequency_khz: 496_000 },
-        ChannelInfo { label: "07", frequency_khz: 501_000 },
-        ChannelInfo { label: "08", frequency_khz: 506_000 },
+        ChannelInfo { label: "01", frequency_khz: 470_100 },
+        ChannelInfo { label: "02", frequency_khz: 470_500 },
+        ChannelInfo { label: "03", frequency_khz: 471_050 },
+        ChannelInfo { label: "04", frequency_khz: 471_750 },
+        ChannelInfo { label: "05", frequency_khz: 472_200 },
+        ChannelInfo { label: "06", frequency_khz: 472_800 },
+        ChannelInfo { label: "07", frequency_khz: 473_650 },
+        ChannelInfo { label: "08", frequency_khz: 474_750 },
+        ChannelInfo { label: "09", frequency_khz: 475_250 },
+        ChannelInfo { label: "10", frequency_khz: 506_150 },
+        ChannelInfo { label: "11", frequency_khz: 506_950 },
+        ChannelInfo { label: "12", frequency_khz: 511_000 },
+        ChannelInfo { label: "13", frequency_khz: 508_500 },
+        ChannelInfo { label: "14", frequency_khz: 512_300 },
+        ChannelInfo { label: "15", frequency_khz: 514_350 },
+        ChannelInfo { label: "16", frequency_khz: 515_550 },
+    ],
+};
+
+/// Sennheiser ew IEM G4 A1 Bank 2 (15 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B2: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-2",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 476_100 },
+        ChannelInfo { label: "02", frequency_khz: 476_500 },
+        ChannelInfo { label: "03", frequency_khz: 477_050 },
+        ChannelInfo { label: "04", frequency_khz: 478_200 },
+        ChannelInfo { label: "05", frequency_khz: 488_100 },
+        ChannelInfo { label: "06", frequency_khz: 488_600 },
+        ChannelInfo { label: "07", frequency_khz: 489_450 },
+        ChannelInfo { label: "08", frequency_khz: 490_050 },
+        ChannelInfo { label: "09", frequency_khz: 491_050 },
+        ChannelInfo { label: "10", frequency_khz: 491_800 },
+        ChannelInfo { label: "11", frequency_khz: 492_250 },
+        ChannelInfo { label: "12", frequency_khz: 492_900 },
+        ChannelInfo { label: "13", frequency_khz: 473_200 },
+        ChannelInfo { label: "14", frequency_khz: 506_150 },
+        ChannelInfo { label: "15", frequency_khz: 511_800 },
+    ],
+};
+
+/// Sennheiser ew IEM G4 A1 Bank 3 (16 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B3: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-3",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 488_100 },
+        ChannelInfo { label: "02", frequency_khz: 488_500 },
+        ChannelInfo { label: "03", frequency_khz: 489_050 },
+        ChannelInfo { label: "04", frequency_khz: 489_750 },
+        ChannelInfo { label: "05", frequency_khz: 490_200 },
+        ChannelInfo { label: "06", frequency_khz: 490_800 },
+        ChannelInfo { label: "07", frequency_khz: 491_550 },
+        ChannelInfo { label: "08", frequency_khz: 492_750 },
+        ChannelInfo { label: "09", frequency_khz: 506_100 },
+        ChannelInfo { label: "10", frequency_khz: 507_200 },
+        ChannelInfo { label: "11", frequency_khz: 509_250 },
+        ChannelInfo { label: "12", frequency_khz: 510_700 },
+        ChannelInfo { label: "13", frequency_khz: 511_600 },
+        ChannelInfo { label: "14", frequency_khz: 502_300 },
+        ChannelInfo { label: "15", frequency_khz: 505_600 },
+        ChannelInfo { label: "16", frequency_khz: 510_050 },
+    ],
+};
+
+/// Sennheiser ew IEM G4 A1 Bank 4 (16 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B4: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-4",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 494_100 },
+        ChannelInfo { label: "02", frequency_khz: 494_500 },
+        ChannelInfo { label: "03", frequency_khz: 495_050 },
+        ChannelInfo { label: "04", frequency_khz: 495_750 },
+        ChannelInfo { label: "05", frequency_khz: 496_200 },
+        ChannelInfo { label: "06", frequency_khz: 496_800 },
+        ChannelInfo { label: "07", frequency_khz: 497_550 },
+        ChannelInfo { label: "08", frequency_khz: 498_750 },
+        ChannelInfo { label: "09", frequency_khz: 499_750 },
+        ChannelInfo { label: "10", frequency_khz: 471_400 },
+        ChannelInfo { label: "11", frequency_khz: 473_750 },
+        ChannelInfo { label: "12", frequency_khz: 474_250 },
+        ChannelInfo { label: "13", frequency_khz: 475_150 },
+        ChannelInfo { label: "14", frequency_khz: 475_800 },
+        ChannelInfo { label: "15", frequency_khz: 470_100 },
+        ChannelInfo { label: "16", frequency_khz: 504_850 },
+    ],
+};
+
+/// Sennheiser ew IEM G4 A1 Bank 5 (16 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B5: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-5",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 500_100 },
+        ChannelInfo { label: "02", frequency_khz: 500_500 },
+        ChannelInfo { label: "03", frequency_khz: 501_050 },
+        ChannelInfo { label: "04", frequency_khz: 501_750 },
+        ChannelInfo { label: "05", frequency_khz: 502_200 },
+        ChannelInfo { label: "06", frequency_khz: 502_800 },
+        ChannelInfo { label: "07", frequency_khz: 503_600 },
+        ChannelInfo { label: "08", frequency_khz: 504_800 },
+        ChannelInfo { label: "09", frequency_khz: 505_650 },
+        ChannelInfo { label: "10", frequency_khz: 471_700 },
+        ChannelInfo { label: "11", frequency_khz: 472_450 },
+        ChannelInfo { label: "12", frequency_khz: 474_350 },
+        ChannelInfo { label: "13", frequency_khz: 475_650 },
+        ChannelInfo { label: "14", frequency_khz: 470_250 },
+        ChannelInfo { label: "15", frequency_khz: 478_050 },
+        ChannelInfo { label: "16", frequency_khz: 480_300 },
+    ],
+};
+
+/// Sennheiser ew IEM G4 A1 Bank 6 (15 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B6: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-6",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 506_100 },
+        ChannelInfo { label: "02", frequency_khz: 506_500 },
+        ChannelInfo { label: "03", frequency_khz: 507_450 },
+        ChannelInfo { label: "04", frequency_khz: 508_000 },
+        ChannelInfo { label: "05", frequency_khz: 509_250 },
+        ChannelInfo { label: "06", frequency_khz: 509_700 },
+        ChannelInfo { label: "07", frequency_khz: 510_800 },
+        ChannelInfo { label: "08", frequency_khz: 511_700 },
+        ChannelInfo { label: "09", frequency_khz: 470_100 },
+        ChannelInfo { label: "10", frequency_khz: 474_950 },
+        ChannelInfo { label: "11", frequency_khz: 481_500 },
+        ChannelInfo { label: "12", frequency_khz: 471_700 },
+        ChannelInfo { label: "13", frequency_khz: 477_100 },
+        ChannelInfo { label: "14", frequency_khz: 473_000 },
+        ChannelInfo { label: "15", frequency_khz: 475_650 },
+    ],
+};
+
+/// Sennheiser ew IEM G4 A1 Bank 7 (16 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B7: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-7",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 470_200 },
+        ChannelInfo { label: "02", frequency_khz: 470_600 },
+        ChannelInfo { label: "03", frequency_khz: 471_150 },
+        ChannelInfo { label: "04", frequency_khz: 471_850 },
+        ChannelInfo { label: "05", frequency_khz: 472_300 },
+        ChannelInfo { label: "06", frequency_khz: 472_900 },
+        ChannelInfo { label: "07", frequency_khz: 473_650 },
+        ChannelInfo { label: "08", frequency_khz: 474_850 },
+        ChannelInfo { label: "09", frequency_khz: 506_300 },
+        ChannelInfo { label: "10", frequency_khz: 508_550 },
+        ChannelInfo { label: "11", frequency_khz: 509_400 },
+        ChannelInfo { label: "12", frequency_khz: 511_750 },
+        ChannelInfo { label: "13", frequency_khz: 504_250 },
+        ChannelInfo { label: "14", frequency_khz: 503_350 },
+        ChannelInfo { label: "15", frequency_khz: 501_500 },
+        ChannelInfo { label: "16", frequency_khz: 504_900 },
+    ],
+};
+
+/// Sennheiser ew IEM G4 A1 Bank 8 (16 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B8: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-8",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 488_200 },
+        ChannelInfo { label: "02", frequency_khz: 488_600 },
+        ChannelInfo { label: "03", frequency_khz: 489_150 },
+        ChannelInfo { label: "04", frequency_khz: 489_850 },
+        ChannelInfo { label: "05", frequency_khz: 490_700 },
+        ChannelInfo { label: "06", frequency_khz: 491_300 },
+        ChannelInfo { label: "07", frequency_khz: 492_600 },
+        ChannelInfo { label: "08", frequency_khz: 493_050 },
+        ChannelInfo { label: "09", frequency_khz: 470_250 },
+        ChannelInfo { label: "10", frequency_khz: 470_750 },
+        ChannelInfo { label: "11", frequency_khz: 472_250 },
+        ChannelInfo { label: "12", frequency_khz: 473_050 },
+        ChannelInfo { label: "13", frequency_khz: 477_750 },
+        ChannelInfo { label: "14", frequency_khz: 482_900 },
+        ChannelInfo { label: "15", frequency_khz: 475_500 },
+        ChannelInfo { label: "16", frequency_khz: 483_950 },
+    ],
+};
+
+/// Sennheiser ew IEM G4 A1 Bank 9 (16 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B9: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-9",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 476_200 },
+        ChannelInfo { label: "02", frequency_khz: 476_600 },
+        ChannelInfo { label: "03", frequency_khz: 477_150 },
+        ChannelInfo { label: "04", frequency_khz: 477_850 },
+        ChannelInfo { label: "05", frequency_khz: 478_300 },
+        ChannelInfo { label: "06", frequency_khz: 506_800 },
+        ChannelInfo { label: "07", frequency_khz: 507_700 },
+        ChannelInfo { label: "08", frequency_khz: 508_350 },
+        ChannelInfo { label: "09", frequency_khz: 509_550 },
+        ChannelInfo { label: "10", frequency_khz: 510_300 },
+        ChannelInfo { label: "11", frequency_khz: 510_900 },
+        ChannelInfo { label: "12", frequency_khz: 511_700 },
+        ChannelInfo { label: "13", frequency_khz: 502_850 },
+        ChannelInfo { label: "14", frequency_khz: 500_850 },
+        ChannelInfo { label: "15", frequency_khz: 500_350 },
+        ChannelInfo { label: "16", frequency_khz: 503_900 },
+    ],
+};
+
+/// Sennheiser ew IEM G4 A1 Bank 10 (15 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B10: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-10",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 488_400 },
+        ChannelInfo { label: "02", frequency_khz: 488_850 },
+        ChannelInfo { label: "03", frequency_khz: 489_450 },
+        ChannelInfo { label: "04", frequency_khz: 490_300 },
+        ChannelInfo { label: "05", frequency_khz: 490_800 },
+        ChannelInfo { label: "06", frequency_khz: 491_450 },
+        ChannelInfo { label: "07", frequency_khz: 492_350 },
+        ChannelInfo { label: "08", frequency_khz: 493_050 },
+        ChannelInfo { label: "09", frequency_khz: 493_600 },
+        ChannelInfo { label: "10", frequency_khz: 471_500 },
+        ChannelInfo { label: "11", frequency_khz: 473_150 },
+        ChannelInfo { label: "12", frequency_khz: 474_150 },
+        ChannelInfo { label: "13", frequency_khz: 484_300 },
+        ChannelInfo { label: "14", frequency_khz: 483_500 },
+        ChannelInfo { label: "15", frequency_khz: 476_000 },
+    ],
+};
+
+/// Sennheiser ew IEM G4 A1 Bank 11 (16 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B11: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-11",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 470_100 },
+        ChannelInfo { label: "02", frequency_khz: 470_500 },
+        ChannelInfo { label: "03", frequency_khz: 471_050 },
+        ChannelInfo { label: "04", frequency_khz: 471_750 },
+        ChannelInfo { label: "05", frequency_khz: 472_200 },
+        ChannelInfo { label: "06", frequency_khz: 472_800 },
+        ChannelInfo { label: "07", frequency_khz: 473_550 },
+        ChannelInfo { label: "08", frequency_khz: 475_700 },
+        ChannelInfo { label: "09", frequency_khz: 485_850 },
+        ChannelInfo { label: "10", frequency_khz: 488_200 },
+        ChannelInfo { label: "11", frequency_khz: 491_200 },
+        ChannelInfo { label: "12", frequency_khz: 493_250 },
+        ChannelInfo { label: "13", frequency_khz: 495_650 },
+        ChannelInfo { label: "14", frequency_khz: 501_800 },
+        ChannelInfo { label: "15", frequency_khz: 503_350 },
+        ChannelInfo { label: "16", frequency_khz: 505_600 },
+    ],
+};
+
+/// Sennheiser ew IEM G4 A1 Bank 12 (16 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B12: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-12",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 478_100 },
+        ChannelInfo { label: "02", frequency_khz: 479_050 },
+        ChannelInfo { label: "03", frequency_khz: 480_200 },
+        ChannelInfo { label: "04", frequency_khz: 480_800 },
+        ChannelInfo { label: "05", frequency_khz: 481_550 },
+        ChannelInfo { label: "06", frequency_khz: 483_700 },
+        ChannelInfo { label: "07", frequency_khz: 484_350 },
+        ChannelInfo { label: "08", frequency_khz: 485_150 },
+        ChannelInfo { label: "09", frequency_khz: 470_100 },
+        ChannelInfo { label: "10", frequency_khz: 471_200 },
+        ChannelInfo { label: "11", frequency_khz: 472_100 },
+        ChannelInfo { label: "12", frequency_khz: 489_900 },
+        ChannelInfo { label: "13", frequency_khz: 492_500 },
+        ChannelInfo { label: "14", frequency_khz: 493_900 },
+        ChannelInfo { label: "15", frequency_khz: 500_450 },
+        ChannelInfo { label: "16", frequency_khz: 504_500 },
+    ],
+};
+
+/// Sennheiser ew IEM G4 A1 Bank 13 (16 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B13: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-13",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 486_100 },
+        ChannelInfo { label: "02", frequency_khz: 486_500 },
+        ChannelInfo { label: "03", frequency_khz: 487_050 },
+        ChannelInfo { label: "04", frequency_khz: 487_750 },
+        ChannelInfo { label: "05", frequency_khz: 488_200 },
+        ChannelInfo { label: "06", frequency_khz: 488_800 },
+        ChannelInfo { label: "07", frequency_khz: 489_550 },
+        ChannelInfo { label: "08", frequency_khz: 491_700 },
+        ChannelInfo { label: "09", frequency_khz: 492_350 },
+        ChannelInfo { label: "10", frequency_khz: 493_150 },
+        ChannelInfo { label: "11", frequency_khz: 470_100 },
+        ChannelInfo { label: "12", frequency_khz: 471_950 },
+        ChannelInfo { label: "13", frequency_khz: 473_350 },
+        ChannelInfo { label: "14", frequency_khz: 475_250 },
+        ChannelInfo { label: "15", frequency_khz: 476_450 },
+        ChannelInfo { label: "16", frequency_khz: 501_850 },
+    ],
+};
+
+/// Sennheiser ew IEM G4 A1 Bank 14 (16 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B14: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-14",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 494_100 },
+        ChannelInfo { label: "02", frequency_khz: 494_500 },
+        ChannelInfo { label: "03", frequency_khz: 495_050 },
+        ChannelInfo { label: "04", frequency_khz: 495_750 },
+        ChannelInfo { label: "05", frequency_khz: 496_200 },
+        ChannelInfo { label: "06", frequency_khz: 496_800 },
+        ChannelInfo { label: "07", frequency_khz: 497_550 },
+        ChannelInfo { label: "08", frequency_khz: 499_700 },
+        ChannelInfo { label: "09", frequency_khz: 500_350 },
+        ChannelInfo { label: "10", frequency_khz: 501_150 },
+        ChannelInfo { label: "11", frequency_khz: 501_650 },
+        ChannelInfo { label: "12", frequency_khz: 470_100 },
+        ChannelInfo { label: "13", frequency_khz: 471_950 },
+        ChannelInfo { label: "14", frequency_khz: 473_350 },
+        ChannelInfo { label: "15", frequency_khz: 475_250 },
+        ChannelInfo { label: "16", frequency_khz: 479_050 },
+    ],
+};
+
+/// Sennheiser ew IEM G4 A1 Bank 15 (16 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B15: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-15",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 502_100 },
+        ChannelInfo { label: "02", frequency_khz: 502_500 },
+        ChannelInfo { label: "03", frequency_khz: 503_050 },
+        ChannelInfo { label: "04", frequency_khz: 503_750 },
+        ChannelInfo { label: "05", frequency_khz: 504_200 },
+        ChannelInfo { label: "06", frequency_khz: 504_800 },
+        ChannelInfo { label: "07", frequency_khz: 505_550 },
+        ChannelInfo { label: "08", frequency_khz: 507_700 },
+        ChannelInfo { label: "09", frequency_khz: 508_350 },
+        ChannelInfo { label: "10", frequency_khz: 509_150 },
+        ChannelInfo { label: "11", frequency_khz: 509_650 },
+        ChannelInfo { label: "12", frequency_khz: 470_100 },
+        ChannelInfo { label: "13", frequency_khz: 471_950 },
+        ChannelInfo { label: "14", frequency_khz: 473_350 },
+        ChannelInfo { label: "15", frequency_khz: 475_250 },
+        ChannelInfo { label: "16", frequency_khz: 476_450 },
+    ],
+};
+
+/// Sennheiser ew IEM G4 A1 Bank 16 (16 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B16: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-16",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 510_100 },
+        ChannelInfo { label: "02", frequency_khz: 510_500 },
+        ChannelInfo { label: "03", frequency_khz: 511_050 },
+        ChannelInfo { label: "04", frequency_khz: 511_750 },
+        ChannelInfo { label: "05", frequency_khz: 512_250 },
+        ChannelInfo { label: "06", frequency_khz: 513_150 },
+        ChannelInfo { label: "07", frequency_khz: 513_800 },
+        ChannelInfo { label: "08", frequency_khz: 514_250 },
+        ChannelInfo { label: "09", frequency_khz: 514_850 },
+        ChannelInfo { label: "10", frequency_khz: 515_600 },
+        ChannelInfo { label: "11", frequency_khz: 470_100 },
+        ChannelInfo { label: "12", frequency_khz: 470_900 },
+        ChannelInfo { label: "13", frequency_khz: 472_050 },
+        ChannelInfo { label: "14", frequency_khz: 474_300 },
+        ChannelInfo { label: "15", frequency_khz: 475_300 },
+        ChannelInfo { label: "16", frequency_khz: 478_950 },
+    ],
+};
+
+/// Sennheiser ew IEM G4 A1 Bank 17 (16 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B17: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-17",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 470_100 },
+        ChannelInfo { label: "02", frequency_khz: 470_850 },
+        ChannelInfo { label: "03", frequency_khz: 471_450 },
+        ChannelInfo { label: "04", frequency_khz: 471_900 },
+        ChannelInfo { label: "05", frequency_khz: 472_550 },
+        ChannelInfo { label: "06", frequency_khz: 473_450 },
+        ChannelInfo { label: "07", frequency_khz: 473_950 },
+        ChannelInfo { label: "08", frequency_khz: 474_650 },
+        ChannelInfo { label: "09", frequency_khz: 475_200 },
+        ChannelInfo { label: "10", frequency_khz: 475_600 },
+        ChannelInfo { label: "11", frequency_khz: 482_850 },
+        ChannelInfo { label: "12", frequency_khz: 485_225 },
+        ChannelInfo { label: "13", frequency_khz: 487_775 },
+        ChannelInfo { label: "14", frequency_khz: 497_500 },
+        ChannelInfo { label: "15", frequency_khz: 501_950 },
+        ChannelInfo { label: "16", frequency_khz: 503_250 },
+    ],
+};
+
+/// Sennheiser ew IEM G4 A1 Bank 18 (16 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B18: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-18",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 476_150 },
+        ChannelInfo { label: "02", frequency_khz: 476_650 },
+        ChannelInfo { label: "03", frequency_khz: 477_450 },
+        ChannelInfo { label: "04", frequency_khz: 478_100 },
+        ChannelInfo { label: "05", frequency_khz: 480_250 },
+        ChannelInfo { label: "06", frequency_khz: 481_000 },
+        ChannelInfo { label: "07", frequency_khz: 483_300 },
+        ChannelInfo { label: "08", frequency_khz: 483_700 },
+        ChannelInfo { label: "09", frequency_khz: 487_750 },
+        ChannelInfo { label: "10", frequency_khz: 489_750 },
+        ChannelInfo { label: "11", frequency_khz: 500_400 },
+        ChannelInfo { label: "12", frequency_khz: 502_650 },
+        ChannelInfo { label: "13", frequency_khz: 504_250 },
+        ChannelInfo { label: "14", frequency_khz: 506_900 },
+        ChannelInfo { label: "15", frequency_khz: 509_350 },
+        ChannelInfo { label: "16", frequency_khz: 510_550 },
+    ],
+};
+
+/// Sennheiser ew IEM G4 A1 Bank 19 (16 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B19: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-19",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 470_100 },
+        ChannelInfo { label: "02", frequency_khz: 470_500 },
+        ChannelInfo { label: "03", frequency_khz: 471_050 },
+        ChannelInfo { label: "04", frequency_khz: 471_750 },
+        ChannelInfo { label: "05", frequency_khz: 472_800 },
+        ChannelInfo { label: "06", frequency_khz: 473_550 },
+        ChannelInfo { label: "07", frequency_khz: 474_750 },
+        ChannelInfo { label: "08", frequency_khz: 475_750 },
+        ChannelInfo { label: "09", frequency_khz: 477_150 },
+        ChannelInfo { label: "10", frequency_khz: 479_150 },
+        ChannelInfo { label: "11", frequency_khz: 479_950 },
+        ChannelInfo { label: "12", frequency_khz: 482_300 },
+        ChannelInfo { label: "13", frequency_khz: 484_450 },
+        ChannelInfo { label: "14", frequency_khz: 484_950 },
+        ChannelInfo { label: "15", frequency_khz: 489_550 },
+        ChannelInfo { label: "16", frequency_khz: 490_450 },
+    ],
+};
+
+/// Sennheiser ew IEM G4 A1 Bank 20 (16 presets).  Source: Sennheiser
+/// "ew IEM G4 A1 Range Frequency Sheet" (01/2018, 578636/A01).
+#[rustfmt::skip]
+static BAND_470_SENN_A1_B20: BandPlanInfo = BandPlanInfo {
+    label: "Senn A1-20",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 470_100 },
+        ChannelInfo { label: "02", frequency_khz: 473_600 },
+        ChannelInfo { label: "03", frequency_khz: 475_650 },
+        ChannelInfo { label: "04", frequency_khz: 477_550 },
+        ChannelInfo { label: "05", frequency_khz: 484_750 },
+        ChannelInfo { label: "06", frequency_khz: 491_000 },
+        ChannelInfo { label: "07", frequency_khz: 492_600 },
+        ChannelInfo { label: "08", frequency_khz: 495_450 },
+        ChannelInfo { label: "09", frequency_khz: 496_350 },
+        ChannelInfo { label: "10", frequency_khz: 500_950 },
+        ChannelInfo { label: "11", frequency_khz: 501_450 },
+        ChannelInfo { label: "12", frequency_khz: 503_600 },
+        ChannelInfo { label: "13", frequency_khz: 505_950 },
+        ChannelInfo { label: "14", frequency_khz: 506_750 },
+        ChannelInfo { label: "15", frequency_khz: 510_150 },
+        ChannelInfo { label: "16", frequency_khz: 511_150 },
     ],
 };
 
@@ -1434,7 +2002,7 @@ mod tests {
             for c in p.info().channels {
                 // Every channel must sit in a band we support: 470–510 MHz
                 // (SX1268) or 902–928 MHz US ISM (SX1262).
-                let in_470 = (470_000..=514_000).contains(&c.frequency_khz);
+                let in_470 = (470_000..=516_000).contains(&c.frequency_khz);
                 let in_ism = (902_000..=928_000).contains(&c.frequency_khz);
                 assert!(
                     in_470 || in_ism,
