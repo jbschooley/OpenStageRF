@@ -1,0 +1,8 @@
+# T114 UI transmitter — DIN MIDI in, 470–514 MHz (CN470/SX1268).
+app       = "t114_ui"
+board     = "t114"
+role      = "tx"
+tx_source = "uart"
+diversity = false
+band      = "470"
+keys      = "osrf-keys.toml"

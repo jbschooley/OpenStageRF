@@ -4,26 +4,26 @@ Open-source firmware platform for low-latency wireless MIDI (and experimental au
 
 ## Flashing (T114)
 
-`cargo xtask run <profile>` builds for the board's target, flashes via probe-rs, and attaches RTT logs (Ctrl-C to detach). Current profiles:
+`cargo xtask run <profile>` builds for the board's target, flashes via probe-rs, and attaches RTT logs (Ctrl-C to detach). A **profile** is a TOML file in [`configs/`](configs/) — role / tx_source / diversity / band are baked in at build time (the generic `t114_ui` UI binary is configured per build, not a crate per deployment). Current UI profiles:
 
 ```bash
 # 902–928 MHz (SX1262) hardware:
-cargo xtask run t114_ui_tx            # UI transmitter — DIN MIDI in from the FeatherWing UART
-cargo xtask run t114_ui_rx_diversity  # UI receiver with dual-SPI receive diversity (on-board SX1262 + DX-LR30 on SPI3)
-cargo xtask run t114_ui_rx            # UI receiver — single radio
-cargo xtask run t114_ui_bench_tx      # UI transmitter driven by the built-in synthetic MIDI scenario source (no DIN needed)
+cargo xtask run ui_tx            # UI transmitter — DIN MIDI in from the FeatherWing UART
+cargo xtask run ui_rx_diversity  # UI receiver with dual-SPI receive diversity (on-board SX1262 + DX-LR30 on SPI3)
+cargo xtask run ui_rx            # UI receiver — single radio
+cargo xtask run ui_bench_tx      # UI transmitter driven by the built-in synthetic MIDI scenario source (no DIN needed)
 
-# 470–510 MHz (SX1268) hardware — same UI, 470 band plan:
-cargo xtask run t114_ui_tx_470
-cargo xtask run t114_ui_rx_470
-cargo xtask run t114_ui_bench_tx_470
+# 470–514 MHz (CN470/SX1268) hardware — same UI, 470 band plans:
+cargo xtask run ui_tx_470
+cargo xtask run ui_rx_470
+cargo xtask run ui_bench_tx_470
 ```
 
-The `_470` profiles are identical to their 900 MHz counterparts but ship the 470–510 MHz band plan (the Band Plan menu shows only the band the radio can tune). Flash the variant matching your hardware.
+The `_470` profiles are identical to their 900 MHz counterparts but ship the 470–514 MHz band plans (the Band Plan menu shows only the band the radio can tune). Flash the variant matching your hardware. **Adding a profile = drop a `.toml` in `configs/`** — see [`configs/README.md`](configs/README.md) for the schema; no new crate needed.
 
 To capture logs to a file: `cargo xtask run <profile> 2>&1 | tee run.log`. If two probes are connected, flash one at a time (the xtask doesn't pass a `--probe` selector).
 
-**AEAD keys** are baked into UI builds at build time from `osrf-keys.toml` at the repo root (gitignored; copy `osrf-keys.toml.example`). Each top-level table is one key (table name = display name) and all of them appear in the device's Key menu; `active = "<name>"` picks the boot default. Paired TX/RX units must build with the same key and have it selected. With no key file the build falls back to insecure test keys and prints a `NOT FOR PRODUCTION` warning. Override the path per build with `OSRF_KEYS_FILE=/path/to/show.toml cargo xtask run t114_ui_tx`.
+**AEAD keys** are baked into UI builds at build time from `osrf-keys.toml` at the repo root (gitignored; copy `osrf-keys.toml.example`), or the `keys = ` path in the profile TOML. Each top-level table is one key (table name = display name) and all of them appear in the device's Key menu; `active = "<name>"` picks the boot default. Paired TX/RX units must build with the same key and have it selected. With no key file the build falls back to insecure test keys and prints a `NOT FOR PRODUCTION` warning.
 
 ## First Edition Target
 

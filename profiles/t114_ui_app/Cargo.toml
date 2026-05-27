@@ -1,10 +1,10 @@
 [package]
-name        = "osrf-profile-t114-ui-tx"
+name        = "osrf-profile-t114-ui-app"
 version     = "0.1.0"
 publish     = false
 edition     = "2021"
 license     = "AGPL-3.0-or-later"
-description = "T114 UI deployment — transmitter binary (UART MIDI source).  Thin shell over `osrf-profile-t114-ui` (lib) that picks Role::Tx + TxSource::Uart at boot."
+description = "Generic flashable T114 UI binary. Configured at build time by a TOML profile (configs/*.toml) via the OSRF_PROFILE env var — role / tx_source / diversity / band are baked in by build.rs. Flash with `cargo xtask run <profile>`."
 
 [package.metadata.osrf]
 board = "t114"
@@ -19,11 +19,12 @@ embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executo
 cortex-m    = { version = "0.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"
 defmt-rtt   = "1.1"
-# Panic handler: `osrf-board-t114`'s `panic-stage` feature provides
-# `#[panic_handler]`.  Do **not** also pull in `panic-probe`.
+
+[build-dependencies]
+toml = "0.8"
 
 [[bin]]
-name  = "ui_tx"
+name  = "ui"
 path  = "src/main.rs"
 test  = false
 bench = false

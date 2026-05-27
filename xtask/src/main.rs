@@ -52,6 +52,23 @@ struct Osrf {
     app: Option<String>,
 }
 
+// ── TOML deployment profile (configs/<name>.toml) ───────────────────────────
+// Build-time-configured profiles: the generic crate `osrf-profile-<app>-app`
+// reads the rest of the fields (role/tx_source/diversity/band) via its
+// build.rs; the xtask only needs app/board/keys to launch the build.
+
+#[derive(Deserialize)]
+struct ProfileConfig {
+    /// Generic crate to build, e.g. "t114_ui" -> `osrf-profile-t114-ui-app`.
+    app: String,
+    /// Board, for rustc-target resolution.
+    board: String,
+    /// AEAD key file relative to the workspace root (baked by the lib's
+    /// build.rs via `OSRF_KEYS_FILE`).  Optional.
+    #[serde(default)]
+    keys: Option<String>,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> ExitCode {
@@ -75,6 +92,15 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let profile_name = &args[2];
+
+    // ── TOML deployment profile takes precedence over a same-named crate ──────
+    // `configs/<name>.toml` builds the generic `osrf-profile-<app>-app` crate
+    // with the profile baked in via env vars.  Falls through to the legacy
+    // crate-per-profile path when no config file exists.
+    let config_path = workspace.join("configs").join(format!("{profile_name}.toml"));
+    if config_path.exists() {
+        return run_toml_profile(&workspace, &config_path, subcommand);
+    }
 
     // ── Profile metadata ─────────────────────────────────────────────────────
     let profile_cargo = workspace
@@ -172,6 +198,80 @@ fn main() -> ExitCode {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Build/flash a TOML deployment profile: parse `configs/<name>.toml`,
+/// resolve the board's rustc target, and run the generic
+/// `osrf-profile-<app>-app` crate with `OSRF_PROFILE` (+ optional
+/// `OSRF_KEYS_FILE`) set so its build.rs bakes in role/band/etc.
+fn run_toml_profile(workspace: &Path, config_path: &Path, subcommand: &str) -> ExitCode {
+    let cargo_cmd = match subcommand {
+        "build" | "check" | "run" => subcommand,
+        other => {
+            eprintln!("error: unknown subcommand `{other}`; expected build, run, or check");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let text = match std::fs::read_to_string(config_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: cannot read {}: {e}", config_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let cfg: ProfileConfig = match toml::from_str(&text) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {}: {e}", config_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Board → rustc target (same lookup as the crate-based path).
+    let board_cargo = workspace
+        .join("boards")
+        .join(&cfg.board)
+        .join("Cargo.toml");
+    let target = match read_osrf_metadata(&board_cargo) {
+        Ok(m) => match m.target {
+            Some(t) => t,
+            None => {
+                eprintln!(
+                    "error: board `{}` is missing `[package.metadata.osrf].target` in {}",
+                    cfg.board,
+                    board_cargo.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let package = format!("osrf-profile-{}-app", cfg.app.replace('_', "-"));
+
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(workspace)
+        .arg(cargo_cmd)
+        .arg("--target")
+        .arg(&target)
+        .arg("-p")
+        .arg(&package)
+        .env("OSRF_PROFILE", config_path);
+    if let Some(keys) = &cfg.keys {
+        cmd.env("OSRF_KEYS_FILE", workspace.join(keys));
+    }
+
+    println!("+ {cmd:?}");
+    let status = cmd.status().expect("failed to run cargo");
+    if status.success() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
 
 fn read_osrf_metadata(path: &Path) -> Result<Osrf, String> {
     let text = std::fs::read_to_string(path)
