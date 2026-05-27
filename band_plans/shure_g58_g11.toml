@@ -1,0 +1,6 @@
+# Band plan "shure_g58_g11" (was static BAND_470_SHURE_G58_G11)
+label = "G58 TV18"
+channels_khz = [
+    494250, 494900, 495350, 496000, 496850, 497375, 498125, 499075,
+    499650,
+]

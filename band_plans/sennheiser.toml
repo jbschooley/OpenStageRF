@@ -1,0 +1,5 @@
+# Band plan "sennheiser" (was static SENNHEISER_COMPAT)
+label = "Senn G compat"
+channels_khz = [
+    914725, 915375, 916125, 916875, 917625,
+]

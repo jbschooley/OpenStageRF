@@ -4,5 +4,5 @@ board     = "t114"
 role      = "tx"
 tx_source = "scenario"
 diversity = false
-band      = "470"
+band_plans = ["band470", "shure_g58_*", "senn_a1_*"]
 keys      = "osrf-keys.toml"

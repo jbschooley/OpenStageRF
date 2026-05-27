@@ -17,6 +17,10 @@ embedded-graphics              = "0.8"
 embedded-graphics-core         = "0.4"
 defmt                          = { version = "1.0", optional = true }
 
+[build-dependencies]
+# Parse band_plans/*.toml in build.rs to generate the band-plan registry.
+toml = "0.8"
+
 [lib]
 test    = true
 doctest = false

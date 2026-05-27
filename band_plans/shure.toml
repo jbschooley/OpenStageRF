@@ -1,0 +1,5 @@
+# Band plan "shure" (was static SHURE_COMPAT)
+label = "Shure compat"
+channels_khz = [
+    914850, 915650, 916450, 917250,
+]
