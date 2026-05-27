@@ -2,7 +2,10 @@
 app       = "t114_ui"
 board     = "t114"
 role      = "tx"
+name      = "Stage TX 470"
 tx_source = "uart"
 diversity = false
 band_plans = ["band470", "shure_g58_*", "senn_a1_*"]
+power_policy = "wired"
+battery      = "lipo"
 keys      = "osrf-keys.toml"

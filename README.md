@@ -9,8 +9,8 @@ Open-source firmware platform for low-latency wireless MIDI (and experimental au
 ```bash
 # 902–928 MHz (SX1262) hardware:
 cargo xtask run ui_tx            # UI transmitter — DIN MIDI in from the FeatherWing UART
-cargo xtask run ui_rx_diversity  # UI receiver with dual-SPI receive diversity (on-board SX1262 + DX-LR30 on SPI3)
 cargo xtask run ui_rx            # UI receiver — single radio
+cargo xtask run ui_rx_diversity  # UI receiver with dual-SPI receive diversity (on-board SX1262 + DX-LR30 on SPI3)
 cargo xtask run ui_bench_tx      # UI transmitter driven by the built-in synthetic MIDI scenario source (no DIN needed)
 
 # 470–514 MHz (CN470/SX1268) hardware — same UI, 470 band plans:

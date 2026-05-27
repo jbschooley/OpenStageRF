@@ -46,19 +46,10 @@ use board::embassy_nrf::wdt::{Config as WdtConfig, Watchdog, WatchdogHandle};
 use board::framebuffer::Framebuffer;
 
 // ── Profile-level configuration ─────────────────────────────────
-
-/// Battery chemistry for this build.  Stock T114 ships with a
-/// single-cell LiPo pouch; swap to `BatteryChemistry::NimhPack
-/// { cells: 3 }` if you've replaced the cell with a 3-AA NiMH
-/// holder.  See `docs/hardware_guides/battery_options.md` for the
-/// full per-chemistry hardware-mod story.
-const CHEMISTRY: BatteryChemistry = BatteryChemistry::LiPoSingle;
-
-/// Power policy.  `Battery` (default) = handheld with explicit
-/// user control over on/off.  `Wired` = permanent-install: device
-/// tracks the host's USB power and auto-soft-offs ~10 s after USB
-/// is lost.
-const POWER_POLICY: PowerPolicy = PowerPolicy::Wired;
+//
+// Battery chemistry and power policy are passed into `run()` from the
+// build-time profile (`configs/<name>.toml` → `battery` / `power_policy`),
+// not hardcoded here.  See `configs/README.md`.
 
 // ── AEAD keys: baked at build time from the key file ─────────────
 //
@@ -231,6 +222,9 @@ pub async fn run(
     tx_source: TxSource,
     diversity: bool,
     band_plans: &'static [BandPlan],
+    power_policy: PowerPolicy,
+    chemistry: BatteryChemistry,
+    name: &'static str,
 ) -> ! {
     // Clear DEMCR — see `t114_dap_idle_freeze.md` memory note.
     // Without this, transient HardFaults halt the core forever
@@ -282,7 +276,7 @@ pub async fn run(
 
     // Wired-mode short-circuit: any wake path → Idle (the 10 s
     // grace timer in `ui_state_loop` handles the rest).
-    if matches!(POWER_POLICY, PowerPolicy::Wired) {
+    if matches!(power_policy, PowerPolicy::Wired) {
         defmt::info!(
             "ui: Wired policy → Idle (VBUS={}, early_wake={:?})",
             vbus_at_boot,
@@ -295,7 +289,7 @@ pub async fn run(
             }
             board::power::WakeSource::UsbPlug if vbus_at_boot => {
                 defmt::info!("ui: wake = UsbPlug + VBUS → charging frame");
-                usb_wake_charging_frame(r.display, r.display_backlight, r.battery).await;
+                usb_wake_charging_frame(r.display, r.display_backlight, r.battery, chemistry).await;
             }
             board::power::WakeSource::UsbPlug => {
                 app::unexpected_wake_resleep(board::power::enter_system_off);
@@ -305,7 +299,7 @@ pub async fn run(
                     "ui: wake = ColdBoot + flash_intent + VBUS → charging frame \
                      (probable brown-out from USB plug-in)"
                 );
-                usb_wake_charging_frame(r.display, r.display_backlight, r.battery).await;
+                usb_wake_charging_frame(r.display, r.display_backlight, r.battery, chemistry).await;
             }
             board::power::WakeSource::ColdBoot if flash_intent => {
                 app::unexpected_wake_resleep(board::power::enter_system_off);
@@ -337,7 +331,7 @@ pub async fn run(
     // SAFETY: only place we borrow FRAMEBUFFER.
     let fb: &'static mut Framebuffer = unsafe { &mut *core::ptr::addr_of_mut!(FRAMEBUFFER) };
 
-    let mut state = UiState::with_role_bands(role, band_plans);
+    let mut state = UiState::with_role_bands(role, band_plans, name);
     let mut settings = Settings::default();
     // Boot default = this build's first band; a fresh device comes up on a
     // band its radio can actually tune.
@@ -439,7 +433,7 @@ pub async fn run(
     spawner.spawn(joystick_task(joystick).expect("alloc joystick_task"));
 
     // ── Battery monitor — periodic SAADC sampler ──────────────────
-    spawner.spawn(battery_task(r.battery).expect("alloc battery_task"));
+    spawner.spawn(battery_task(r.battery, chemistry).expect("alloc battery_task"));
 
     // ── Hardware watchdog ─────────────────────────────────────────
     // Done late in boot so the slow startup steps (display rail
@@ -549,8 +543,8 @@ pub async fn run(
         &mut last_panic_msg,
         concat!("v", env!("CARGO_PKG_VERSION")),
         board::GIT_HASH,
-        CHEMISTRY,
-        POWER_POLICY,
+        chemistry,
+        power_policy,
         board::storage::SETTINGS_RANGE,
         board::storage::PANIC_RING_RANGE,
         vbus_present_fn,
@@ -727,8 +721,8 @@ async fn joystick_task(mut js: Joystick) {
 }
 
 #[embassy_executor::task]
-async fn battery_task(monitor: board::battery::BatteryMonitor) -> ! {
-    app::battery_loop(ProfileBattery(monitor), CHEMISTRY).await
+async fn battery_task(monitor: board::battery::BatteryMonitor, chemistry: BatteryChemistry) -> ! {
+    app::battery_loop(ProfileBattery(monitor), chemistry).await
 }
 
 // ── USB-wake charging frame (uses concrete display) ─────────────
@@ -741,10 +735,11 @@ async fn usb_wake_charging_frame(
     mut display: board::Display,
     mut backlight: Output<'static>,
     mut battery_mon: board::battery::BatteryMonitor,
+    chemistry: BatteryChemistry,
 ) -> ! {
     // Sample once so the frame shows real mV / %.
     let mv = battery_mon.sample().await;
-    let status = BatteryStatus::from_reading(mv, true, CHEMISTRY);
+    let status = BatteryStatus::from_reading(mv, true, chemistry);
     defmt::info!(
         "usb-wake: battery {=u16} mV ({=u8} %)",
         status.voltage_mv,

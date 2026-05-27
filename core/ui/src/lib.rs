@@ -485,6 +485,12 @@ pub struct UiState {
     /// indices, so a persisted setting survives even if this subset
     /// changes — this list only governs what the menu shows/selects.
     pub band_plans: &'static [BandPlan],
+    /// Operator-set unit name (e.g. `"Stage L"`, `"Keytar"`) shown in
+    /// the Idle top bar in place of the generic "OpenStageRF TX/RX"
+    /// banner, so multiple units at a venue are tellable apart.  Baked
+    /// from the build profile today; will become BLE-settable.  Empty
+    /// string = no name, in which case the generic banner is shown.
+    pub name: &'static str,
 }
 
 impl Default for UiState {
@@ -502,6 +508,7 @@ impl Default for UiState {
             nav_stack: Vec::new(),
             scan: ScanState::default(),
             band_plans: BAND_PLANS,
+            name: "",
         }
     }
 }
@@ -518,11 +525,18 @@ impl UiState {
     }
 
     /// Like [`Self::with_role`] but also sets the per-profile band-plan
-    /// menu list (see [`Self::band_plans`]).  Use a 470 list on SX1268
-    /// builds, the 915 list on SX1262 builds.
-    pub fn with_role_bands(role: Role, band_plans: &'static [BandPlan]) -> Self {
+    /// menu list (see [`Self::band_plans`]) and the operator-set unit
+    /// [`name`](Self::name).  Use a 470 list on SX1268 builds, the 915
+    /// list on SX1262 builds; pass `""` for `name` to keep the generic
+    /// Idle banner.
+    pub fn with_role_bands(
+        role: Role,
+        band_plans: &'static [BandPlan],
+        name: &'static str,
+    ) -> Self {
         Self {
             band_plans,
+            name,
             ..Self::with_role(role)
         }
     }
@@ -1332,10 +1346,19 @@ fn build_idle(
     status: &LinkStatus,
     out: &mut WidgetList,
 ) {
-    // Title carries the role suffix ("OpenStageRF TX" / "RX") so
-    // the user can tell at a glance which side they're holding.
+    // Title: the operator-set unit name when present (so multiple
+    // units at a venue are tellable apart at a glance), otherwise the
+    // generic "OpenStageRF TX/RX" banner carrying the role suffix.
     let mut title: String<24> = String::new();
-    let _ = write!(&mut title, "OpenStageRF {}", state.role.label());
+    if state.name.is_empty() {
+        let _ = write!(&mut title, "OpenStageRF {}", state.role.label());
+    } else {
+        // Truncate by char to the 24-cell title width (push_str would
+        // no-op on overflow, blanking the bar — char-push truncates).
+        for c in state.name.chars().take(24) {
+            let _ = title.push(c);
+        }
+    }
     out.push(Widget::Title(title)).ok();
     let ch = settings.current_channel();
     // Row 1: link status on RX (watchdog tracks heartbeats);
@@ -1959,6 +1982,7 @@ mod tests {
             nav_stack: Vec::new(),
             scan: ScanState::default(),
             band_plans: BAND_PLANS,
+            name: "",
         };
         let mut settings = Settings::default();
         let keys = KeyStore::new();
@@ -1979,6 +2003,7 @@ mod tests {
             nav_stack: Vec::new(),
             scan: ScanState::default(),
             band_plans: BAND_PLANS,
+            name: "",
         };
         let mut settings = Settings::default();
         let keys = KeyStore::new();
@@ -2007,6 +2032,7 @@ mod tests {
             nav_stack: Vec::new(),
             scan: ScanState::default(),
             band_plans: BAND_PLANS,
+            name: "",
         };
         let mut settings = Settings::default();
         let keys = KeyStore::new();
@@ -2147,6 +2173,7 @@ mod tests {
             nav_stack: Vec::new(),
             scan: ScanState::default(),
             band_plans: BAND_PLANS,
+            name: "",
         };
         let mut settings = Settings {
             tx_power_dbm: 0,
@@ -2236,6 +2263,7 @@ mod tests {
             nav_stack: Vec::new(),
             scan: ScanState::default(),
             band_plans: BAND_PLANS,
+            name: "",
         };
         let settings = Settings::default();
         let keys = KeyStore::new();
