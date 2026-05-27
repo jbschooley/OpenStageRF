@@ -220,11 +220,11 @@ const WDT_TIMEOUT_TICKS: u32 = 5 * 32_768;
 /// (single-radio TX).  Single-radio builds pass `false` and never claim
 /// SPI3 / the radio1 header pins.
 ///
-/// `band_plans` is this build's Band Plan menu list — `osrf_ui::BAND_PLANS_915`
-/// for 902–928 MHz (SX1262) builds, `BAND_PLANS_470` for 470–510 MHz (SX1268)
-/// builds.  It also fixes the default/clamp: a fresh device boots on
-/// `band_plans[0]`, and a persisted plan outside this list (e.g. after
-/// reflashing across bands) is snapped back to `band_plans[0]`.
+/// `band_plans` is this build's Band Plan menu list (resolved from the
+/// profile's `band_plans = [...]` against the `band_plans/` registry).  It
+/// also fixes the default/clamp: a fresh device boots on `band_plans[0]`,
+/// and a persisted plan outside this list (e.g. after reflashing across
+/// bands) is snapped back to `band_plans[0]`.
 pub async fn run(
     spawner: Spawner,
     role: Role,

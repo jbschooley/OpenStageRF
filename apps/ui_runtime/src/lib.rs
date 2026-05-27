@@ -54,10 +54,10 @@ use osrf_link_runtime::{
     ShutdownSignal,
 };
 use osrf_ui::{
-    band_plan_channel, band_plan_index, build_screen, max_channel_index, AboutData, BandPlan,
-    BatteryChemistry, BatteryStatus, Command, KeyRecord, KeyStore, LinkStatus, PowerPolicy,
-    ScanState, ScreenId, Settings, UiState, Widget, WidgetList, BAND_PLANS, KEY_RECORD_BYTES,
-    MAX_KEY_NAME, MAX_SCAN_CHANNELS, WIRED_USB_LOSS_GRACE_SECS,
+    band_plan_channel, band_plan_storage_id, band_plan_from_storage_id, build_screen,
+    max_channel_index, AboutData, BandPlan, BatteryChemistry, BatteryStatus, Command, KeyRecord,
+    KeyStore, LinkStatus, PowerPolicy, ScanState, ScreenId, Settings, UiState, Widget, WidgetList,
+    KEY_RECORD_BYTES, MAX_KEY_NAME, MAX_SCAN_CHANNELS, WIRED_USB_LOSS_GRACE_SECS,
 };
 use sequential_storage::cache::NoCache;
 use sequential_storage::map;
@@ -795,7 +795,7 @@ where
 //
 // Schema (key → value type):
 //   KEY_CHANNEL         → u32     channel index in the active band plan
-//   KEY_BAND_PLAN       → u32     index into `BAND_PLANS`
+//   KEY_BAND_PLAN       → u32     band_plan_storage_id (hash of plan id)
 //   KEY_TX_POWER        → i32     dBm, range MIN_TX_POWER_DBM..=MAX_TX_POWER_DBM
 //   KEY_ACTIVE_KEY_FP   → u32     fingerprint, 0 = "no key" (== `None`)
 //   KEY_SOFT_OFF_INTENT → u32     1 if last run entered soft-off; 0 otherwise.
@@ -839,15 +839,13 @@ where
     match map::fetch_item::<u8, u32, _>(flash, range.clone(), &mut cache, &mut buf, &KEY_BAND_PLAN)
         .await
     {
-        Ok(Some(v)) if (v as usize) < BAND_PLANS.len() => {
-            settings.band_plan = BAND_PLANS[v as usize];
-        }
-        Ok(Some(v)) => {
-            defmt::warn!(
-                "persist: stored band_plan index {} out of range, using default",
+        Ok(Some(v)) => match band_plan_from_storage_id(v) {
+            Some(p) => settings.band_plan = p,
+            None => defmt::warn!(
+                "persist: stored band_plan id {} not in this build, using default",
                 v
-            )
-        }
+            ),
+        },
         Ok(None) => defmt::info!("persist: no stored band_plan, using default"),
         Err(e) => defmt::warn!(
             "persist: load band_plan failed: {:?}",
@@ -874,9 +872,9 @@ where
     }
 
     defmt::info!(
-        "persist: loaded ch={} plan={=usize} pwr={} key_fp={:?}",
+        "persist: loaded ch={} plan_id={=u32:08x} pwr={} key_fp={:?}",
         settings.channel,
-        band_plan_index(settings.band_plan),
+        band_plan_storage_id(settings.band_plan),
         settings.tx_power_dbm,
         settings.active_key_fp,
     );
@@ -931,7 +929,7 @@ where
         flash,
         range,
         KEY_BAND_PLAN,
-        band_plan_index(plan) as u32,
+        band_plan_storage_id(plan),
         "band_plan",
     )
     .await;

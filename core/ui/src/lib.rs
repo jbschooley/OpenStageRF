@@ -43,8 +43,9 @@ pub mod key_store;
 pub mod render;
 
 pub use band_plan::{
-    channel as band_plan_channel, max_channel_index, BandPlan, BandPlanInfo, ChannelInfo,
-    BAND_PLANS, BAND_PLANS_470, BAND_PLANS_915,
+    band_plan_from_storage_id, band_plan_storage_id, channel as band_plan_channel,
+    max_channel_index, plan_by_id, BandPlan, BandPlanInfo, ChannelInfo, BAND_PLANS,
+    DEFAULT_BAND_PLAN,
 };
 pub use battery::{BatteryChemistry, BatteryStatus, CRITICAL_THRESHOLD_PCT, LOW_THRESHOLD_PCT};
 pub use key_store::{
@@ -92,7 +93,7 @@ pub const MAX_TX_POWER_DBM: i8 = 22;
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            band_plan: BandPlan::Ism915,
+            band_plan: DEFAULT_BAND_PLAN,
             channel: 0,
             tx_power_dbm: 22,
             active_key_fp: None,
@@ -1051,13 +1052,6 @@ fn active_key_cursor(active_fp: Option<u32>, keys: &KeyStore) -> u8 {
         .unwrap_or(0)
 }
 
-/// Find the index of a [`BandPlan`] in [`BAND_PLANS`].  Used by
-/// `enter` to position the cursor on the currently-active plan,
-/// and by the M7 persistence layer to encode a band plan as a
-/// stable u8.
-pub fn band_plan_index(plan: BandPlan) -> usize {
-    BAND_PLANS.iter().position(|p| *p == plan).unwrap_or(0)
-}
 
 /// Which list a list-based screen is selecting from.  Public so
 /// menu definitions can refer to it via [`ItemAction::List`].
@@ -1109,7 +1103,7 @@ impl ListKind {
                 let new_plan = band_plans
                     .get(cursor as usize)
                     .copied()
-                    .unwrap_or(BandPlan::Ism915);
+                    .unwrap_or(DEFAULT_BAND_PLAN);
                 let changed = settings.band_plan != new_plan;
                 settings.band_plan = new_plan;
                 // Switching plan may push the active channel out of
@@ -2097,7 +2091,7 @@ mod tests {
             ..UiState::default()
         };
         let mut settings = Settings {
-            band_plan: BandPlan::DenseLo, // 87 channels
+            band_plan: plan_by_id("dense_lo").unwrap(), // 87 channels
             channel: 7,
             ..Settings::default()
         };
@@ -2114,13 +2108,14 @@ mod tests {
         }
         state.handle_event(&mut settings, &keys, press(Direction::Center));
         assert_eq!(state.screen, ScreenId::BandPlanSelect);
-        // Find Shure plan (4 channels, index 2).
-        let shure_idx = BAND_PLANS
-            .iter()
-            .position(|p| *p == BandPlan::Shure)
-            .unwrap() as u8;
+        // Find the Shure plan in the (default = all) menu list.
+        let shure = plan_by_id("shure").unwrap();
+        let shure_idx = BAND_PLANS.iter().position(|p| *p == shure).unwrap() as u8;
         // Move cursor to Shure.
-        let cur_plan_idx = band_plan_index(settings.band_plan) as u8;
+        let cur_plan_idx = BAND_PLANS
+            .iter()
+            .position(|p| *p == settings.band_plan)
+            .unwrap() as u8;
         if cur_plan_idx < shure_idx {
             for _ in 0..(shure_idx - cur_plan_idx) {
                 state.handle_event(&mut settings, &keys, press(Direction::Down));
@@ -2133,10 +2128,10 @@ mod tests {
         assert_eq!(state.cursor, shure_idx);
         // Apply.
         let cmd = state.handle_event(&mut settings, &keys, press(Direction::Center));
-        assert_eq!(cmd, Some(Command::ApplyBandPlan(BandPlan::Shure)));
-        assert_eq!(settings.band_plan, BandPlan::Shure);
+        assert_eq!(cmd, Some(Command::ApplyBandPlan(shure)));
+        assert_eq!(settings.band_plan, shure);
         // Channel clamped from 7 to Shure's max (3).
-        assert_eq!(settings.channel, max_channel_index(BandPlan::Shure));
+        assert_eq!(settings.channel, max_channel_index(shure));
     }
 
     #[test]
@@ -2332,7 +2327,7 @@ mod tests {
         assert_eq!(state.cursor, 0);
         assert_eq!(
             state.scan.channel_count,
-            max_channel_index(BandPlan::Ism915) + 1
+            max_channel_index(settings.band_plan) + 1
         );
 
         let pass1: heapless::Vec<i16, MAX_SCAN_CHANNELS> =

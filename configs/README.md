@@ -24,7 +24,11 @@ generates `ROLE` / `TX_SOURCE` / `DIVERSITY` / `BAND_PLANS`.
 | `role` | `tx` \| `rx` | Required. |
 | `tx_source` | `uart` \| `scenario` | TX only; `uart` = DIN MIDI, `scenario` = synthetic bench source. Default `uart`. |
 | `diversity` | `true` \| `false` | RX only; dual-SPI receive diversity (radio0 + radio1 on SPI3). Default `false`. |
-| `band` | `915` \| `470` | `915` → 902–928 MHz (SX1262) band plans; `470` → 470–514 MHz (CN470/SX1268) band plans. Default `915`. |
+| `band_plans` | list of plan ids | Band plans this build offers in the Band Plan menu, by `band_plans/<id>.toml` stem. A trailing `*` is a prefix glob. Order is preserved; first entry is the boot default. Default `["ism915"]`. |
 | `keys` | path | AEAD key file, relative to repo root (gitignored). Default `osrf-keys.toml`. |
 
-Adding a profile = drop a `.toml` here. No new crate, no workspace edits.
+`band_plans` examples:
+- 902–928 MHz: `["ism915", "sennheiser", "shure", "dense_lo", "dense_mid", "dense_hi", "wide"]`
+- 470–514 MHz: `["band470", "shure_g58_*", "senn_a1_*"]`
+
+Band plan definitions live in [`band_plans/`](../band_plans/) (one `.toml` per plan: `label` + `channels_khz`). Add a plan = drop a file there; reference it by filename here. Adding a profile = drop a `.toml` in `configs/`. No new crate, no workspace edits.

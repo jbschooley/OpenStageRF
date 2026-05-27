@@ -16,6 +16,7 @@ cargo xtask run ui_bench_tx      # UI transmitter driven by the built-in synthet
 # 470–514 MHz (CN470/SX1268) hardware — same UI, 470 band plans:
 cargo xtask run ui_tx_470
 cargo xtask run ui_rx_470
+cargo xtask run ui_rx_diversity_470  # 470 receiver with dual-SPI diversity (DX-LR30-470 on SPI3)
 cargo xtask run ui_bench_tx_470
 ```
 

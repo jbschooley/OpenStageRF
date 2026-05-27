@@ -4,5 +4,5 @@ board     = "t114"
 role      = "tx"
 tx_source = "uart"
 diversity = false
-band      = "915"
+band_plans = ["ism915", "sennheiser", "shure", "dense_lo", "dense_mid", "dense_hi", "wide"]
 keys      = "osrf-keys.toml"

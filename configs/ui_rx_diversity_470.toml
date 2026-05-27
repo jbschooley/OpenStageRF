@@ -1,0 +1,7 @@
+# T114 UI receiver with dual-SPI receive diversity, 470–514 MHz (CN470/SX1268).
+app        = "t114_ui"
+board      = "t114"
+role       = "rx"
+diversity  = true
+band_plans = ["band470", "shure_g58_*", "senn_a1_*"]
+keys       = "osrf-keys.toml"
