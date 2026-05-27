@@ -36,8 +36,8 @@ use osrf_app_ui_runtime as app;
 use osrf_board_t114 as board;
 use osrf_driver_input_joystick5way::Joystick5Way;
 use osrf_ui::{
-    BatteryChemistry, BatteryStatus, KeyStore, PowerPolicy, Renderer, Role, Settings, UiState,
-    Widget, WidgetList,
+    BandPlan, BatteryChemistry, BatteryStatus, KeyStore, PowerPolicy, Renderer, Role, Settings,
+    UiState, Widget, WidgetList,
 };
 
 use board::embassy_nrf::gpio::{Input, Output, Pull};
@@ -219,7 +219,19 @@ const WDT_TIMEOUT_TICKS: u32 = 5 * 32_768;
 /// receive diversity via `run_rx_diversity`.  Ignored for `Role::Tx`
 /// (single-radio TX).  Single-radio builds pass `false` and never claim
 /// SPI3 / the radio1 header pins.
-pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource, diversity: bool) -> ! {
+///
+/// `band_plans` is this build's Band Plan menu list — `osrf_ui::BAND_PLANS_915`
+/// for 902–928 MHz (SX1262) builds, `BAND_PLANS_470` for 470–510 MHz (SX1268)
+/// builds.  It also fixes the default/clamp: a fresh device boots on
+/// `band_plans[0]`, and a persisted plan outside this list (e.g. after
+/// reflashing across bands) is snapped back to `band_plans[0]`.
+pub async fn run(
+    spawner: Spawner,
+    role: Role,
+    tx_source: TxSource,
+    diversity: bool,
+    band_plans: &'static [BandPlan],
+) -> ! {
     // Clear DEMCR — see `t114_dap_idle_freeze.md` memory note.
     // Without this, transient HardFaults halt the core forever
     // post-`cargo run` once the probe is detached.
@@ -325,9 +337,19 @@ pub async fn run(spawner: Spawner, role: Role, tx_source: TxSource, diversity: b
     // SAFETY: only place we borrow FRAMEBUFFER.
     let fb: &'static mut Framebuffer = unsafe { &mut *core::ptr::addr_of_mut!(FRAMEBUFFER) };
 
-    let mut state = UiState::with_role(role);
+    let mut state = UiState::with_role_bands(role, band_plans);
     let mut settings = Settings::default();
+    // Boot default = this build's first band; a fresh device comes up on a
+    // band its radio can actually tune.
+    settings.band_plan = band_plans[0];
     app::load_settings(&mut flash, board::storage::SETTINGS_RANGE, &mut settings).await;
+    // Snap a persisted plan that isn't in this build's list back to the
+    // default — covers reflashing a device across bands (the stored global
+    // index could otherwise resolve to a plan this radio can't tune).
+    if !band_plans.contains(&settings.band_plan) {
+        settings.band_plan = band_plans[0];
+        settings.channel = 0;
+    }
     let mut keys = KeyStore::new();
     app::load_keys(&mut flash, board::storage::KEY_STORE_RANGE, &mut keys).await;
 

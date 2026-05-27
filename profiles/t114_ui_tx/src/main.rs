@@ -11,7 +11,7 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 use osrf_board_t114 as board;
 use osrf_profile_t114_ui::{run, TxSource};
-use osrf_ui::Role;
+use osrf_ui::{Role, BAND_PLANS_915};
 
 #[cortex_m_rt::pre_init]
 unsafe fn pre_init() {
@@ -20,5 +20,5 @@ unsafe fn pre_init() {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    run(spawner, Role::Tx, TxSource::Uart, false).await;
+    run(spawner, Role::Tx, TxSource::Uart, false, BAND_PLANS_915).await;
 }
