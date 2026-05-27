@@ -128,43 +128,45 @@ pub enum BandPlan {
     /// proprietary intermod-coordinated bank frequencies** — same stub
     /// caveat as [`BandPlan::Sennheiser`]; refine with real coordination data.
     SennheiserA1,
-    /// Shure SLX-D **G58 Group 1 (Full Range 1)** — 26 ch ≤510 MHz.
+    /// Shure SLX-D **G58 Group 1 (Full Range 1)** — 31 channels.
     ShureG58G1,
-    /// Shure SLX-D **G58 Group 2 (Full Range 2)** — 25 ch ≤510 MHz.
+    /// Shure SLX-D **G58 Group 2 (Full Range 2)** — 30 channels.
     ShureG58G2,
-    /// Shure SLX-D **G58 Group 3 (Full Range 3)** — 27 ch ≤510 MHz.
+    /// Shure SLX-D **G58 Group 3 (Full Range 3)** — 30 channels.
     ShureG58G3,
-    /// Shure SLX-D **G58 Group 4 (Multi-band G4 (compat w/ group 4 of H55 & J52))** — 24 ch ≤510 MHz.
+    /// Shure SLX-D **G58 Group 4 (Multi-band G4 (compat w/ group 4 of H55 & J52))** — 29 channels.
     ShureG58G4,
-    /// Shure SLX-D **G58 Group 5 (Multi-band G5 (group 5 of H55 & J52))** — 27 ch ≤510 MHz.
+    /// Shure SLX-D **G58 Group 5 (Multi-band G5 (group 5 of H55 & J52))** — 30 channels.
     ShureG58G5,
-    /// Shure SLX-D **G58 Group 6 (Multi-band G6 (group 6 of H55 & J52))** — 26 ch ≤510 MHz.
+    /// Shure SLX-D **G58 Group 6 (Multi-band G6 (group 6 of H55 & J52))** — 30 channels.
     ShureG58G6,
-    /// Shure SLX-D **G58 Group 7 (TV14)** — 10 ch ≤510 MHz.
+    /// Shure SLX-D **G58 Group 7 (TV14)** — 10 channels.
     ShureG58G7,
-    /// Shure SLX-D **G58 Group 8 (TV15)** — 10 ch ≤510 MHz.
+    /// Shure SLX-D **G58 Group 8 (TV15)** — 10 channels.
     ShureG58G8,
-    /// Shure SLX-D **G58 Group 9 (TV16)** — 10 ch ≤510 MHz.
+    /// Shure SLX-D **G58 Group 9 (TV16)** — 10 channels.
     ShureG58G9,
-    /// Shure SLX-D **G58 Group 10 (TV17)** — 10 ch ≤510 MHz.
+    /// Shure SLX-D **G58 Group 10 (TV17)** — 10 channels.
     ShureG58G10,
-    /// Shure SLX-D **G58 Group 11 (TV18)** — 9 ch ≤510 MHz.
+    /// Shure SLX-D **G58 Group 11 (TV18)** — 9 channels.
     ShureG58G11,
-    /// Shure SLX-D **G58 Group 12 (TV19)** — 10 ch ≤510 MHz.
+    /// Shure SLX-D **G58 Group 12 (TV19)** — 10 channels.
     ShureG58G12,
-    /// Shure SLX-D **G58 Group 13 (TV20)** — 7 ch ≤510 MHz.
+    /// Shure SLX-D **G58 Group 13 (TV20)** — 10 channels.
     ShureG58G13,
-    /// Shure SLX-D **G58 Group 15 (TV14 & TV16)** — 18 ch ≤510 MHz.
+    /// Shure SLX-D **G58 Group 14 (TV21 (2 MHz))** — 4 channels.
+    ShureG58G14,
+    /// Shure SLX-D **G58 Group 15 (TV14 & TV16)** — 18 channels.
     ShureG58G15,
-    /// Shure SLX-D **G58 Group 16 (TV15 & TV17)** — 18 ch ≤510 MHz.
+    /// Shure SLX-D **G58 Group 16 (TV15 & TV17)** — 18 channels.
     ShureG58G16,
-    /// Shure SLX-D **G58 Group 17 (TV16 & TV18)** — 18 ch ≤510 MHz.
+    /// Shure SLX-D **G58 Group 17 (TV16 & TV18)** — 18 channels.
     ShureG58G17,
-    /// Shure SLX-D **G58 Group 18 (TV17 & TV19)** — 18 ch ≤510 MHz.
+    /// Shure SLX-D **G58 Group 18 (TV17 & TV19)** — 18 channels.
     ShureG58G18,
-    /// Shure SLX-D **G58 Group 19 (TV18 & TV20)** — 15 ch ≤510 MHz.
+    /// Shure SLX-D **G58 Group 19 (TV18 & TV20)** — 18 channels.
     ShureG58G19,
-    /// Shure SLX-D **G58 Group 20 (TV19 & TV21)** — 10 ch ≤510 MHz.
+    /// Shure SLX-D **G58 Group 20 (TV19 & TV21)** — 14 channels.
     ShureG58G20,
 }
 
@@ -194,6 +196,7 @@ impl BandPlan {
             BandPlan::ShureG58G11 => &BAND_470_SHURE_G58_G11,
             BandPlan::ShureG58G12 => &BAND_470_SHURE_G58_G12,
             BandPlan::ShureG58G13 => &BAND_470_SHURE_G58_G13,
+            BandPlan::ShureG58G14 => &BAND_470_SHURE_G58_G14,
             BandPlan::ShureG58G15 => &BAND_470_SHURE_G58_G15,
             BandPlan::ShureG58G16 => &BAND_470_SHURE_G58_G16,
             BandPlan::ShureG58G17 => &BAND_470_SHURE_G58_G17,
@@ -234,6 +237,7 @@ pub const BAND_PLANS: &[BandPlan] = &[
     BandPlan::ShureG58G11,
     BandPlan::ShureG58G12,
     BandPlan::ShureG58G13,
+    BandPlan::ShureG58G14,
     BandPlan::ShureG58G15,
     BandPlan::ShureG58G16,
     BandPlan::ShureG58G17,
@@ -270,6 +274,7 @@ pub const BAND_PLANS_470: &[BandPlan] = &[
     BandPlan::ShureG58G11,
     BandPlan::ShureG58G12,
     BandPlan::ShureG58G13,
+    BandPlan::ShureG58G14,
     BandPlan::ShureG58G15,
     BandPlan::ShureG58G16,
     BandPlan::ShureG58G17,
@@ -845,7 +850,7 @@ static BAND_470_SENNHEISER_A1: BandPlanInfo = BandPlanInfo {
 };
 
 /// Shure SLX-D G58 Group 1 (Full Range 1).  Source: Shure SLX-D Frequency
-/// Compatibility Supplement (© 2020).  Channels >510 MHz omitted (26 of 31).
+/// Compatibility Supplement (© 2020), full group (31 ch).
 #[rustfmt::skip]
 static BAND_470_SHURE_G58_G1: BandPlanInfo = BandPlanInfo {
     label: "G58 Full1",
@@ -876,11 +881,16 @@ static BAND_470_SHURE_G58_G1: BandPlanInfo = BandPlanInfo {
         ChannelInfo { label: "24", frequency_khz: 506_075 },
         ChannelInfo { label: "25", frequency_khz: 507_300 },
         ChannelInfo { label: "26", frequency_khz: 509_625 },
+        ChannelInfo { label: "27", frequency_khz: 510_200 },
+        ChannelInfo { label: "28", frequency_khz: 511_075 },
+        ChannelInfo { label: "29", frequency_khz: 511_750 },
+        ChannelInfo { label: "30", frequency_khz: 512_225 },
+        ChannelInfo { label: "31", frequency_khz: 513_675 },
     ],
 };
 
 /// Shure SLX-D G58 Group 2 (Full Range 2).  Source: Shure SLX-D Frequency
-/// Compatibility Supplement (© 2020).  Channels >510 MHz omitted (25 of 30).
+/// Compatibility Supplement (© 2020), full group (30 ch).
 #[rustfmt::skip]
 static BAND_470_SHURE_G58_G2: BandPlanInfo = BandPlanInfo {
     label: "G58 Full2",
@@ -910,11 +920,16 @@ static BAND_470_SHURE_G58_G2: BandPlanInfo = BandPlanInfo {
         ChannelInfo { label: "23", frequency_khz: 505_900 },
         ChannelInfo { label: "24", frequency_khz: 506_775 },
         ChannelInfo { label: "25", frequency_khz: 507_375 },
+        ChannelInfo { label: "26", frequency_khz: 510_725 },
+        ChannelInfo { label: "27", frequency_khz: 511_375 },
+        ChannelInfo { label: "28", frequency_khz: 512_500 },
+        ChannelInfo { label: "29", frequency_khz: 513_375 },
+        ChannelInfo { label: "30", frequency_khz: 513_875 },
     ],
 };
 
 /// Shure SLX-D G58 Group 3 (Full Range 3).  Source: Shure SLX-D Frequency
-/// Compatibility Supplement (© 2020).  Channels >510 MHz omitted (27 of 30).
+/// Compatibility Supplement (© 2020), full group (30 ch).
 #[rustfmt::skip]
 static BAND_470_SHURE_G58_G3: BandPlanInfo = BandPlanInfo {
     label: "G58 Full3",
@@ -946,11 +961,14 @@ static BAND_470_SHURE_G58_G3: BandPlanInfo = BandPlanInfo {
         ChannelInfo { label: "25", frequency_khz: 507_450 },
         ChannelInfo { label: "26", frequency_khz: 508_925 },
         ChannelInfo { label: "27", frequency_khz: 509_650 },
+        ChannelInfo { label: "28", frequency_khz: 511_375 },
+        ChannelInfo { label: "29", frequency_khz: 512_750 },
+        ChannelInfo { label: "30", frequency_khz: 513_600 },
     ],
 };
 
 /// Shure SLX-D G58 Group 4 (Multi-band G4 (compat w/ group 4 of H55 & J52)).  Source: Shure SLX-D Frequency
-/// Compatibility Supplement (© 2020).  Channels >510 MHz omitted (24 of 29).
+/// Compatibility Supplement (© 2020), full group (29 ch).
 #[rustfmt::skip]
 static BAND_470_SHURE_G58_G4: BandPlanInfo = BandPlanInfo {
     label: "G58 Multi4",
@@ -979,11 +997,16 @@ static BAND_470_SHURE_G58_G4: BandPlanInfo = BandPlanInfo {
         ChannelInfo { label: "22", frequency_khz: 505_825 },
         ChannelInfo { label: "23", frequency_khz: 508_550 },
         ChannelInfo { label: "24", frequency_khz: 509_050 },
+        ChannelInfo { label: "25", frequency_khz: 510_150 },
+        ChannelInfo { label: "26", frequency_khz: 510_650 },
+        ChannelInfo { label: "27", frequency_khz: 511_500 },
+        ChannelInfo { label: "28", frequency_khz: 512_000 },
+        ChannelInfo { label: "29", frequency_khz: 513_550 },
     ],
 };
 
 /// Shure SLX-D G58 Group 5 (Multi-band G5 (group 5 of H55 & J52)).  Source: Shure SLX-D Frequency
-/// Compatibility Supplement (© 2020).  Channels >510 MHz omitted (27 of 30).
+/// Compatibility Supplement (© 2020), full group (30 ch).
 #[rustfmt::skip]
 static BAND_470_SHURE_G58_G5: BandPlanInfo = BandPlanInfo {
     label: "G58 Multi5",
@@ -1015,11 +1038,14 @@ static BAND_470_SHURE_G58_G5: BandPlanInfo = BandPlanInfo {
         ChannelInfo { label: "25", frequency_khz: 508_350 },
         ChannelInfo { label: "26", frequency_khz: 508_900 },
         ChannelInfo { label: "27", frequency_khz: 509_750 },
+        ChannelInfo { label: "28", frequency_khz: 510_900 },
+        ChannelInfo { label: "29", frequency_khz: 511_450 },
+        ChannelInfo { label: "30", frequency_khz: 512_300 },
     ],
 };
 
 /// Shure SLX-D G58 Group 6 (Multi-band G6 (group 6 of H55 & J52)).  Source: Shure SLX-D Frequency
-/// Compatibility Supplement (© 2020).  Channels >510 MHz omitted (26 of 30).
+/// Compatibility Supplement (© 2020), full group (30 ch).
 #[rustfmt::skip]
 static BAND_470_SHURE_G58_G6: BandPlanInfo = BandPlanInfo {
     label: "G58 Multi6",
@@ -1050,11 +1076,15 @@ static BAND_470_SHURE_G58_G6: BandPlanInfo = BandPlanInfo {
         ChannelInfo { label: "24", frequency_khz: 506_650 },
         ChannelInfo { label: "25", frequency_khz: 507_225 },
         ChannelInfo { label: "26", frequency_khz: 509_000 },
+        ChannelInfo { label: "27", frequency_khz: 511_000 },
+        ChannelInfo { label: "28", frequency_khz: 511_625 },
+        ChannelInfo { label: "29", frequency_khz: 512_775 },
+        ChannelInfo { label: "30", frequency_khz: 513_475 },
     ],
 };
 
 /// Shure SLX-D G58 Group 7 (TV14).  Source: Shure SLX-D Frequency
-/// Compatibility Supplement (© 2020).  Channels >510 MHz omitted (10 of 10).
+/// Compatibility Supplement (© 2020), full group (10 ch).
 #[rustfmt::skip]
 static BAND_470_SHURE_G58_G7: BandPlanInfo = BandPlanInfo {
     label: "G58 TV14",
@@ -1073,7 +1103,7 @@ static BAND_470_SHURE_G58_G7: BandPlanInfo = BandPlanInfo {
 };
 
 /// Shure SLX-D G58 Group 8 (TV15).  Source: Shure SLX-D Frequency
-/// Compatibility Supplement (© 2020).  Channels >510 MHz omitted (10 of 10).
+/// Compatibility Supplement (© 2020), full group (10 ch).
 #[rustfmt::skip]
 static BAND_470_SHURE_G58_G8: BandPlanInfo = BandPlanInfo {
     label: "G58 TV15",
@@ -1092,7 +1122,7 @@ static BAND_470_SHURE_G58_G8: BandPlanInfo = BandPlanInfo {
 };
 
 /// Shure SLX-D G58 Group 9 (TV16).  Source: Shure SLX-D Frequency
-/// Compatibility Supplement (© 2020).  Channels >510 MHz omitted (10 of 10).
+/// Compatibility Supplement (© 2020), full group (10 ch).
 #[rustfmt::skip]
 static BAND_470_SHURE_G58_G9: BandPlanInfo = BandPlanInfo {
     label: "G58 TV16",
@@ -1111,7 +1141,7 @@ static BAND_470_SHURE_G58_G9: BandPlanInfo = BandPlanInfo {
 };
 
 /// Shure SLX-D G58 Group 10 (TV17).  Source: Shure SLX-D Frequency
-/// Compatibility Supplement (© 2020).  Channels >510 MHz omitted (10 of 10).
+/// Compatibility Supplement (© 2020), full group (10 ch).
 #[rustfmt::skip]
 static BAND_470_SHURE_G58_G10: BandPlanInfo = BandPlanInfo {
     label: "G58 TV17",
@@ -1130,7 +1160,7 @@ static BAND_470_SHURE_G58_G10: BandPlanInfo = BandPlanInfo {
 };
 
 /// Shure SLX-D G58 Group 11 (TV18).  Source: Shure SLX-D Frequency
-/// Compatibility Supplement (© 2020).  Channels >510 MHz omitted (9 of 9).
+/// Compatibility Supplement (© 2020), full group (9 ch).
 #[rustfmt::skip]
 static BAND_470_SHURE_G58_G11: BandPlanInfo = BandPlanInfo {
     label: "G58 TV18",
@@ -1148,7 +1178,7 @@ static BAND_470_SHURE_G58_G11: BandPlanInfo = BandPlanInfo {
 };
 
 /// Shure SLX-D G58 Group 12 (TV19).  Source: Shure SLX-D Frequency
-/// Compatibility Supplement (© 2020).  Channels >510 MHz omitted (10 of 10).
+/// Compatibility Supplement (© 2020), full group (10 ch).
 #[rustfmt::skip]
 static BAND_470_SHURE_G58_G12: BandPlanInfo = BandPlanInfo {
     label: "G58 TV19",
@@ -1167,7 +1197,7 @@ static BAND_470_SHURE_G58_G12: BandPlanInfo = BandPlanInfo {
 };
 
 /// Shure SLX-D G58 Group 13 (TV20).  Source: Shure SLX-D Frequency
-/// Compatibility Supplement (© 2020).  Channels >510 MHz omitted (7 of 10).
+/// Compatibility Supplement (© 2020), full group (10 ch).
 #[rustfmt::skip]
 static BAND_470_SHURE_G58_G13: BandPlanInfo = BandPlanInfo {
     label: "G58 TV20",
@@ -1179,11 +1209,27 @@ static BAND_470_SHURE_G58_G13: BandPlanInfo = BandPlanInfo {
         ChannelInfo { label: "05", frequency_khz: 508_675 },
         ChannelInfo { label: "06", frequency_khz: 509_450 },
         ChannelInfo { label: "07", frequency_khz: 509_900 },
+        ChannelInfo { label: "08", frequency_khz: 510_550 },
+        ChannelInfo { label: "09", frequency_khz: 511_425 },
+        ChannelInfo { label: "10", frequency_khz: 511_875 },
+    ],
+};
+
+/// Shure SLX-D G58 Group 14 (TV21 (2 MHz)).  Source: Shure SLX-D Frequency
+/// Compatibility Supplement (© 2020), full group (4 ch).
+#[rustfmt::skip]
+static BAND_470_SHURE_G58_G14: BandPlanInfo = BandPlanInfo {
+    label: "G58 TV21",
+    channels: &[
+        ChannelInfo { label: "01", frequency_khz: 512_200 },
+        ChannelInfo { label: "02", frequency_khz: 512_650 },
+        ChannelInfo { label: "03", frequency_khz: 513_325 },
+        ChannelInfo { label: "04", frequency_khz: 513_775 },
     ],
 };
 
 /// Shure SLX-D G58 Group 15 (TV14 & TV16).  Source: Shure SLX-D Frequency
-/// Compatibility Supplement (© 2020).  Channels >510 MHz omitted (18 of 18).
+/// Compatibility Supplement (© 2020), full group (18 ch).
 #[rustfmt::skip]
 static BAND_470_SHURE_G58_G15: BandPlanInfo = BandPlanInfo {
     label: "G58 14&16",
@@ -1210,7 +1256,7 @@ static BAND_470_SHURE_G58_G15: BandPlanInfo = BandPlanInfo {
 };
 
 /// Shure SLX-D G58 Group 16 (TV15 & TV17).  Source: Shure SLX-D Frequency
-/// Compatibility Supplement (© 2020).  Channels >510 MHz omitted (18 of 18).
+/// Compatibility Supplement (© 2020), full group (18 ch).
 #[rustfmt::skip]
 static BAND_470_SHURE_G58_G16: BandPlanInfo = BandPlanInfo {
     label: "G58 15&17",
@@ -1237,7 +1283,7 @@ static BAND_470_SHURE_G58_G16: BandPlanInfo = BandPlanInfo {
 };
 
 /// Shure SLX-D G58 Group 17 (TV16 & TV18).  Source: Shure SLX-D Frequency
-/// Compatibility Supplement (© 2020).  Channels >510 MHz omitted (18 of 18).
+/// Compatibility Supplement (© 2020), full group (18 ch).
 #[rustfmt::skip]
 static BAND_470_SHURE_G58_G17: BandPlanInfo = BandPlanInfo {
     label: "G58 16&18",
@@ -1264,7 +1310,7 @@ static BAND_470_SHURE_G58_G17: BandPlanInfo = BandPlanInfo {
 };
 
 /// Shure SLX-D G58 Group 18 (TV17 & TV19).  Source: Shure SLX-D Frequency
-/// Compatibility Supplement (© 2020).  Channels >510 MHz omitted (18 of 18).
+/// Compatibility Supplement (© 2020), full group (18 ch).
 #[rustfmt::skip]
 static BAND_470_SHURE_G58_G18: BandPlanInfo = BandPlanInfo {
     label: "G58 17&19",
@@ -1291,7 +1337,7 @@ static BAND_470_SHURE_G58_G18: BandPlanInfo = BandPlanInfo {
 };
 
 /// Shure SLX-D G58 Group 19 (TV18 & TV20).  Source: Shure SLX-D Frequency
-/// Compatibility Supplement (© 2020).  Channels >510 MHz omitted (15 of 18).
+/// Compatibility Supplement (© 2020), full group (18 ch).
 #[rustfmt::skip]
 static BAND_470_SHURE_G58_G19: BandPlanInfo = BandPlanInfo {
     label: "G58 18&20",
@@ -1311,11 +1357,14 @@ static BAND_470_SHURE_G58_G19: BandPlanInfo = BandPlanInfo {
         ChannelInfo { label: "13", frequency_khz: 508_525 },
         ChannelInfo { label: "14", frequency_khz: 509_275 },
         ChannelInfo { label: "15", frequency_khz: 509_825 },
+        ChannelInfo { label: "16", frequency_khz: 510_675 },
+        ChannelInfo { label: "17", frequency_khz: 511_325 },
+        ChannelInfo { label: "18", frequency_khz: 511_775 },
     ],
 };
 
 /// Shure SLX-D G58 Group 20 (TV19 & TV21).  Source: Shure SLX-D Frequency
-/// Compatibility Supplement (© 2020).  Channels >510 MHz omitted (10 of 14).
+/// Compatibility Supplement (© 2020), full group (14 ch).
 #[rustfmt::skip]
 static BAND_470_SHURE_G58_G20: BandPlanInfo = BandPlanInfo {
     label: "G58 19&21",
@@ -1330,6 +1379,10 @@ static BAND_470_SHURE_G58_G20: BandPlanInfo = BandPlanInfo {
         ChannelInfo { label: "08", frequency_khz: 504_775 },
         ChannelInfo { label: "09", frequency_khz: 505_225 },
         ChannelInfo { label: "10", frequency_khz: 505_875 },
+        ChannelInfo { label: "11", frequency_khz: 512_250 },
+        ChannelInfo { label: "12", frequency_khz: 512_700 },
+        ChannelInfo { label: "13", frequency_khz: 513_425 },
+        ChannelInfo { label: "14", frequency_khz: 513_875 },
     ],
 };
 
@@ -1381,7 +1434,7 @@ mod tests {
             for c in p.info().channels {
                 // Every channel must sit in a band we support: 470–510 MHz
                 // (SX1268) or 902–928 MHz US ISM (SX1262).
-                let in_470 = (470_000..=510_000).contains(&c.frequency_khz);
+                let in_470 = (470_000..=514_000).contains(&c.frequency_khz);
                 let in_ism = (902_000..=928_000).contains(&c.frequency_khz);
                 assert!(
                     in_470 || in_ism,

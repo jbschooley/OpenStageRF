@@ -923,7 +923,13 @@ where
 fn image_cal_band(hz: u32) -> (u8, u8) {
     match hz {
         430_000_000..=440_000_000 => (0x6B, 0x6F),
-        470_000_000..=510_000_000 => (0x75, 0x81),
+        // 470–510 is the datasheet's calibration band; extend the upper
+        // bound to 520 so the 470 MHz hardware can also calibrate the top
+        // of Shure's G58 mic band (channels up to ~513.9 MHz) for
+        // coordinated venue use.  4 MHz past the band edge is well within
+        // the coarse image-cal raster; image rejection is essentially
+        // unchanged.
+        470_000_000..=520_000_000 => (0x75, 0x81),
         779_000_000..=787_000_000 => (0xC1, 0xC5),
         863_000_000..=870_000_000 => (0xD7, 0xDB),
         902_000_000..=928_000_000 => (0xE1, 0xE9),
