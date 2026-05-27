@@ -44,7 +44,7 @@ pub mod render;
 
 pub use band_plan::{
     channel as band_plan_channel, max_channel_index, BandPlan, BandPlanInfo, ChannelInfo,
-    BAND_PLANS,
+    BAND_PLANS, BAND_PLANS_470, BAND_PLANS_915,
 };
 pub use battery::{BatteryChemistry, BatteryStatus, CRITICAL_THRESHOLD_PCT, LOW_THRESHOLD_PCT};
 pub use key_store::{
@@ -476,6 +476,14 @@ pub struct UiState {
     /// Updated by the profile's scan loop via
     /// [`Self::apply_scan_pass`] after each completed pass.
     pub scan: ScanState,
+    /// Band plans this build offers in the Band Plan menu — a per-profile
+    /// subset of the global [`BAND_PLANS`] superset (e.g. the 915 MHz
+    /// plans on an SX1262 build, just the 470 plan on an SX1268 build).
+    /// The profile sets this after [`Self::with_role`]; defaults to the
+    /// full `BAND_PLANS`.  Serialization still uses global `BAND_PLANS`
+    /// indices, so a persisted setting survives even if this subset
+    /// changes — this list only governs what the menu shows/selects.
+    pub band_plans: &'static [BandPlan],
 }
 
 impl Default for UiState {
@@ -492,6 +500,7 @@ impl Default for UiState {
             edit_buffer: 0,
             nav_stack: Vec::new(),
             scan: ScanState::default(),
+            band_plans: BAND_PLANS,
         }
     }
 }
@@ -504,6 +513,16 @@ impl UiState {
             role,
             current_menu: role.main_menu(),
             ..Self::default()
+        }
+    }
+
+    /// Like [`Self::with_role`] but also sets the per-profile band-plan
+    /// menu list (see [`Self::band_plans`]).  Use a 470 list on SX1268
+    /// builds, the 915 list on SX1262 builds.
+    pub fn with_role_bands(role: Role, band_plans: &'static [BandPlan]) -> Self {
+        Self {
+            band_plans,
+            ..Self::with_role(role)
         }
     }
 }
@@ -823,7 +842,7 @@ impl UiState {
         keys: &KeyStore,
         kind: ListKind,
     ) -> Option<Command> {
-        let max_idx = kind.max_index(settings, keys);
+        let max_idx = kind.max_index(settings, keys, self.band_plans);
         match event {
             JoystickEvent::Press(Direction::Up) => {
                 self.cursor = self.cursor.saturating_sub(1);
@@ -838,7 +857,7 @@ impl UiState {
                 }
             }
             JoystickEvent::Press(Direction::Center) | JoystickEvent::Press(Direction::Right) => {
-                let cmd = kind.commit(self.cursor, settings, keys);
+                let cmd = kind.commit(self.cursor, settings, keys, self.band_plans);
                 self.pop_nav();
                 return cmd;
             }
@@ -985,7 +1004,13 @@ impl UiState {
         self.edit_buffer = 0;
         let cursor = match screen {
             ScreenId::ChannelSelect => settings.channel,
-            ScreenId::BandPlanSelect => band_plan_index(settings.band_plan) as u8,
+            // Cursor index is within the *menu* list (this build's subset),
+            // not the global BAND_PLANS used for serialization.
+            ScreenId::BandPlanSelect => self
+                .band_plans
+                .iter()
+                .position(|p| *p == settings.band_plan)
+                .unwrap_or(0) as u8,
             ScreenId::KeySelect => active_key_cursor(settings.active_key_fp, keys),
             // Scan starts with the cursor on the currently-active
             // channel — same UX as ChannelSelect.
@@ -1053,16 +1078,22 @@ impl ListKind {
         }
     }
 
-    fn max_index(&self, settings: &Settings, keys: &KeyStore) -> u8 {
+    fn max_index(&self, settings: &Settings, keys: &KeyStore, band_plans: &[BandPlan]) -> u8 {
         match self {
             ListKind::Channel => max_channel_index(settings.band_plan),
-            ListKind::BandPlan => (BAND_PLANS.len() as u8).saturating_sub(1),
+            ListKind::BandPlan => (band_plans.len() as u8).saturating_sub(1),
             // Key list = 1 (Open) + however many real keys are stored.
             ListKind::Key => keys.len() as u8,
         }
     }
 
-    fn commit(&self, cursor: u8, settings: &mut Settings, keys: &KeyStore) -> Option<Command> {
+    fn commit(
+        &self,
+        cursor: u8,
+        settings: &mut Settings,
+        keys: &KeyStore,
+        band_plans: &[BandPlan],
+    ) -> Option<Command> {
         match self {
             ListKind::Channel => {
                 let new_v = cursor.min(max_channel_index(settings.band_plan));
@@ -1075,7 +1106,7 @@ impl ListKind {
                 }
             }
             ListKind::BandPlan => {
-                let new_plan = BAND_PLANS
+                let new_plan = band_plans
                     .get(cursor as usize)
                     .copied()
                     .unwrap_or(BandPlan::Ism915);
@@ -1500,11 +1531,11 @@ fn build_channel_select(state: &UiState, settings: &Settings, out: &mut WidgetLi
 
 fn build_band_plan_select(state: &UiState, settings: &Settings, out: &mut WidgetList) {
     out.push(Widget::Title(s("Band Plan"))).ok();
-    let total = BAND_PLANS.len() as u8;
+    let total = state.band_plans.len() as u8;
     let start = state.scroll_offset;
     let end = (start + VISIBLE_LIST_ROWS).min(total);
     for (visible_idx, list_idx) in (start..end).enumerate() {
-        let plan = BAND_PLANS[list_idx as usize];
+        let plan = state.band_plans[list_idx as usize];
         let info = plan.info();
         let mut label: String<16> = String::new();
         let _ = write!(&mut label, "{}", info.label);
@@ -1933,6 +1964,7 @@ mod tests {
             current_menu: &MAIN_MENU_RX,
             nav_stack: Vec::new(),
             scan: ScanState::default(),
+            band_plans: BAND_PLANS,
         };
         let mut settings = Settings::default();
         let keys = KeyStore::new();
@@ -1952,6 +1984,7 @@ mod tests {
             current_menu: &MAIN_MENU_RX,
             nav_stack: Vec::new(),
             scan: ScanState::default(),
+            band_plans: BAND_PLANS,
         };
         let mut settings = Settings::default();
         let keys = KeyStore::new();
@@ -1979,6 +2012,7 @@ mod tests {
             current_menu: &MAIN_MENU_RX,
             nav_stack: Vec::new(),
             scan: ScanState::default(),
+            band_plans: BAND_PLANS,
         };
         let mut settings = Settings::default();
         let keys = KeyStore::new();
@@ -2117,6 +2151,7 @@ mod tests {
             current_menu: &MAIN_MENU_RX,
             nav_stack: Vec::new(),
             scan: ScanState::default(),
+            band_plans: BAND_PLANS,
         };
         let mut settings = Settings {
             tx_power_dbm: 0,
@@ -2205,6 +2240,7 @@ mod tests {
             current_menu: &MAIN_MENU_RX,
             nav_stack: Vec::new(),
             scan: ScanState::default(),
+            band_plans: BAND_PLANS,
         };
         let settings = Settings::default();
         let keys = KeyStore::new();

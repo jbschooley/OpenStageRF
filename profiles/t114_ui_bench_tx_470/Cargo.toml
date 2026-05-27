@@ -1,0 +1,27 @@
+[package]
+name        = "osrf-profile-t114-ui-bench-tx-470"
+version     = "0.1.0"
+publish     = false
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "T114 UI deployment — diagnostic transmitter binary.  Same UI / link stack as `t114_ui_tx` but the MIDI source is the synthetic `ScenarioSource` from `osrf-app-link-bench` (burst-pattern stress tests) instead of the FeatherWing UART. (470-510 MHz / SX1268 band plan)."
+
+[package.metadata.osrf]
+board = "t114"
+
+[dependencies]
+osrf-board-t114      = { workspace = true, features = ["defmt", "panic-stage"] }
+osrf-profile-t114-ui = { path = "../t114_ui" }
+osrf-ui              = { workspace = true, features = ["defmt"] }
+
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+
+cortex-m    = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+defmt-rtt   = "1.1"
+
+[[bin]]
+name  = "ui_bench_tx_470"
+path  = "src/main.rs"
+test  = false
+bench = false

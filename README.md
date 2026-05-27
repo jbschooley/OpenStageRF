@@ -7,11 +7,19 @@ Open-source firmware platform for low-latency wireless MIDI (and experimental au
 `cargo xtask run <profile>` builds for the board's target, flashes via probe-rs, and attaches RTT logs (Ctrl-C to detach). Current profiles:
 
 ```bash
+# 902–928 MHz (SX1262) hardware:
 cargo xtask run t114_ui_tx            # UI transmitter — DIN MIDI in from the FeatherWing UART
 cargo xtask run t114_ui_rx_diversity  # UI receiver with dual-SPI receive diversity (on-board SX1262 + DX-LR30 on SPI3)
 cargo xtask run t114_ui_rx            # UI receiver — single radio
 cargo xtask run t114_ui_bench_tx      # UI transmitter driven by the built-in synthetic MIDI scenario source (no DIN needed)
+
+# 470–510 MHz (SX1268) hardware — same UI, 470 band plan:
+cargo xtask run t114_ui_tx_470
+cargo xtask run t114_ui_rx_470
+cargo xtask run t114_ui_bench_tx_470
 ```
+
+The `_470` profiles are identical to their 900 MHz counterparts but ship the 470–510 MHz band plan (the Band Plan menu shows only the band the radio can tune). Flash the variant matching your hardware.
 
 To capture logs to a file: `cargo xtask run <profile> 2>&1 | tee run.log`. If two probes are connected, flash one at a time (the xtask doesn't pass a `--probe` selector).
 

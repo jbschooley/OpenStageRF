@@ -17,7 +17,7 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 use osrf_board_t114 as board;
 use osrf_profile_t114_ui::{run, TxSource};
-use osrf_ui::Role;
+use osrf_ui::{Role, BAND_PLANS_915};
 
 #[cortex_m_rt::pre_init]
 unsafe fn pre_init() {
@@ -28,5 +28,5 @@ unsafe fn pre_init() {
 async fn main(spawner: Spawner) {
     // `tx_source` is meaningless for Rx; pass any value.  `diversity = true`
     // enables the dual-SPI receive-diversity path.
-    run(spawner, Role::Rx, TxSource::Uart, true).await;
+    run(spawner, Role::Rx, TxSource::Uart, true, BAND_PLANS_915).await;
 }
