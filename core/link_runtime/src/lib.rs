@@ -570,6 +570,14 @@ pub struct LinkStats {
     /// what the SX1262 driver reports — practical values are -120 to
     /// -10 so an `i8` fits, but consumers can clamp at display time.
     pub last_rssi_dbm: Option<i16>,
+    /// RSSI (dBm) of the most recent crc-ok packet caught by the
+    /// *primary* radio (radio0), and by the *secondary* diversity
+    /// radio (radio1), tracked separately so an antenna / front-end
+    /// imbalance between the two shows up directly.  `None` until that
+    /// radio has caught its first packet.  On a single-radio build
+    /// `last_rssi_dbm_rx1` stays `None`.  RX-side only.
+    pub last_rssi_dbm_rx0: Option<i16>,
+    pub last_rssi_dbm_rx1: Option<i16>,
     /// Total accepted packets since boot (heartbeats + MIDI + sysex).
     /// RX-side.
     pub total_accepted: u32,
@@ -603,6 +611,8 @@ impl LinkStats {
     pub const EMPTY: Self = Self {
         link_up: false,
         last_rssi_dbm: None,
+        last_rssi_dbm_rx0: None,
+        last_rssi_dbm_rx1: None,
         total_accepted: 0,
         accepted_heartbeats: 0,
         accepted_midi: 0,
@@ -1540,6 +1550,12 @@ where
     let mut stuck_recoveries: u32 = 0;
     // RSSI of the most recent accepted packet, exposed via `stats`.
     let mut last_rssi: Option<i16> = None;
+    // Same, split per radio (diversity diagnostics): most recent crc-ok
+    // RSSI from the primary (radio0) and secondary (radio1) radios.
+    // Sticky — pair with the per-window `rx0`/`rx1` counts to tell
+    // whether the reading is current or stale for that radio.
+    let mut last_rssi_rx0: Option<i16> = None;
+    let mut last_rssi_rx1: Option<i16> = None;
 
     // ── Per-radio receive attribution (diversity diagnostics) ────
     // Counts crc-ok packets *delivered* by each radio — i.e. the
@@ -1841,8 +1857,10 @@ where
                 // caught it (the `recv_any` select winner).
                 if from_radio1 {
                     rx1_caught = rx1_caught.wrapping_add(1);
+                    last_rssi_rx1 = Some(pkt.rssi_dbm);
                 } else {
                     rx0_caught = rx0_caught.wrapping_add(1);
+                    last_rssi_rx0 = Some(pkt.rssi_dbm);
                 }
 
                 let n = pkt.len.min(radio_buf.len());
@@ -2185,8 +2203,13 @@ where
                 // windows — show 0/0 rather than a skewed first number.
                 _ => (0, 0),
             };
+            // Per-radio RSSI (dBm), most-recent crc-ok packet on each.
+            // `0` = that radio hasn't caught anything yet — read it
+            // alongside `rx0`/`rx1` to know if it's a current reading.
+            let rssi0 = last_rssi_rx0.unwrap_or(0);
+            let rssi1 = last_rssi_rx1.unwrap_or(0);
             defmt::info!(
-                "RX last1s: pkts={}/{} loss={}.{}% midi_ev={} hb={} drop={} crc_err={} rx0={} rx1={} | total: pkts={} midi_ev={} hb={} sysex={} drop={} crc_err={} rx0={} rx1={}",
+                "RX last1s: pkts={}/{} loss={}.{}% midi_ev={} hb={} drop={} crc_err={} rx0={} rx1={} rssi0={=i16}dBm rssi1={=i16}dBm | total: pkts={} midi_ev={} hb={} sysex={} drop={} crc_err={} rx0={} rx1={}",
                 d_accepted,
                 tx_count,
                 loss_x10 / 10,
@@ -2197,6 +2220,8 @@ where
                 d_crc,
                 d_rx0,
                 d_rx1,
+                rssi0,
+                rssi1,
                 accepted,
                 accepted_midi,
                 accepted_heartbeats,
@@ -2264,6 +2289,8 @@ where
         stats.update(|s| {
             s.link_up = link_up;
             s.last_rssi_dbm = last_rssi;
+            s.last_rssi_dbm_rx0 = last_rssi_rx0;
+            s.last_rssi_dbm_rx1 = last_rssi_rx1;
             s.total_accepted = accepted;
             s.accepted_heartbeats = accepted_heartbeats;
             s.accepted_midi = accepted_midi;
