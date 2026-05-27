@@ -2,6 +2,9 @@
 app        = "t114_ui"
 board      = "t114"
 role       = "rx"
+name       = "Stage RX Div 470"
 diversity  = true
 band_plans = ["band470", "shure_g58_*", "senn_a1_*"]
+power_policy = "wired"
+battery      = "lipo"
 keys       = "osrf-keys.toml"
