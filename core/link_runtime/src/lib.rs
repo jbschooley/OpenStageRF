@@ -692,6 +692,20 @@ pub trait MidiSource {
     /// the next event's deadline is in the future.  Called only inside
     /// `select` where the waker supports `embassy_time::Timer`.
     async fn wait_ready(&mut self);
+
+    /// Discard any input that accumulated before the link came up.
+    ///
+    /// `run_tx` calls this once, after the radio is configured but
+    /// before the first packet ships.  A keyboardist mashing keys while
+    /// the TX board boots piles up NoteOns whose matching NoteOffs were
+    /// sent before the source was listening (or arrive only after the
+    /// key is released post-boot) — forwarding those strands notes on
+    /// the RX synth.  Dropping the boot-window input avoids it without
+    /// the RX side ever emitting a speculative all-notes-off (which
+    /// would disturb a second player on a split/other channel).
+    ///
+    /// Default is a no-op: synthetic sources have no stale backlog.
+    async fn drain_startup(&mut self) {}
 }
 
 pub trait MidiSink {
@@ -953,6 +967,14 @@ where
     // resume the normal TX path.
     let mut scanning = false;
     let mut scan_idx: u8 = 0;
+
+    // Throw away any MIDI that arrived while the radio was initialising.
+    // If someone is mashing keys as the TX board powers up, the NoteOns
+    // pile up in the source's buffers but their NoteOffs may never have
+    // been captured — forwarding them strands notes on the RX synth.
+    // We discard rather than emit a speculative all-notes-off so a
+    // second player on a split / another channel is never disturbed.
+    source.drain_startup().await;
 
     loop {
         let now = Instant::now();

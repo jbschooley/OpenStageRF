@@ -44,6 +44,7 @@
 
 use core::convert::Infallible;
 
+use embassy_time::{with_timeout, Duration};
 use embedded_io_async::{Read, Write};
 use heapless::{Deque, Vec};
 
@@ -162,6 +163,35 @@ impl<R: Read> MidiSource for UartMidiSource<R> {
             }
             // No complete event yet (e.g. only got the status byte) —
             // loop and read more.
+        }
+    }
+
+    async fn drain_startup(&mut self) {
+        // Pull raw bytes straight off the UART (bypassing `ingest`, so
+        // nothing reaches the parsed-event queue) until the line stays
+        // quiet for one timeout window.  The hardware `BufferedUarte`
+        // ring keeps filling from DMA while the radio inits; this drains
+        // whatever a boot-time key mash left there.  Held keys emit no
+        // bytes once down, so a held chord drains in one window; their
+        // eventual NoteOffs after release are harmless on the RX synth
+        // (it never saw the matching NoteOn).
+        let mut buf = [0u8; UART_READ_CHUNK];
+        let mut flushed = 0u32;
+        loop {
+            match with_timeout(Duration::from_millis(5), self.uart.read(&mut buf)).await {
+                Ok(Ok(0)) => break,                 // EOF — shouldn't happen
+                Ok(Ok(n)) => flushed += n as u32,   // got bytes, keep going
+                Ok(Err(_)) => break,                // UART error — stop
+                Err(_) => break,                    // timed out — line is quiet
+            }
+        }
+        // Drop any complete events seeded before this call and clear
+        // half-parsed running-status state so the live session starts
+        // from a clean slate.
+        self.events.clear();
+        self.parser.reset();
+        if flushed > 0 {
+            defmt::info!("midi_node TX: drained {} boot-window MIDI bytes", flushed);
         }
     }
 }
