@@ -27,7 +27,7 @@ use embassy_futures::select::{select, select5, Either, Either5};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Channel, Receiver, Sender};
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{with_timeout, Duration, Instant, Timer};
 use embedded_hal::digital::StatefulOutputPin;
 use embedded_hal_async::{digital::Wait, spi::SpiDevice};
 
@@ -1345,11 +1345,32 @@ async fn apply_rx_reconfig<Spi, Busy, Dio1, Reset, Switch>(
     );
 }
 
+/// Radio self-heal: how long a radio may produce **nothing** (no packet,
+/// no CRC fail, no error) before we treat it as wedged and force it back
+/// into RX.  With a 10 ms TX heartbeat the receiver should hear something
+/// roughly every 10 ms even when nobody is playing, and the link watchdog
+/// is 200 ms, so 1 s of total silence is unambiguous — a couple of dropped
+/// packets never trips it.  Re-arming a radio that's silent merely because
+/// TX is off is harmless (`rx_start` just re-issues SetRx).
+const RADIO_REARM_SILENCE: Duration = Duration::from_millis(1000);
+
+/// Cheap `rx_start()` re-arms to attempt within one silence episode before
+/// escalating to a full reset + `configure_radio` (what a power cycle does
+/// to the radio, minus the power).  Each radio escalates independently.
+const RADIO_REARM_CHEAP_ATTEMPTS: u32 = 3;
+
 /// Drain loop for the **secondary (diversity) radio**, run as its own task.
 ///
 /// This is the heart of the storm-free diversity design: the secondary
 /// radio's `rx_recv` runs to completion in a dedicated task and is **never
 /// cancelled** during steady-state, so its DIO1 IRQ is always cleared.
+///
+/// **Self-heal:** the `rx_recv` wait is bounded by [`RADIO_REARM_SILENCE`].
+/// If radio1's DIO1 wedges (the dual-radio shared-GPIOTE hazard) the wait
+/// would otherwise hang this task forever and the radio would never deliver
+/// again until a power cycle.  On timeout we force a re-arm (escalating to a
+/// full reconfigure), independently of the primary loop's radio0 self-heal,
+/// so a single wedged radio recovers without disturbing the other.
 /// (The earlier race-and-cancel design left the loser radio's level-
 /// sensitive DIO1 stuck high, which storms embassy-nrf's shared GPIOTE PORT
 /// interrupt and wrecks the primary's reception — exactly the 50%-loss +
@@ -1393,6 +1414,13 @@ where
         Err(_) => defmt::error!("diversity RX (secondary): SPI error during presence check"),
     }
     let mut buf = [0u8; RF_PAYLOAD_MAX as usize];
+    // Mirror of the config this radio is currently tuned to, so an
+    // escalated self-heal reconfigure retunes to the live channel rather
+    // than the boot-time one after the UI has changed bands.
+    let mut current = *config;
+    // Consecutive re-arm attempts in the current silence episode; reset to
+    // 0 the moment radio1 produces anything again.
+    let mut rearms: u32 = 0;
     loop {
         let cfg_wait = async {
             match cfg_updates {
@@ -1400,8 +1428,22 @@ where
                 None => core::future::pending::<LinkConfig>().await,
             }
         };
-        match select(radio.rx_recv(&mut buf), cfg_wait).await {
-            Either::First(Ok(pkt)) if pkt.crc_ok => {
+        // Bound the receive wait so a wedged DIO1 can't hang this task
+        // forever — on timeout we treat radio1 as wedged and re-arm it.
+        match select(
+            with_timeout(RADIO_REARM_SILENCE, radio.rx_recv(&mut buf)),
+            cfg_wait,
+        )
+        .await
+        {
+            Either::First(Ok(Ok(pkt))) if pkt.crc_ok => {
+                if rearms > 0 {
+                    defmt::info!(
+                        "diversity RX (secondary): radio1 recovered after {} re-arm(s)",
+                        rearms
+                    );
+                    rearms = 0;
+                }
                 let len = pkt.len.min(buf.len());
                 let mut frame = DiversityRxFrame {
                     buf: [0u8; RF_PAYLOAD_MAX as usize],
@@ -1415,15 +1457,57 @@ where
                 // primary likely caught it too, or it's one missed packet.
                 let _ = tx.try_send(frame);
             }
-            // crc-fail / radio error: rx_recv completed (IRQ cleared); just
-            // re-arm on the next loop.  Not forwarded — the primary counts
-            // its own crc/error stats.
-            Either::First(_) => {}
+            // crc-fail / radio error: rx_recv completed (IRQ cleared) — the
+            // radio is alive, just didn't deliver a usable frame.  Clear the
+            // re-arm episode and re-arm on the next loop.  Not forwarded —
+            // the primary counts its own crc/error stats.
+            Either::First(Ok(_)) => {
+                if rearms > 0 {
+                    defmt::info!(
+                        "diversity RX (secondary): radio1 recovered after {} re-arm(s)",
+                        rearms
+                    );
+                    rearms = 0;
+                }
+            }
+            // Timed out: radio1 produced nothing for RADIO_REARM_SILENCE.
+            // With a 10 ms heartbeat that means its DIO1/RX path is wedged.
+            // Force it back into RX; escalate to a full reset once cheap
+            // re-arms haven't helped.
+            Either::First(Err(_timeout)) => {
+                rearms = rearms.wrapping_add(1);
+                if rearms <= RADIO_REARM_CHEAP_ATTEMPTS {
+                    if rearms == 1 {
+                        defmt::warn!(
+                            "diversity RX (secondary): radio1 went silent ({}ms, no packets) → re-arm",
+                            RADIO_REARM_SILENCE.as_millis()
+                        );
+                    }
+                    let _ = radio.rx_start().await;
+                } else if rearms == RADIO_REARM_CHEAP_ATTEMPTS + 1 {
+                    defmt::warn!(
+                        "diversity RX (secondary): radio1 still silent after {} re-arms → full reset + reconfigure",
+                        RADIO_REARM_CHEAP_ATTEMPTS
+                    );
+                    if configure_radio(radio, &current).await.is_err()
+                        || radio.rx_start().await.is_err()
+                    {
+                        defmt::error!("diversity RX (secondary): self-heal reconfigure failed");
+                    }
+                } else {
+                    // Past escalation — keep cheap re-arms (harmless if TX is
+                    // simply off) without re-logging every second.
+                    let _ = radio.rx_start().await;
+                }
+            }
             Either::Second(new_cfg) => {
+                rearms = 0;
                 if configure_radio(radio, &new_cfg).await.is_err()
                     || radio.rx_start().await.is_err()
                 {
                     defmt::error!("diversity RX (secondary): reconfigure failed; off-channel");
+                } else {
+                    current = new_cfg;
                 }
             }
         }
@@ -1592,6 +1676,19 @@ where
     let mut rx1_caught: u32 = 0;
     let mut prev_rx0: u32 = 0;
     let mut prev_rx1: u32 = 0;
+    // ── Radio0 liveness self-heal ────────────────────────────────
+    // Last time radio0's *own* rx_recv produced any result — a packet,
+    // a CRC fail, or an error — all of which prove its DIO1/IRQ path
+    // fired.  Heartbeats arrive every ~10 ms, so a long gap here means
+    // radio0 is wedged (the dual-radio shared-GPIOTE hazard), not merely
+    // idle.  radio1 is watched + re-armed independently inside
+    // `run_rx_secondary`, so a single wedged radio recovers without
+    // disturbing the other.  Initialised to `now` so a slow first packet
+    // doesn't look like an instant wedge.
+    let mut last_rx0_at = Instant::now();
+    // Consecutive re-arm attempts in the current silence episode; reset
+    // to 0 the moment radio0 produces anything again.
+    let mut rx0_rearms: u32 = 0;
     // Loss % over the most recent 1-second window — computed inside
     // the periodic-stats block below and exposed via `stats`.  None
     // until we've seen two consecutive windows.
@@ -1795,6 +1892,45 @@ where
             continue;
         }
 
+        // ── Radio0 liveness self-heal ────────────────────────────
+        // Reached only in normal (non-scanning) mode.  At loop top
+        // radio0's `rx_recv` is not in flight (the prior iteration's
+        // select resolved or cancelled it), so issuing SPI here is safe.
+        // If radio0 has gone silent past RADIO_REARM_SILENCE, force it
+        // back into RX; escalate to a full reset + reconfigure once cheap
+        // re-arms haven't helped.  Recovery is logged where radio0 next
+        // produces a result (the receive / crc-fail / error arms below).
+        let rx0_silent = Instant::now().duration_since(last_rx0_at);
+        if rx0_silent >= RADIO_REARM_SILENCE {
+            rx0_rearms = rx0_rearms.wrapping_add(1);
+            if rx0_rearms <= RADIO_REARM_CHEAP_ATTEMPTS {
+                if rx0_rearms == 1 {
+                    defmt::warn!(
+                        "link RX: radio0 went silent ({}ms, no packets) → re-arm",
+                        rx0_silent.as_millis()
+                    );
+                }
+                let _ = radio.rx_start().await;
+            } else if rx0_rearms == RADIO_REARM_CHEAP_ATTEMPTS + 1 {
+                defmt::warn!(
+                    "link RX: radio0 still silent after {} re-arms → full reset + reconfigure",
+                    RADIO_REARM_CHEAP_ATTEMPTS
+                );
+                if configure_radio(radio, &current).await.is_err()
+                    || radio.rx_start().await.is_err()
+                {
+                    defmt::error!("link RX: radio0 self-heal reconfigure failed");
+                }
+            } else {
+                // Past escalation — keep cheap re-arms (harmless if TX is
+                // simply off) without re-logging every second.
+                let _ = radio.rx_start().await;
+            }
+            // Defer the next check a full window so we don't spam SPI /
+            // logs while a radio stays silent.
+            last_rx0_at = Instant::now();
+        }
+
         // ── Normal mode: continuous RX with watchdog + signal arms ─
         let cfg_wait = async {
             match config_updates {
@@ -1883,6 +2019,15 @@ where
                 } else {
                     rx0_caught = rx0_caught.wrapping_add(1);
                     last_rssi_rx0 = Some(pkt.rssi_dbm);
+                    // radio0 delivered → its RX path is alive.
+                    if rx0_rearms > 0 {
+                        defmt::info!(
+                            "link RX: radio0 recovered after {} re-arm(s)",
+                            rx0_rearms
+                        );
+                        rx0_rearms = 0;
+                    }
+                    last_rx0_at = arrived;
                 }
 
                 let n = pkt.len.min(radio_buf.len());
@@ -2087,6 +2232,12 @@ where
             Either5::First(Ok(_)) => {
                 // Chip set both `rx_done` and `crc_err` in the IRQ
                 // bitmap — a complete frame arrived but failed CRC.
+                // radio0's rx_recv returned, so its IRQ path is alive.
+                if rx0_rearms > 0 {
+                    defmt::info!("link RX: radio0 recovered after {} re-arm(s)", rx0_rearms);
+                    rx0_rearms = 0;
+                }
+                last_rx0_at = Instant::now();
                 // Counted in the existing `crc_mismatch` field so
                 // `recent_loss_pct` doesn't double-count it as
                 // "lost without trace."
@@ -2096,6 +2247,14 @@ where
                 }
             }
             Either5::First(Err(e)) => {
+                // radio0's rx_recv returned (an error, but it returned) —
+                // not the silent wedge the self-heal targets, so clear the
+                // re-arm episode and reset the silence clock.
+                if rx0_rearms > 0 {
+                    defmt::info!("link RX: radio0 recovered after {} re-arm(s)", rx0_rearms);
+                    rx0_rearms = 0;
+                }
+                last_rx0_at = Instant::now();
                 // Bucket by variant — different fingerprints suggest
                 // different root causes.  Throttle the per-variant
                 // log lines so a sustained error stream doesn't
