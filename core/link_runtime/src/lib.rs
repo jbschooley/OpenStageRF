@@ -1950,35 +1950,41 @@ where
                 None => core::future::pending::<()>().await,
             }
         };
-        // Receive from radio0, or from whichever of radio0/radio1 fires
-        // first when a diversity radio is present.  On a secondary win we
-        // copy its payload into `radio_buf` and return the same
-        // `Result<RxPacket, _>` the primary would, so every downstream
-        // arm (CRC-ok, early-CRC-fail, radio-error) is reached
-        // identically regardless of source.  `select` is biased toward
-        // its first future, so the single-radio (`None`) path resolves
-        // exactly as before.
-        // Which radio won this receive — read in the crc-ok arm to bump
-        // the per-radio attribution counters.  Reset each iteration;
-        // only meaningful when a packet (not a timer/signal) wins.
-        let mut from_radio1 = false;
+        // Race only radio0's IRQ *wait* (a bare DIO1 pin wait, safe to
+        // drop) against a frame from radio1's drain task — NOT radio0's SPI
+        // read.  Whoever wins, the actual packet read (`read_packet`) runs
+        // AFTER `select5` resolves, so radio0's SPI transfer can never be
+        // cancelled mid-flight (the corrupt length/pointer reads we chased).
+        // `select` is biased toward its first future; the single-radio
+        // (`None`) path still just waits radio0's IRQ.  Returns the inner
+        // `Either<wait_irq result, radio1 frame>` so the First arm can
+        // resolve it without the SPI read ever sitting inside a `select`.
         let recv_any = async {
             match secondary.as_ref() {
-                // Race the primary's own receive against a frame handed over
-                // from the secondary radio's drain task.  `select` polls the
-                // primary first, so the channel only wins when the primary is
-                // *pending* (no packet of its own) — cancelling a pending
-                // `rx_recv` (DIO1 still low) is harmless, so the primary's
-                // IRQ is never left stuck.  The secondary never gets cancelled
-                // at all (it lives in its own task).
-                Some(rx) => match select(radio.rx_recv(&mut radio_buf), rx.receive()).await {
-                    Either::First(res) => res,
+                Some(rx) => select(radio.wait_irq(), rx.receive()).await,
+                None => Either::First(radio.wait_irq().await),
+            }
+        };
+        match select5(recv_any, wd.wait(), cfg_wait, scan_wait, shutdown_wait).await {
+            Either5::Fifth(()) => {
+                handle_rx_shutdown(radio, led, sink).await;
+            }
+            Either5::First(recv) => {
+                // Resolve the receive winner OUTSIDE the select: read
+                // radio0's packet here (uncancellable) or unpack radio1's
+                // forwarded frame.  `from_radio1` drives per-radio
+                // attribution in the crc-ok arm below.
+                let mut from_radio1 = false;
+                let res = match recv {
+                    // radio0's DIO1 fired — read the packet now, not in a select.
+                    Either::First(Ok(())) => radio.read_packet(&mut radio_buf).await,
+                    // wait_irq pin error (rare) — surface it like any radio error.
+                    Either::First(Err(e)) => Err(e),
+                    // radio1's drain task forwarded a crc-ok frame.
                     Either::Second(frame) => {
                         from_radio1 = true;
                         let n = frame.len.min(radio_buf.len());
                         radio_buf[..n].copy_from_slice(&frame.buf[..n]);
-                        // Synthesize the same packet metadata `rx_recv` would
-                        // return; the producer only forwards crc-ok frames.
                         Ok(RxPacket {
                             len: n,
                             rssi_dbm: frame.rssi_dbm,
@@ -1986,318 +1992,342 @@ where
                             crc_ok: true,
                         })
                     }
-                },
-                None => radio.rx_recv(&mut radio_buf).await,
-            }
-        };
-        match select5(recv_any, wd.wait(), cfg_wait, scan_wait, shutdown_wait).await {
-            Either5::Fifth(()) => {
-                handle_rx_shutdown(radio, led, sink).await;
-            }
-            Either5::First(Ok(pkt)) if pkt.crc_ok => {
-                let arrived = Instant::now();
-                bucket_rx_gap(
-                    &mut rx_gap_buckets,
-                    arrived.duration_since(last_rx_at).as_millis(),
-                );
-                last_rx_at = arrived;
-                // RSSI updates on any radio receive (signal-strength
-                // panel should keep ticking even on rejected packets
-                // — the operator is still pulling RF in).  But the
-                // watchdog and the link-UP flag stay gated on
-                // `process()` actually *accepting* the packet (see
-                // the `Ok(Ok(()))` arm below) — a wrong-key TX is
-                // an effectively-dead link from the application's
-                // POV, even though radio packets keep arriving.
-                last_rssi = Some(pkt.rssi_dbm);
-
-                // Attribute this delivered packet to the radio that
-                // caught it (the `recv_any` select winner).
-                if from_radio1 {
-                    rx1_caught = rx1_caught.wrapping_add(1);
-                    last_rssi_rx1 = Some(pkt.rssi_dbm);
-                } else {
-                    rx0_caught = rx0_caught.wrapping_add(1);
-                    last_rssi_rx0 = Some(pkt.rssi_dbm);
-                    // radio0 delivered → its RX path is alive.
-                    if rx0_rearms > 0 {
-                        defmt::info!(
-                            "link RX: radio0 recovered after {} re-arm(s)",
-                            rx0_rearms
+                };
+                match res {
+                    Ok(pkt) if pkt.crc_ok => {
+                        let arrived = Instant::now();
+                        bucket_rx_gap(
+                            &mut rx_gap_buckets,
+                            arrived.duration_since(last_rx_at).as_millis(),
                         );
-                        rx0_rearms = 0;
-                    }
-                    last_rx0_at = arrived;
-                }
+                        last_rx_at = arrived;
+                        // RSSI updates on any radio receive (signal-strength
+                        // panel should keep ticking even on rejected packets
+                        // — the operator is still pulling RF in).  But the
+                        // watchdog and the link-UP flag stay gated on
+                        // `process()` actually *accepting* the packet (see
+                        // the `Ok(Ok(()))` arm below) — a wrong-key TX is
+                        // an effectively-dead link from the application's
+                        // POV, even though radio packets keep arriving.
+                        last_rssi = Some(pkt.rssi_dbm);
 
-                let n = pkt.len.min(radio_buf.len());
-                let now = Instant::now();
-                // Snapshot what we may need outside the closure.
-                let mut heartbeat_mask: Option<Option<u16>> = None;
-                let result = receiver.process(&radio_buf[..n], now, |ev| {
-                    match ev {
-                        RxEvent::Heartbeat(mask) => {
-                            accepted_heartbeats = accepted_heartbeats.wrapping_add(1);
-                            heartbeat_mask = Some(mask);
+                        // Attribute this delivered packet to the radio that
+                        // caught it (the `recv_any` select winner).
+                        if from_radio1 {
+                            rx1_caught = rx1_caught.wrapping_add(1);
+                            last_rssi_rx1 = Some(pkt.rssi_dbm);
+                        } else {
+                            rx0_caught = rx0_caught.wrapping_add(1);
+                            last_rssi_rx0 = Some(pkt.rssi_dbm);
+                            // radio0 delivered → its RX path is alive.
+                            if rx0_rearms > 0 {
+                                defmt::info!(
+                                    "link RX: radio0 recovered after {} re-arm(s)",
+                                    rx0_rearms
+                                );
+                                rx0_rearms = 0;
+                            }
+                            last_rx0_at = arrived;
                         }
-                        RxEvent::ChannelVoice(midi) => {
-                            accepted_midi = accepted_midi.wrapping_add(1);
-                            // Track local pressed-notes state so we can
-                            // detect divergence from TX's heartbeat mask.
-                            rx_state.observe(midi);
-                            let mut v: MidiBuf = heapless::Vec::new();
-                            let _ = v.extend_from_slice(midi);
-                            let _ = midi_events.push(v);
-                        }
-                        RxEvent::SysExComplete(body) => {
-                            accepted_sysex = accepted_sysex.wrapping_add(1);
-                            let mut v: SysExBuf = heapless::Vec::new();
-                            let _ = v.extend_from_slice(body);
-                            let _ = sysex_events.push(v);
-                        }
-                    }
-                });
 
-                // Stuck-note recovery: if this packet was a heartbeat
-                // carrying a mask, check each channel where TX says
-                // silent but RX has notes pressed.  Only fire recovery
-                // for channels where that divergence has persisted
-                // continuously for ≥ `STUCK_NOTE_MIN_DIVERGENCE_MS` —
-                // shorter divergences are almost certainly the
-                // legitimate race between a NoteOff being pushed (TX
-                // mask flips to 0) and that NoteOff actually reaching
-                // RX (up to +60 ms via delayed-copy retransmits).
-                //
-                // For each stuck channel, send SELECTIVE NoteOffs
-                // (status 0x80, vel 0) for the notes RX believes are
-                // still down — NOT a blanket CC 123.  This preserves
-                // release tails on unrelated notes while still
-                // clearing the genuinely-stuck ones.
-                if let Some(mask_opt) = heartbeat_mask {
-                    match mask_opt {
-                        Some(mask) => {
-                            let needed = rx_state.missing_clear(mask);
-                            for ch in 0..16u8 {
-                                let bit = 1u16 << ch;
-                                if needed & bit == 0 {
-                                    // No divergence on this channel —
-                                    // reset its timer.
-                                    divergence_since[ch as usize] = None;
-                                    continue;
+                        let n = pkt.len.min(radio_buf.len());
+                        let now = Instant::now();
+                        // Snapshot what we may need outside the closure.
+                        let mut heartbeat_mask: Option<Option<u16>> = None;
+                        let result = receiver.process(&radio_buf[..n], now, |ev| {
+                            match ev {
+                                RxEvent::Heartbeat(mask) => {
+                                    accepted_heartbeats = accepted_heartbeats.wrapping_add(1);
+                                    heartbeat_mask = Some(mask);
                                 }
-                                // Divergence present.  Start the timer
-                                // if this is the first observation.
-                                let started = divergence_since[ch as usize].get_or_insert(now);
-                                if now.duration_since(*started)
-                                    < Duration::from_millis(STUCK_NOTE_MIN_DIVERGENCE_MS)
-                                {
-                                    continue;
+                                RxEvent::ChannelVoice(midi) => {
+                                    accepted_midi = accepted_midi.wrapping_add(1);
+                                    // Track local pressed-notes state so we can
+                                    // detect divergence from TX's heartbeat mask.
+                                    rx_state.observe(midi);
+                                    let mut v: MidiBuf = heapless::Vec::new();
+                                    let _ = v.extend_from_slice(midi);
+                                    let _ = midi_events.push(v);
                                 }
-                                // Persisted long enough — recover.
-                                // Push selective NoteOffs for every
-                                // pressed note in this channel.  If
-                                // `midi_events` runs out of capacity
-                                // mid-loop, *don't* clear `rx_state`
-                                // for this channel — leave the
-                                // divergence timer set so the next
-                                // heartbeat retries the leftover
-                                // notes.  Sending duplicate NoteOffs
-                                // for notes the synth has already
-                                // silenced is a no-op; missing
-                                // NoteOffs leave permanently stuck
-                                // notes.  We optimise for the latter.
-                                let pressed = rx_state.pressed_on(ch);
-                                let mut count = 0u32;
-                                let mut overflowed = false;
-                                for note in 0..128u8 {
-                                    if pressed & (1u128 << note) != 0 {
-                                        let mut noteoff: MidiBuf = heapless::Vec::new();
-                                        let _ = noteoff.extend_from_slice(&[0x80 | ch, note, 0]);
-                                        if midi_events.push(noteoff).is_err() {
-                                            overflowed = true;
-                                            break;
+                                RxEvent::SysExComplete(body) => {
+                                    accepted_sysex = accepted_sysex.wrapping_add(1);
+                                    let mut v: SysExBuf = heapless::Vec::new();
+                                    let _ = v.extend_from_slice(body);
+                                    let _ = sysex_events.push(v);
+                                }
+                            }
+                        });
+
+                        // Stuck-note recovery: if this packet was a heartbeat
+                        // carrying a mask, check each channel where TX says
+                        // silent but RX has notes pressed.  Only fire recovery
+                        // for channels where that divergence has persisted
+                        // continuously for ≥ `STUCK_NOTE_MIN_DIVERGENCE_MS` —
+                        // shorter divergences are almost certainly the
+                        // legitimate race between a NoteOff being pushed (TX
+                        // mask flips to 0) and that NoteOff actually reaching
+                        // RX (up to +60 ms via delayed-copy retransmits).
+                        //
+                        // For each stuck channel, send SELECTIVE NoteOffs
+                        // (status 0x80, vel 0) for the notes RX believes are
+                        // still down — NOT a blanket CC 123.  This preserves
+                        // release tails on unrelated notes while still
+                        // clearing the genuinely-stuck ones.
+                        if let Some(mask_opt) = heartbeat_mask {
+                            match mask_opt {
+                                Some(mask) => {
+                                    let needed = rx_state.missing_clear(mask);
+                                    for ch in 0..16u8 {
+                                        let bit = 1u16 << ch;
+                                        if needed & bit == 0 {
+                                            // No divergence on this channel —
+                                            // reset its timer.
+                                            divergence_since[ch as usize] = None;
+                                            continue;
                                         }
-                                        count += 1;
-                                    }
-                                }
-                                if overflowed {
-                                    // Partial recovery — leave divergence
-                                    // timer set, retry next heartbeat.
-                                    // We don't touch `rx_state` so the
-                                    // still-stuck notes get retried.
-                                    defmt::warn!(
+                                        // Divergence present.  Start the timer
+                                        // if this is the first observation.
+                                        let started =
+                                            divergence_since[ch as usize].get_or_insert(now);
+                                        if now.duration_since(*started)
+                                            < Duration::from_millis(STUCK_NOTE_MIN_DIVERGENCE_MS)
+                                        {
+                                            continue;
+                                        }
+                                        // Persisted long enough — recover.
+                                        // Push selective NoteOffs for every
+                                        // pressed note in this channel.  If
+                                        // `midi_events` runs out of capacity
+                                        // mid-loop, *don't* clear `rx_state`
+                                        // for this channel — leave the
+                                        // divergence timer set so the next
+                                        // heartbeat retries the leftover
+                                        // notes.  Sending duplicate NoteOffs
+                                        // for notes the synth has already
+                                        // silenced is a no-op; missing
+                                        // NoteOffs leave permanently stuck
+                                        // notes.  We optimise for the latter.
+                                        let pressed = rx_state.pressed_on(ch);
+                                        let mut count = 0u32;
+                                        let mut overflowed = false;
+                                        for note in 0..128u8 {
+                                            if pressed & (1u128 << note) != 0 {
+                                                let mut noteoff: MidiBuf = heapless::Vec::new();
+                                                let _ = noteoff.extend_from_slice(&[
+                                                    0x80 | ch,
+                                                    note,
+                                                    0,
+                                                ]);
+                                                if midi_events.push(noteoff).is_err() {
+                                                    overflowed = true;
+                                                    break;
+                                                }
+                                                count += 1;
+                                            }
+                                        }
+                                        if overflowed {
+                                            // Partial recovery — leave divergence
+                                            // timer set, retry next heartbeat.
+                                            // We don't touch `rx_state` so the
+                                            // still-stuck notes get retried.
+                                            defmt::warn!(
                                         "RX stuck-note recovery: ch {} → midi_events full after {} NoteOff(s); retrying next heartbeat",
                                         ch,
                                         count
                                     );
-                                } else {
-                                    rx_state.clear_channel(ch);
-                                    divergence_since[ch as usize] = None;
-                                    stuck_recoveries = stuck_recoveries.wrapping_add(1);
-                                    defmt::warn!(
+                                        } else {
+                                            rx_state.clear_channel(ch);
+                                            divergence_since[ch as usize] = None;
+                                            stuck_recoveries = stuck_recoveries.wrapping_add(1);
+                                            defmt::warn!(
                                         "RX stuck-note recovery: ch {} → {} selective NoteOff(s) (total recoveries={})",
                                         ch,
                                         count,
                                         stuck_recoveries
                                     );
+                                        }
+                                    }
+                                }
+                                None => {
+                                    // Legacy 0-byte heartbeat — reset all
+                                    // divergence timers so a stale mask
+                                    // doesn't pollute recovery.
+                                    divergence_since = [None; 16];
                                 }
                             }
                         }
-                        None => {
-                            // Legacy 0-byte heartbeat — reset all
-                            // divergence timers so a stale mask
-                            // doesn't pollute recovery.
-                            divergence_since = [None; 16];
-                        }
-                    }
-                }
-                match result {
-                    Ok(Ok(())) => {
-                        accepted = accepted.wrapping_add(1);
-                        let _ = led.toggle();
-                        // Mark the link as alive only on acceptance —
-                        // a wrong-key TX produces a steady stream of
-                        // KeyFpMismatch drops that should *not* keep
-                        // the link "UP", because no MIDI is making it
-                        // through.  Watchdog kick lives here too for
-                        // the same reason: it should fire after
-                        // `watchdog_ms` of no *accepted* traffic, not
-                        // of no radio activity.
-                        wd.kick();
-                        let was_down = !link_up;
-                        link_up = true;
-                        if was_down {
-                            defmt::info!("link RX: link UP");
-                        }
-                        // Log Open↔AEAD transitions exactly once per
-                        // crossover — quiet during steady state, but
-                        // gives a clear audit trail when the operator
-                        // flips the Key menu on the TX side.
-                        let observed = receiver.last_accepted_key_fp();
-                        if observed != last_logged_key_fp {
-                            match observed {
-                                None => {}
-                                Some(fp) if fp == osrf_link::KEY_FP_NONE => {
-                                    defmt::info!("link RX: accepting plaintext (key_fp=000000)",)
+                        match result {
+                            Ok(Ok(())) => {
+                                accepted = accepted.wrapping_add(1);
+                                let _ = led.toggle();
+                                // Mark the link as alive only on acceptance —
+                                // a wrong-key TX produces a steady stream of
+                                // KeyFpMismatch drops that should *not* keep
+                                // the link "UP", because no MIDI is making it
+                                // through.  Watchdog kick lives here too for
+                                // the same reason: it should fire after
+                                // `watchdog_ms` of no *accepted* traffic, not
+                                // of no radio activity.
+                                wd.kick();
+                                let was_down = !link_up;
+                                link_up = true;
+                                if was_down {
+                                    defmt::info!("link RX: link UP");
                                 }
-                                Some(fp) => defmt::info!(
+                                // Log Open↔AEAD transitions exactly once per
+                                // crossover — quiet during steady state, but
+                                // gives a clear audit trail when the operator
+                                // flips the Key menu on the TX side.
+                                let observed = receiver.last_accepted_key_fp();
+                                if observed != last_logged_key_fp {
+                                    match observed {
+                                        None => {}
+                                        Some(fp) if fp == osrf_link::KEY_FP_NONE => {
+                                            defmt::info!(
+                                                "link RX: accepting plaintext (key_fp=000000)",
+                                            )
+                                        }
+                                        Some(fp) => defmt::info!(
                                     "link RX: accepting AEAD key_fp={=u8:02x}{=u8:02x}{=u8:02x}",
                                     fp[2],
                                     fp[1],
                                     fp[0],
                                 ),
+                                    }
+                                    last_logged_key_fp = observed;
+                                }
                             }
-                            last_logged_key_fp = observed;
+                            Ok(Err(reason)) => {
+                                dropped = dropped.wrapping_add(1);
+                                if !matches!(reason, RxDrop::PacketReplay(_)) {
+                                    defmt::warn!(
+                                        "RX dropped: {:?} (accepted={} dropped={})",
+                                        reason,
+                                        accepted,
+                                        dropped
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                dropped = dropped.wrapping_add(1);
+                                defmt::warn!(
+                                    "RX decode error (accepted={} dropped={})",
+                                    accepted,
+                                    dropped
+                                );
+                            }
                         }
-                    }
-                    Ok(Err(reason)) => {
-                        dropped = dropped.wrapping_add(1);
-                        if !matches!(reason, RxDrop::PacketReplay(_)) {
-                            defmt::warn!(
-                                "RX dropped: {:?} (accepted={} dropped={})",
-                                reason,
-                                accepted,
-                                dropped
-                            );
-                        }
-                    }
-                    Err(_) => {
-                        dropped = dropped.wrapping_add(1);
-                        defmt::warn!(
-                            "RX decode error (accepted={} dropped={})",
-                            accepted,
-                            dropped
-                        );
-                    }
-                }
 
-                // Drain buffered events to the sink.  MIDI events
-                // first, then SysEx — within any single iteration a
-                // packet produces events of one kind only (see the
-                // `BufferedEvent` comment above), so the order
-                // between the two vecs is never observable.
-                for bytes in midi_events.iter() {
-                    defmt::info!("RX MIDI: {=[u8]:#x}", bytes.as_slice());
-                    if sink.write_message(bytes).await.is_err() {
-                        defmt::error!("sink write_message failed");
-                    }
-                }
-                for bytes in sysex_events.iter() {
-                    defmt::info!("RX SysEx: {} bytes", bytes.len());
-                    if sink.write_message(bytes).await.is_err() {
-                        defmt::error!("sink SysEx write failed");
-                    }
-                }
-            }
-            Either5::First(Ok(_)) => {
-                // Chip set both `rx_done` and `crc_err` in the IRQ
-                // bitmap — a complete frame arrived but failed CRC.
-                // radio0's rx_recv returned, so its IRQ path is alive.
-                if rx0_rearms > 0 {
-                    defmt::info!("link RX: radio0 recovered after {} re-arm(s)", rx0_rearms);
-                    rx0_rearms = 0;
-                }
-                last_rx0_at = Instant::now();
-                // Counted in the existing `crc_mismatch` field so
-                // `recent_loss_pct` doesn't double-count it as
-                // "lost without trace."
-                crc_mismatch = crc_mismatch.wrapping_add(1);
-                if crc_mismatch.is_multiple_of(50) {
-                    defmt::warn!("RX: CRC mismatch count = {}", crc_mismatch);
-                }
-            }
-            Either5::First(Err(e)) => {
-                // radio0's rx_recv returned (an error, but it returned) —
-                // not the silent wedge the self-heal targets, so clear the
-                // re-arm episode and reset the silence clock.
-                if rx0_rearms > 0 {
-                    defmt::info!("link RX: radio0 recovered after {} re-arm(s)", rx0_rearms);
-                    rx0_rearms = 0;
-                }
-                last_rx0_at = Instant::now();
-                // Bucket by variant — different fingerprints suggest
-                // different root causes.  Throttle the per-variant
-                // log lines so a sustained error stream doesn't
-                // flood the RTT buffer.
-                match e {
-                    RadioErrorKind::CrcMismatch => {
-                        err_crc_mismatch = err_crc_mismatch.wrapping_add(1);
-                        if err_crc_mismatch.is_multiple_of(50) {
-                            defmt::warn!("RX: early-CRC-fail count = {}", err_crc_mismatch);
+                        // Drain buffered events to the sink.  MIDI events
+                        // first, then SysEx — within any single iteration a
+                        // packet produces events of one kind only (see the
+                        // `BufferedEvent` comment above), so the order
+                        // between the two vecs is never observable.
+                        for bytes in midi_events.iter() {
+                            defmt::info!("RX MIDI: {=[u8]:#x}", bytes.as_slice());
+                            if sink.write_message(bytes).await.is_err() {
+                                defmt::error!("sink write_message failed");
+                            }
+                        }
+                        for bytes in sysex_events.iter() {
+                            defmt::info!("RX SysEx: {} bytes", bytes.len());
+                            if sink.write_message(bytes).await.is_err() {
+                                defmt::error!("sink SysEx write failed");
+                            }
                         }
                     }
-                    RadioErrorKind::UnexpectedIrq(irq) => {
-                        err_unexpected_irq = err_unexpected_irq.wrapping_add(1);
-                        if err_unexpected_irq <= 5 || err_unexpected_irq.is_multiple_of(20) {
-                            defmt::warn!(
-                                "RX: unexpected IRQ {=u16:#06x} (count {})",
-                                irq,
-                                err_unexpected_irq
+                    Ok(_) => {
+                        // Chip set both `rx_done` and `crc_err` in the IRQ
+                        // bitmap — a complete frame arrived but failed CRC.
+                        // radio0's read returned, so its IRQ path is alive.
+                        if rx0_rearms > 0 {
+                            defmt::info!(
+                                "link RX: radio0 recovered after {} re-arm(s)",
+                                rx0_rearms
                             );
+                            rx0_rearms = 0;
+                        }
+                        last_rx0_at = Instant::now();
+                        // Counted in the existing `crc_mismatch` field so
+                        // `recent_loss_pct` doesn't double-count it as
+                        // "lost without trace."
+                        crc_mismatch = crc_mismatch.wrapping_add(1);
+                        if crc_mismatch.is_multiple_of(50) {
+                            defmt::warn!("RX: CRC mismatch count = {}", crc_mismatch);
                         }
                     }
-                    RadioErrorKind::Spi => {
-                        err_spi = err_spi.wrapping_add(1);
-                        defmt::warn!("RX: SPI error (count {})", err_spi);
+                    Err(e) => {
+                        // radio0's read returned (an error, but it returned) —
+                        // not the silent wedge the self-heal targets, so clear the
+                        // re-arm episode and reset the silence clock.
+                        if rx0_rearms > 0 {
+                            defmt::info!(
+                                "link RX: radio0 recovered after {} re-arm(s)",
+                                rx0_rearms
+                            );
+                            rx0_rearms = 0;
+                        }
+                        last_rx0_at = Instant::now();
+                        // Bucket by variant — different fingerprints suggest
+                        // different root causes.  Throttle the per-variant
+                        // log lines so a sustained error stream doesn't
+                        // flood the RTT buffer.
+                        match e {
+                            RadioErrorKind::CrcMismatch => {
+                                err_crc_mismatch = err_crc_mismatch.wrapping_add(1);
+                                if err_crc_mismatch.is_multiple_of(50) {
+                                    defmt::warn!("RX: early-CRC-fail count = {}", err_crc_mismatch);
+                                }
+                            }
+                            RadioErrorKind::UnexpectedIrq(irq) => {
+                                err_unexpected_irq = err_unexpected_irq.wrapping_add(1);
+                                if err_unexpected_irq <= 5 || err_unexpected_irq.is_multiple_of(20)
+                                {
+                                    defmt::warn!(
+                                        "RX: unexpected IRQ {=u16:#06x} (count {})",
+                                        irq,
+                                        err_unexpected_irq
+                                    );
+                                }
+                            }
+                            RadioErrorKind::Spi => {
+                                err_spi = err_spi.wrapping_add(1);
+                                defmt::warn!("RX: SPI error (count {})", err_spi);
+                            }
+                            RadioErrorKind::Bus => {
+                                err_bus = err_bus.wrapping_add(1);
+                                defmt::warn!("RX: bus / pin-wait error (count {})", err_bus);
+                            }
+                            RadioErrorKind::BufferTooSmall { .. } => {
+                                // A received frame carried a payload-length field
+                                // bigger than our buffer.  In variable-length GFSK
+                                // the length byte travels over the air, so a momentary
+                                // fade (e.g. the transmitter swinging through a null)
+                                // corrupts it — this is just a damaged packet, the
+                                // same family as a CRC failure, and diversity plus the
+                                // next packet cover it (link stays at 0% loss).  Count
+                                // it as a damaged frame and stay quiet; a genuinely
+                                // wedged radio0 is caught loudly by the separate
+                                // silence → re-arm path instead, so we lose no
+                                // visibility into a real fault.
+                                err_crc_mismatch = err_crc_mismatch.wrapping_add(1);
+                            }
+                            _ => {
+                                // Reset / Switch / PayloadTooLarge /
+                                // BufferTooSmall / InvalidSyncWord / Timeout.
+                                // These shouldn't fire on a healthy RX path
+                                // — `Reset`/`Switch` have generic payloads
+                                // that don't impl `defmt::Format` so we
+                                // can't print the variant directly.  The
+                                // count alone is enough to flag "something
+                                // unusual is going wrong; investigate."
+                                err_other = err_other.wrapping_add(1);
+                                defmt::warn!("RX: other radio error variant (count {})", err_other);
+                            }
+                        }
                     }
-                    RadioErrorKind::Bus => {
-                        err_bus = err_bus.wrapping_add(1);
-                        defmt::warn!("RX: bus / pin-wait error (count {})", err_bus);
-                    }
-                    _ => {
-                        // Reset / Switch / PayloadTooLarge /
-                        // BufferTooSmall / InvalidSyncWord / Timeout.
-                        // These shouldn't fire on a healthy RX path
-                        // — `Reset`/`Switch` have generic payloads
-                        // that don't impl `defmt::Format` so we
-                        // can't print the variant directly.  The
-                        // count alone is enough to flag "something
-                        // unusual is going wrong; investigate."
-                        err_other = err_other.wrapping_add(1);
-                        defmt::warn!("RX: other radio error variant (count {})", err_other);
-                    }
-                }
-            }
+                } // end `match res`
+            } // end `Either5::First(recv)`
             Either5::Second(()) => {
                 if link_up {
                     link_up = false;

@@ -51,8 +51,14 @@ pub enum Error<SwitchErr, ResetErr> {
     Bus,
     /// Caller passed too-long payload.
     PayloadTooLarge,
-    /// Caller-supplied buffer too small for received packet.
-    BufferTooSmall,
+    /// `GetRxBufferStatus` reported a payload length larger than the
+    /// caller's buffer.  On a healthy chip this never happens (TX caps
+    /// payloads well under the buffer); when it does, `got` is almost
+    /// always a garbage SPI read — `got == 0xFF` with `rx_ptr == 0xFF`
+    /// means MISO floated high (chip not responding / BUSY contention),
+    /// whereas a plausible-but-too-big `got` points at a FIFO overrun.
+    /// Fields are carried so the runtime can log the decisive value.
+    BufferTooSmall { got: u16, max: u16, rx_ptr: u8 },
     /// Sync word > 8 bytes.
     InvalidSyncWord,
     /// CRC of received packet didn't match.
@@ -749,13 +755,31 @@ where
         Ok(())
     }
 
-    /// Wait for the next packet.  Chip stays in continuous RX after.
-    /// Caller is responsible for `rx_start` once before the loop and
-    /// (eventually) calling some other state-changing method (`tx`,
-    /// `set_standby`, etc.) to leave RX.
-    pub async fn rx_recv(&mut self, buf: &mut [u8]) -> Result<RxPacket, RadioError<Reset, Switch>> {
-        self.dio1.wait_for_high().await.map_err(|_| Error::Bus)?;
+    /// Wait for the radio's DIO1 IRQ line to assert (RX done / CRC error /
+    /// timeout, per the IRQ mask).  **Cancel-safe**: this is purely a GPIO
+    /// pin wait with no SPI transaction in flight, so dropping the future
+    /// (e.g. losing a `select`/`with_timeout`) leaves the chip untouched —
+    /// the IRQ stays latched in the SX1262 and the next `wait_irq` returns
+    /// immediately.  Pair with [`read_packet`] to actually read the frame.
+    ///
+    /// The split between this and [`read_packet`] exists so a receive loop
+    /// can race the *wait* against other futures (channels, timers) while
+    /// keeping the *SPI read* out of any `select` — cancelling a read
+    /// mid-transfer corrupts it (garbage length / pointer reads).
+    pub async fn wait_irq(&mut self) -> Result<(), RadioError<Reset, Switch>> {
+        self.dio1.wait_for_high().await.map_err(|_| Error::Bus)
+    }
 
+    /// Read the packet whose IRQ [`wait_irq`] just reported.  Assumes DIO1
+    /// is already high (an IRQ is pending).  **Do NOT run this inside a
+    /// `select`/`with_timeout`** — it issues a sequence of SPI commands and
+    /// cancelling it mid-transfer leaves the read half-done (the corrupt
+    /// reads we were chasing).  Clears the IRQ before returning, so the chip
+    /// is ready for the next packet (it stays in continuous RX).
+    pub async fn read_packet(
+        &mut self,
+        buf: &mut [u8],
+    ) -> Result<RxPacket, RadioError<Reset, Switch>> {
         let irq = self.get_irq_raw().await?;
         self.cmd(CMD_CLEAR_IRQ_STATUS, &[0xFF, 0xFF]).await?;
 
@@ -770,7 +794,11 @@ where
             let payload_len = bs[0] as usize;
             let rx_start = bs[1];
             if payload_len > buf.len() {
-                return Err(Error::BufferTooSmall);
+                return Err(Error::BufferTooSmall {
+                    got: payload_len as u16,
+                    max: buf.len() as u16,
+                    rx_ptr: rx_start,
+                });
             }
             self.read_buffer(rx_start, &mut buf[..payload_len]).await?;
             // GetPacketStatus (FSK): [status, RxStatus, RssiSync, RssiAvg].
@@ -789,6 +817,18 @@ where
         } else {
             Err(Error::UnexpectedIrq(irq))
         }
+    }
+
+    /// Wait for the next packet, then read it.  Chip stays in continuous RX
+    /// after.  Convenience wrapper over [`wait_irq`] + [`read_packet`] for
+    /// callers that are **not** racing the receive against other futures (a
+    /// dedicated drain task whose only cancellation points are an idle-only
+    /// timeout and rare reconfigure).  A loop that races receive against a
+    /// busy channel/timer should call the two halves separately so the SPI
+    /// read in `read_packet` never sits inside the `select`.
+    pub async fn rx_recv(&mut self, buf: &mut [u8]) -> Result<RxPacket, RadioError<Reset, Switch>> {
+        self.wait_irq().await?;
+        self.read_packet(buf).await
     }
 
     /// Toggle the SX1262's RX gain register between `rx_default`
