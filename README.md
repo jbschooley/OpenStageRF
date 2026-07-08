@@ -22,7 +22,14 @@ cargo xtask run ui_bench_tx_470
 
 The `_470` profiles are identical to their 900 MHz counterparts but ship the 470–514 MHz band plans (the Band Plan menu shows only the band the radio can tune). Flash the variant matching your hardware. **Adding a profile = drop a `.toml` in `configs/`** — see [`configs/README.md`](configs/README.md) for the schema; no new crate needed.
 
-To capture logs to a file: `cargo xtask run <profile> 2>&1 | tee run.log`. If two probes are connected, flash one at a time (the xtask doesn't pass a `--probe` selector).
+To capture logs to a file: `cargo xtask run <profile> 2>&1 | tee run.log`. For the diversity receivers:
+
+```bash
+cargo xtask run ui_rx_diversity     2>&1 | tee rx_diversity.log   # 900 MHz diversity RX → log
+cargo xtask run ui_rx_diversity_470 2>&1 | tee rx_div_470.log     # 470 MHz diversity RX → log
+```
+
+If two probes are connected, flash one at a time (the xtask doesn't pass a `--probe` selector).
 
 **AEAD keys** are baked into UI builds at build time from `osrf-keys.toml` at the repo root (gitignored; copy `osrf-keys.toml.example`), or the `keys = ` path in the profile TOML. Each top-level table is one key (table name = display name) and all of them appear in the device's Key menu; `active = "<name>"` picks the boot default. Paired TX/RX units must build with the same key and have it selected. With no key file the build falls back to insecure test keys and prints a `NOT FOR PRODUCTION` warning.
 
