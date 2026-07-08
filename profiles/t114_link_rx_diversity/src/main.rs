@@ -45,7 +45,13 @@ unsafe fn pre_init() {
 /// Producer task: owns radio1 (DX-LR30), drains it into `RADIO1_CH`.
 #[embassy_executor::task]
 async fn secondary_task(mut radio1: board::Radio1, config: LinkConfig) -> ! {
-    run_rx_secondary(&mut radio1, &config, Some(&SECONDARY_CFG), RADIO1_CH.sender()).await
+    run_rx_secondary(
+        &mut radio1,
+        &config,
+        Some(&SECONDARY_CFG),
+        RADIO1_CH.sender(),
+    )
+    .await
 }
 
 #[embassy_executor::main]

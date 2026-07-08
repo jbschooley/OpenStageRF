@@ -51,7 +51,11 @@ fn main() {
         assert!(!chans.is_empty(), "{}: empty channel list", path.display());
         entries.push((id, label, chans));
     }
-    assert!(!entries.is_empty(), "no band_plans/*.toml found in {}", dir.display());
+    assert!(
+        !entries.is_empty(),
+        "no band_plans/*.toml found in {}",
+        dir.display()
+    );
 
     let default_idx = entries
         .iter()

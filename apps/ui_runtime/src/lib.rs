@@ -54,7 +54,7 @@ use osrf_link_runtime::{
     ShutdownSignal,
 };
 use osrf_ui::{
-    band_plan_channel, band_plan_storage_id, band_plan_from_storage_id, build_screen,
+    band_plan_channel, band_plan_from_storage_id, band_plan_storage_id, build_screen,
     max_channel_index, AboutData, BandPlan, BatteryChemistry, BatteryStatus, Command, KeyRecord,
     KeyStore, LinkStatus, PowerPolicy, ScanState, ScreenId, Settings, UiState, Widget, WidgetList,
     KEY_RECORD_BYTES, MAX_KEY_NAME, MAX_SCAN_CHANNELS, WIRED_USB_LOSS_GRACE_SECS,

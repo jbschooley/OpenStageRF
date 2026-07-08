@@ -379,9 +379,7 @@ pub fn resources_with_diversity() -> (Resources, Radio1) {
 }
 
 /// [`resources_with_diversity()`] with a caller-supplied clock config.
-pub fn resources_with_diversity_config(
-    config: embassy_nrf::config::Config,
-) -> (Resources, Radio1) {
+pub fn resources_with_diversity_config(config: embassy_nrf::config::Config) -> (Resources, Radio1) {
     let p = init_with(config);
     let (r, radio1_tokens, _usbd) = build_resources(p);
     (r, build_radio1(radio1_tokens))
@@ -689,12 +687,6 @@ pub fn build_radio1(tokens: Radio1Tokens) -> Radio1 {
     // `init()` skips `SetDio3AsTcxoCtrl` — otherwise the chip is put in TCXO
     // mode it can't satisfy and never demodulates.  The on-board radio0
     // (LR1262) does have a TCXO, so it keeps the default.
-    osrf_radio_sx126x::Sx1262Radio::new(
-        spi_dev,
-        busy,
-        dio1,
-        reset,
-        osrf_radio_sx126x::Dio2RfSwitch,
-    )
-    .without_tcxo()
+    osrf_radio_sx126x::Sx1262Radio::new(spi_dev, busy, dio1, reset, osrf_radio_sx126x::Dio2RfSwitch)
+        .without_tcxo()
 }

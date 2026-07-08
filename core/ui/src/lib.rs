@@ -1066,7 +1066,6 @@ fn active_key_cursor(active_fp: Option<u32>, keys: &KeyStore) -> u8 {
         .unwrap_or(0)
 }
 
-
 /// Which list a list-based screen is selecting from.  Public so
 /// menu definitions can refer to it via [`ItemAction::List`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
