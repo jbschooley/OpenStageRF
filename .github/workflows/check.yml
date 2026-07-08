@@ -135,39 +135,32 @@ jobs:
           done
 
   # ── embedded-build ─────────────────────────────────────────────────
-  # Build canary profiles for each supported board to catch breakage
-  # of the profile / board / driver layers.  `cargo xtask check`
-  # resolves each profile's board → target from its
-  # `[package.metadata.osrf]` block, so we just enumerate the profile
-  # names here.
+  # Build the shipped UI deployment profiles to catch breakage of the
+  # profile / board / driver layers.  `cargo xtask check` resolves each
+  # profile from `configs/<name>.toml` (board → rustc target, app crate,
+  # and the role / tx_source / diversity / band baked in via env), so we
+  # just enumerate the config names here.
   #
-  # Profiles in the matrix exercise different feature combinations:
-  #   - `*_blink`       — bare-minimum board bring-up.
-  #   - `*_midi_tx/rx`  — link runtime + MIDI app on each board.
-  #   - `t114_ui`       — the full UI / battery / power-policy stack.
+  # The matrix is the full shipped set: tx / rx / rx_diversity / bench_tx,
+  # in both the 902–928 MHz and 470–514 MHz band variants.  All build the
+  # generic `osrf-profile-t114-ui-app` crate and exercise the AEAD
+  # plumbing through the production UI path.
   embedded-build:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         profile:
-          - dx_lr30_blink
-          - dx_lr30_midi_tx
-          - dx_lr30_midi_rx
-          - t114_blink
-          - t114_midi_tx
-          - t114_midi_rx
-          # Full UI deployment — three bin profiles + the shared lib
-          # `osrf-profile-t114-ui` (the lib is built transitively).
-          # Exercises the AEAD plumbing through the production UI path.
-          - t114_ui_tx
-          - t114_ui_rx
-          - t114_ui_bench_tx
-          # Paired link-bench profiles with the Stage-3 AEAD test-stub
-          # key wired in.  Exercises the encrypt / decrypt path through
-          # `osrf-link-runtime` end-to-end without the UI stack on top.
-          - t114_link_tx
-          - t114_link_rx
+          # 902–928 MHz
+          - ui_tx
+          - ui_rx
+          - ui_rx_diversity
+          - ui_bench_tx
+          # 470–514 MHz
+          - ui_tx_470
+          - ui_rx_470
+          - ui_rx_diversity_470
+          - ui_bench_tx_470
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0

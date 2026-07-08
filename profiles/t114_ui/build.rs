@@ -46,8 +46,9 @@ fn main() {
                 .parse()
                 .unwrap_or_else(|e| panic!("{}: invalid TOML: {e}", key_path.display()));
             if let Some(v) = tbl.get("device_id").and_then(|v| v.as_integer()) {
-                device_id = u32::try_from(v)
-                    .unwrap_or_else(|_| panic!("{}: device_id out of u32 range", key_path.display()));
+                device_id = u32::try_from(v).unwrap_or_else(|_| {
+                    panic!("{}: device_id out of u32 range", key_path.display())
+                });
             }
             active = tbl.get("active").and_then(|v| v.as_str()).map(String::from);
             // Every other top-level table is a key.

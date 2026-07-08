@@ -97,7 +97,9 @@ fn main() -> ExitCode {
     // `configs/<name>.toml` builds the generic `osrf-profile-<app>-app` crate
     // with the profile baked in via env vars.  Falls through to the legacy
     // crate-per-profile path when no config file exists.
-    let config_path = workspace.join("configs").join(format!("{profile_name}.toml"));
+    let config_path = workspace
+        .join("configs")
+        .join(format!("{profile_name}.toml"));
     if config_path.exists() {
         return run_toml_profile(&workspace, &config_path, subcommand);
     }
@@ -228,10 +230,7 @@ fn run_toml_profile(workspace: &Path, config_path: &Path, subcommand: &str) -> E
     };
 
     // Board → rustc target (same lookup as the crate-based path).
-    let board_cargo = workspace
-        .join("boards")
-        .join(&cfg.board)
-        .join("Cargo.toml");
+    let board_cargo = workspace.join("boards").join(&cfg.board).join("Cargo.toml");
     let target = match read_osrf_metadata(&board_cargo) {
         Ok(m) => match m.target {
             Some(t) => t,

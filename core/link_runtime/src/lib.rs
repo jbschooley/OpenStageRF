@@ -74,7 +74,8 @@ pub struct DiversityRxFrame {
 /// diversity radio's drain task) to [`run_rx_diversity`] (the primary
 /// receive loop).  A profile declares one as a `static` and hands a
 /// `.receiver()` to the consumer and a `.sender()` to the producer.
-pub type DiversityRxChannel = Channel<CriticalSectionRawMutex, DiversityRxFrame, DIVERSITY_CH_DEPTH>;
+pub type DiversityRxChannel =
+    Channel<CriticalSectionRawMutex, DiversityRxFrame, DIVERSITY_CH_DEPTH>;
 /// Receiver half of [`DiversityRxChannel`] (consumed by the primary loop).
 pub type DiversityRxReceiver =
     Receiver<'static, CriticalSectionRawMutex, DiversityRxFrame, DIVERSITY_CH_DEPTH>;

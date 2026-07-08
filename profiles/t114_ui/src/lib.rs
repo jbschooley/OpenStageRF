@@ -29,8 +29,8 @@ use embassy_futures::select::{select3, Either3};
 use embassy_time::Timer;
 use osrf_app_link_bench::synthetic::ScenarioSource;
 use osrf_app_midi_node::{
-    run_rx, run_rx_diversity, run_rx_secondary, run_tx, AeadConfig, AeadUpdate, CipherId, Direction,
-    DiversityRxChannel, LinkConfig, LinkConfigSignal, UartMidiSink, UartMidiSource,
+    run_rx, run_rx_diversity, run_rx_secondary, run_tx, AeadConfig, AeadUpdate, CipherId,
+    Direction, DiversityRxChannel, LinkConfig, LinkConfigSignal, UartMidiSink, UartMidiSource,
 };
 use osrf_app_ui_runtime as app;
 use osrf_board_t114 as board;
@@ -659,7 +659,13 @@ async fn link_rx_diversity_task(
 /// Retunes when the consumer forwards a config change via `SECONDARY_CFG`.
 #[embassy_executor::task]
 async fn link_rx_secondary_task(mut radio1: board::Radio1, config: LinkConfig) -> ! {
-    run_rx_secondary(&mut radio1, &config, Some(&SECONDARY_CFG), RADIO1_CH.sender()).await
+    run_rx_secondary(
+        &mut radio1,
+        &config,
+        Some(&SECONDARY_CFG),
+        RADIO1_CH.sender(),
+    )
+    .await
 }
 
 #[embassy_executor::task]

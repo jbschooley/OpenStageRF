@@ -179,10 +179,10 @@ impl<R: Read> MidiSource for UartMidiSource<R> {
         let mut flushed = 0u32;
         loop {
             match with_timeout(Duration::from_millis(5), self.uart.read(&mut buf)).await {
-                Ok(Ok(0)) => break,                 // EOF — shouldn't happen
-                Ok(Ok(n)) => flushed += n as u32,   // got bytes, keep going
-                Ok(Err(_)) => break,                // UART error — stop
-                Err(_) => break,                    // timed out — line is quiet
+                Ok(Ok(0)) => break,               // EOF — shouldn't happen
+                Ok(Ok(n)) => flushed += n as u32, // got bytes, keep going
+                Ok(Err(_)) => break,              // UART error — stop
+                Err(_) => break,                  // timed out — line is quiet
             }
         }
         // Drop any complete events seeded before this call and clear

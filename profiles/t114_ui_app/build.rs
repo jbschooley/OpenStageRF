@@ -90,11 +90,17 @@ fn main() {
                     .iter()
                     .map(|v| {
                         v.as_str()
-                            .unwrap_or_else(|| panic!("{}: band_plans entries must be strings", path.display()))
+                            .unwrap_or_else(|| {
+                                panic!("{}: band_plans entries must be strings", path.display())
+                            })
                             .to_string()
                     })
                     .collect();
-                assert!(!band_plans.is_empty(), "{}: band_plans is empty", path.display());
+                assert!(
+                    !band_plans.is_empty(),
+                    "{}: band_plans is empty",
+                    path.display()
+                );
             }
         }
         None => {

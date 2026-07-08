@@ -55,4 +55,8 @@ ignore = [
     # `proc-macro-error` unmaintained; pulled in by `maybe-async-cfg` via
     # `ssd1306` (DX-LR30 OLED).  `cargo deny` confirms no safe upgrade.
     { id = "RUSTSEC-2024-0370", reason = "transitive via ssd1306 → maybe-async-cfg; awaiting upstream replacement" },
+    # `proc-macro-error2` unmaintained (the maintained fork of the above is
+    # now also abandoned); pulled in by `defmt-macros` → `defmt`, a
+    # build-time proc-macro.  `cargo deny` confirms no safe upgrade.
+    { id = "RUSTSEC-2026-0173", reason = "transitive via defmt-macros → defmt; awaiting upstream drop" },
 ]
