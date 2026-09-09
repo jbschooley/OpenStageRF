@@ -8,6 +8,8 @@ description = "Milestone 2 — board-agnostic SX1262 bench test (TX and RX loops
 
 [dependencies]
 osrf-radio-sx126x  = { workspace = true, features = ["defmt"] }
+osrf-phy-api       = { workspace = true }
+osrf-phy-sx126x    = { workspace = true, features = ["defmt"] }
 embedded-hal       = { workspace = true }
 embedded-hal-async = { workspace = true }
 embassy-time       = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
