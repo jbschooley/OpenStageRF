@@ -82,7 +82,7 @@ The repo has many profiles.  The relevant T114 ones, grouped by purpose:
 - `t114_blink` — LED toggle, sanity-check the toolchain works.
 
 **Radio bring-up (no link layer):**
-- `t114_radio_tx`, `t114_radio_rx` — bare-metal SX1262 driver test, no MIDI.
+- `t114_radio_tx`, `t114_radio_rx` — bare-metal SX1262 test through the `osrf-phy-api` `Phy` adapter (`drivers/phy/sx126x`), no MIDI.  A clean packet log on two boards is the adapter's hardware test.
 - `t114_tx_basic`, `t114_rx_basic` — adds packet framing.
 
 **Link layer with synthetic MIDI (the bench):**

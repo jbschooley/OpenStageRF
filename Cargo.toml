@@ -10,6 +10,7 @@ members = [
     "boards/dx_lr30",
     "boards/t114",
     "core/link",
+    "core/phy_api",
     "core/link_runtime",
     "core/panic_log",
     "core/ui",
@@ -18,6 +19,7 @@ members = [
     "drivers/input/joystick5way",
     "drivers/midi/din",
     "drivers/radio/sx126x",
+    "drivers/phy/sx126x",
     "ports/embassy_stm32",
     "profiles/dx_lr30_blink",
     "profiles/dx_lr30_midi_rx",
@@ -59,6 +61,7 @@ default-members = [
     "apps/ui_runtime",
     "boards/dx_lr30",
     "core/link",
+    "core/phy_api",
     "core/link_runtime",
     "core/panic_log",
     "core/ui",
@@ -67,6 +70,7 @@ default-members = [
     "drivers/input/joystick5way",
     "drivers/midi/din",
     "drivers/radio/sx126x",
+    "drivers/phy/sx126x",
     "ports/embassy_stm32",
     "profiles/dx_lr30_blink",
     "profiles/dx_lr30_midi_rx",
@@ -99,6 +103,8 @@ osrf-driver-display-st7789        = { path = "drivers/display/st7789" }
 osrf-driver-input-joystick5way    = { path = "drivers/input/joystick5way" }
 osrf-midi-din                     = { path = "drivers/midi/din" }
 osrf-radio-sx126x                 = { path = "drivers/radio/sx126x" }
+osrf-phy-api                      = { path = "core/phy_api" }
+osrf-phy-sx126x                   = { path = "drivers/phy/sx126x" }
 osrf-profile-dx-lr30-blink        = { path = "profiles/dx_lr30_blink" }
 osrf-profile-dx-lr30-midi-tx      = { path = "profiles/dx_lr30_midi_tx" }
 osrf-profile-dx-lr30-midi-rx      = { path = "profiles/dx_lr30_midi_rx" }

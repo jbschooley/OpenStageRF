@@ -1,0 +1,21 @@
+[package]
+name        = "osrf-phy-api"
+version     = "0.1.0"
+publish     = false
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "The Phy trait every radio adapter implements (packet radios, the Si4463 continuous stream, the wideband superframe modem), its capability descriptor, and a simulator PHY for host tests."
+
+[features]
+default = []
+# Simulator PHY: host only (std).  Loss, burst, bit-error, delay and
+# reorder models; 1-slot or N-slot shapes; internal or external FEC/CRC.
+sim = ["std"]
+std = []
+
+[dependencies]
+
+[lib]
+test    = true
+doctest = false
+bench   = false

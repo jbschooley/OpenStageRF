@@ -1,0 +1,21 @@
+[package]
+name        = "osrf-phy-sx126x"
+version     = "0.1.0"
+publish     = false
+edition     = "2021"
+license     = "AGPL-3.0-or-later"
+description = "Phy adapter for the SX1262 driver: presents the packet radio through osrf-phy-api so transports (MIDI today, audio next) talk to it like any other PHY."
+
+[features]
+defmt = ["osrf-radio-sx126x/defmt"]
+
+[dependencies]
+osrf-phy-api       = { workspace = true }
+osrf-radio-sx126x  = { workspace = true }
+embedded-hal       = { workspace = true }
+embedded-hal-async = { workspace = true }
+
+[lib]
+test    = false
+doctest = false
+bench   = false
