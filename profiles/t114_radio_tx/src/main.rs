@@ -32,6 +32,14 @@ unsafe fn pre_init() {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    // Clear DEMCR before anything else — see the `t114_dap_idle_freeze`
+    // note and `profiles/t114_ui/src/lib.rs`.  `probe-rs run` arms the
+    // HardFault / reset vector catches; with the SoftDevice bootloader a
+    // transient HardFault then halts the core (probe-rs shows it as
+    // "Firmware exited unexpectedly: Exception") instead of being handled.
+    const DEMCR: *mut u32 = 0xE000_EDFC as *mut u32;
+    unsafe { core::ptr::write_volatile(DEMCR, 0) };
+
     #[cfg(feature = "usb-log")]
     let mut r = {
         let (r, usbd) = board::resources_and_usbd_with(board::clocks::usb_config());
