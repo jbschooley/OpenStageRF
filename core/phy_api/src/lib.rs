@@ -122,7 +122,12 @@ impl PhyCaps {
         if self.slot_period_us == 0 {
             return 0;
         }
-        let per_period: u32 = self.tx_slots.iter().filter(|s| s.dir == dir).map(|s| s.bytes as u32).sum();
+        let per_period: u32 = self
+            .tx_slots
+            .iter()
+            .filter(|s| s.dir == dir)
+            .map(|s| s.bytes as u32)
+            .sum();
         (per_period as u64 * 1_000_000 / self.slot_period_us as u64) as u32
     }
 }

@@ -15,14 +15,22 @@
 
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::{digital::Wait, spi::SpiDevice};
-use osrf_phy_api::{CrcCaps, Dir, FecCaps, MetaCaps, Phy, PhyCaps, PhyError, PhyKind, RxMeta, SlotDesc, TxSlot};
-use osrf_radio_sx126x::{Error, GfskBandwidth, GfskPulseShape, RadioError, RfSwitchControl, Sx1262Radio};
+use osrf_phy_api::{
+    CrcCaps, Dir, FecCaps, MetaCaps, Phy, PhyCaps, PhyError, PhyKind, RxMeta, SlotDesc, TxSlot,
+};
+use osrf_radio_sx126x::{
+    Error, GfskBandwidth, GfskPulseShape, RadioError, RfSwitchControl, Sx1262Radio,
+};
 
 /// Longest payload the adapter accepts (the driver's packet-length field
 /// is a byte; the runtimes size their wire buffers to this).
 pub const PAYLOAD_MAX: u8 = 64;
 
-static SLOTS: [SlotDesc; 1] = [SlotDesc { id: 0, bytes: PAYLOAD_MAX as u16, dir: Dir::Down }];
+static SLOTS: [SlotDesc; 1] = [SlotDesc {
+    id: 0,
+    bytes: PAYLOAD_MAX as u16,
+    dir: Dir::Down,
+}];
 
 /// What every SX1262 module offers, independent of configuration.
 pub static CAPS: PhyCaps = PhyCaps {
@@ -33,7 +41,11 @@ pub static CAPS: PhyCaps = PhyCaps {
     fec: FecCaps::None,
     crc: CrcCaps::Internal,
     sync_tick: false,
-    meta: MetaCaps { rssi: true, snr: false, antenna: false },
+    meta: MetaCaps {
+        rssi: true,
+        snr: false,
+        antenna: false,
+    },
     freq_min_khz: 150_000,
     freq_max_khz: 960_000,
     freq_step_khz: 1,
@@ -94,7 +106,9 @@ where
 
 fn map_err<S, R>(e: Error<S, R>) -> PhyError {
     match e {
-        Error::PayloadTooLarge | Error::BufferTooSmall { .. } | Error::InvalidSyncWord => PhyError::Frame,
+        Error::PayloadTooLarge | Error::BufferTooSmall { .. } | Error::InvalidSyncWord => {
+            PhyError::Frame
+        }
         Error::Timeout => PhyError::Timeout,
         _ => PhyError::Io,
     }
@@ -109,7 +123,14 @@ where
     Switch: RfSwitchControl,
 {
     pub fn new(radio: &'a mut Sx1262Radio<Spi, Busy, Dio1, Reset, Switch>) -> Self {
-        Sx126xPhy { radio, payload_max: PAYLOAD_MAX, tx_period: 0, rx_period: 0, in_rx: false, branch: 0 }
+        Sx126xPhy {
+            radio,
+            payload_max: PAYLOAD_MAX,
+            tx_period: 0,
+            rx_period: 0,
+            in_rx: false,
+            branch: 0,
+        }
     }
     /// Diversity branch id reported in `RxMeta::antenna` (0 = first radio).
     pub fn with_branch(mut self, branch: u8) -> Self {
@@ -136,8 +157,17 @@ where
     async fn apply(&mut self, cfg: &Sx126xConfig) -> Result<(), RadioError<Reset, Switch>> {
         self.radio.init().await?;
         self.radio.set_frequency(cfg.frequency_hz).await?;
-        self.radio.set_modulation_gfsk(cfg.bitrate_bps, cfg.deviation_hz, cfg.gfsk_bandwidth, cfg.pulse_shape).await?;
-        self.radio.set_packet_format(cfg.preamble_bits, &cfg.sync_word, cfg.payload_max, true).await?;
+        self.radio
+            .set_modulation_gfsk(
+                cfg.bitrate_bps,
+                cfg.deviation_hz,
+                cfg.gfsk_bandwidth,
+                cfg.pulse_shape,
+            )
+            .await?;
+        self.radio
+            .set_packet_format(cfg.preamble_bits, &cfg.sync_word, cfg.payload_max, true)
+            .await?;
         self.radio.set_tx_power(cfg.tx_power_dbm).await?;
         if cfg.rx_boosted {
             self.radio.set_rx_boosted(true).await?;
@@ -166,7 +196,9 @@ where
         if cfg.payload_max == 0 || cfg.payload_max > PAYLOAD_MAX {
             return Err(PhyError::Config);
         }
-        if cfg.frequency_hz / 1000 < CAPS.freq_min_khz || cfg.frequency_hz / 1000 > CAPS.freq_max_khz {
+        if cfg.frequency_hz / 1000 < CAPS.freq_min_khz
+            || cfg.frequency_hz / 1000 > CAPS.freq_max_khz
+        {
             return Err(PhyError::Config);
         }
         if cfg.tx_power_dbm < CAPS.tx_power_min_dbm || cfg.tx_power_dbm > CAPS.tx_power_max_dbm {
@@ -219,10 +251,27 @@ where
         }
         let period = self.rx_period;
         self.rx_period = self.rx_period.wrapping_add(1);
-        let base = RxMeta { slot: 0, len: 0, period, rssi_dbm: None, snr_db: None, antenna: self.branch, crc_ok: true, sync_tick: false };
+        let base = RxMeta {
+            slot: 0,
+            len: 0,
+            period,
+            rssi_dbm: None,
+            snr_db: None,
+            antenna: self.branch,
+            crc_ok: true,
+            sync_tick: false,
+        };
         match self.radio.rx_recv(buf).await {
-            Ok(pkt) => Ok(RxMeta { len: pkt.len.min(buf.len()), rssi_dbm: Some(pkt.rssi_dbm), crc_ok: pkt.crc_ok, ..base }),
-            Err(Error::CrcMismatch) => Ok(RxMeta { crc_ok: false, ..base }),
+            Ok(pkt) => Ok(RxMeta {
+                len: pkt.len.min(buf.len()),
+                rssi_dbm: Some(pkt.rssi_dbm),
+                crc_ok: pkt.crc_ok,
+                ..base
+            }),
+            Err(Error::CrcMismatch) => Ok(RxMeta {
+                crc_ok: false,
+                ..base
+            }),
             Err(e) => {
                 // The chip may have left RX (unexpected IRQ, bus trouble);
                 // re-arm on the next call.

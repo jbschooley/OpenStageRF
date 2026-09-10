@@ -21,7 +21,9 @@
 //! * `delay`: periods between transmission and delivery; `jitter` adds a
 //!   random 0..=jitter on top, which also reorders.
 
-use crate::{CrcCaps, Dir, FecCaps, MetaCaps, Phy, PhyCaps, PhyError, PhyKind, RxMeta, SlotDesc, TxSlot};
+use crate::{
+    CrcCaps, Dir, FecCaps, MetaCaps, Phy, PhyCaps, PhyError, PhyKind, RxMeta, SlotDesc, TxSlot,
+};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -31,18 +33,62 @@ pub mod shapes {
 
     /// 1 Mb/s × 333.3 µs = 333 bits; 24 go to the adapter's sync word and
     /// sequence, 38 bytes (304 bits) are payload.
-    const ONE_DOWN_38: [SlotDesc; 1] = [SlotDesc { id: 0, bytes: 38, dir: Dir::Down }];
-    const ONE_DOWN_64: [SlotDesc; 1] = [SlotDesc { id: 0, bytes: 64, dir: Dir::Down }];
+    const ONE_DOWN_38: [SlotDesc; 1] = [SlotDesc {
+        id: 0,
+        bytes: 38,
+        dir: Dir::Down,
+    }];
+    const ONE_DOWN_64: [SlotDesc; 1] = [SlotDesc {
+        id: 0,
+        bytes: 64,
+        dir: Dir::Down,
+    }];
     const EIGHT_DOWN_ONE_UP: [SlotDesc; 9] = [
-        SlotDesc { id: 0, bytes: 48, dir: Dir::Down },
-        SlotDesc { id: 1, bytes: 48, dir: Dir::Down },
-        SlotDesc { id: 2, bytes: 48, dir: Dir::Down },
-        SlotDesc { id: 3, bytes: 48, dir: Dir::Down },
-        SlotDesc { id: 4, bytes: 48, dir: Dir::Down },
-        SlotDesc { id: 5, bytes: 48, dir: Dir::Down },
-        SlotDesc { id: 6, bytes: 48, dir: Dir::Down },
-        SlotDesc { id: 7, bytes: 48, dir: Dir::Down },
-        SlotDesc { id: 8, bytes: 16, dir: Dir::Up },
+        SlotDesc {
+            id: 0,
+            bytes: 48,
+            dir: Dir::Down,
+        },
+        SlotDesc {
+            id: 1,
+            bytes: 48,
+            dir: Dir::Down,
+        },
+        SlotDesc {
+            id: 2,
+            bytes: 48,
+            dir: Dir::Down,
+        },
+        SlotDesc {
+            id: 3,
+            bytes: 48,
+            dir: Dir::Down,
+        },
+        SlotDesc {
+            id: 4,
+            bytes: 48,
+            dir: Dir::Down,
+        },
+        SlotDesc {
+            id: 5,
+            bytes: 48,
+            dir: Dir::Down,
+        },
+        SlotDesc {
+            id: 6,
+            bytes: 48,
+            dir: Dir::Down,
+        },
+        SlotDesc {
+            id: 7,
+            bytes: 48,
+            dir: Dir::Down,
+        },
+        SlotDesc {
+            id: 8,
+            bytes: 16,
+            dir: Dir::Up,
+        },
     ];
 
     /// The Si4463 direct-mode shape: one 38-byte block every 333 µs (four
@@ -55,7 +101,11 @@ pub mod shapes {
         fec: FecCaps::None,
         crc: CrcCaps::None,
         sync_tick: true,
-        meta: MetaCaps { rssi: true, snr: false, antenna: false },
+        meta: MetaCaps {
+            rssi: true,
+            snr: false,
+            antenna: false,
+        },
         freq_min_khz: 470_000,
         freq_max_khz: 608_000,
         freq_step_khz: 25,
@@ -73,7 +123,11 @@ pub mod shapes {
         fec: FecCaps::None,
         crc: CrcCaps::Internal,
         sync_tick: false,
-        meta: MetaCaps { rssi: true, snr: true, antenna: false },
+        meta: MetaCaps {
+            rssi: true,
+            snr: true,
+            antenna: false,
+        },
         freq_min_khz: 470_000,
         freq_max_khz: 928_000,
         freq_step_khz: 1,
@@ -91,7 +145,11 @@ pub mod shapes {
         fec: FecCaps::Internal { rate: (2, 3) },
         crc: CrcCaps::Internal,
         sync_tick: true,
-        meta: MetaCaps { rssi: true, snr: true, antenna: true },
+        meta: MetaCaps {
+            rssi: true,
+            snr: true,
+            antenna: true,
+        },
         freq_min_khz: 470_000,
         freq_max_khz: 608_000,
         freq_step_khz: 1000,
@@ -116,7 +174,14 @@ pub struct Impairments {
 }
 
 impl Impairments {
-    pub const CLEAN: Impairments = Impairments { loss: 0.0, burst: 1, ber: 0.0, delay: 0, jitter: 0, rssi_dbm: -60 };
+    pub const CLEAN: Impairments = Impairments {
+        loss: 0.0,
+        burst: 1,
+        ber: 0.0,
+        delay: 0,
+        jitter: 0,
+        rssi_dbm: -60,
+    };
 }
 
 #[derive(Clone)]
@@ -143,14 +208,35 @@ pub struct Air(Arc<Mutex<AirState>>);
 
 impl Air {
     pub fn new(caps: PhyCaps) -> Self {
-        Air(Arc::new(Mutex::new(AirState { caps, tx_period: 0, tx_next_slot: 0, sent: VecDeque::new(), sent_base: 0, branches: 0 })))
+        Air(Arc::new(Mutex::new(AirState {
+            caps,
+            tx_period: 0,
+            tx_next_slot: 0,
+            sent: VecDeque::new(),
+            sent_base: 0,
+            branches: 0,
+        })))
     }
     pub fn caps(&self) -> PhyCaps {
         self.0.lock().unwrap().caps
     }
     /// The transmitter end.
     pub fn transmitter(&self) -> SimPhy {
-        SimPhy { air: self.clone(), role: Role::Tx, caps: self.caps(), imp: Impairments::CLEAN, rx_period: 0, next_index: 0, burst_left: 0, in_burst: false, prng: Lcg(1), branch: 0, pending: VecDeque::new(), delivered: 0, dropped: 0 }
+        SimPhy {
+            air: self.clone(),
+            role: Role::Tx,
+            caps: self.caps(),
+            imp: Impairments::CLEAN,
+            rx_period: 0,
+            next_index: 0,
+            burst_left: 0,
+            in_burst: false,
+            prng: Lcg(1),
+            branch: 0,
+            pending: VecDeque::new(),
+            delivered: 0,
+            dropped: 0,
+        }
     }
     /// A receiver branch with its own impairments and random stream.
     pub fn receiver(&self, imp: Impairments, seed: u64) -> SimPhy {
@@ -168,7 +254,9 @@ impl Air {
             next_index: 0,
             burst_left: 0,
             in_burst: false,
-            prng: Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(branch as u64 + 1)),
+            prng: Lcg(seed
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(branch as u64 + 1)),
             branch,
             pending: VecDeque::new(),
             delivered: 0,
@@ -186,7 +274,10 @@ enum Role {
 struct Lcg(u64);
 impl Lcg {
     fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0
     }
     fn next_f64(&mut self) -> f64 {
@@ -260,7 +351,10 @@ impl SimPhy {
             // One loss decision per period, not per sub-slot.
             if last_period != Some(f.period) {
                 last_period = Some(f.period);
-                if self.burst_left == 0 && self.imp.loss > 0.0 && self.prng.next_f64() < self.imp.loss {
+                if self.burst_left == 0
+                    && self.imp.loss > 0.0
+                    && self.prng.next_f64() < self.imp.loss
+                {
                     self.burst_left = self.imp.burst.max(1);
                 }
                 // `in_burst` covers this whole period's sub-slots; the
@@ -290,8 +384,15 @@ impl SimPhy {
                 CrcCaps::Internal => !flipped,
                 CrcCaps::None => true,
             };
-            let deliver_at = f.period.wrapping_add(self.imp.delay).wrapping_add(self.prng.below(self.imp.jitter + 1));
-            self.pending.push_back(Arrival { deliver_at, frame: Frame { bytes, ..f }, crc_ok });
+            let deliver_at = f
+                .period
+                .wrapping_add(self.imp.delay)
+                .wrapping_add(self.prng.below(self.imp.jitter + 1));
+            self.pending.push_back(Arrival {
+                deliver_at,
+                frame: Frame { bytes, ..f },
+                crc_ok,
+            });
         }
         // Deliver in arrival order.
         let mut v: Vec<Arrival> = self.pending.drain(..).collect();
@@ -311,7 +412,10 @@ impl Phy for SimPhy {
         Ok(())
     }
     async fn set_frequency_khz(&mut self, khz: u32) -> Result<(), PhyError> {
-        if khz < self.caps.freq_min_khz || khz > self.caps.freq_max_khz || (khz - self.caps.freq_min_khz) % self.caps.freq_step_khz != 0 {
+        if khz < self.caps.freq_min_khz
+            || khz > self.caps.freq_max_khz
+            || (khz - self.caps.freq_min_khz) % self.caps.freq_step_khz != 0
+        {
             return Err(PhyError::Config);
         }
         Ok(())
@@ -350,8 +454,16 @@ impl Phy for SimPhy {
         }
         let mut a = self.air.0.lock().unwrap();
         // The period this frame belongs to is the one `next_tx_slot` handed out.
-        let period = if a.caps.kind == PhyKind::PacketRadio || a.tx_next_slot != 0 { a.tx_period } else { a.tx_period.wrapping_sub(1) };
-        a.sent.push_back(Frame { slot, period, bytes: bytes.to_vec() });
+        let period = if a.caps.kind == PhyKind::PacketRadio || a.tx_next_slot != 0 {
+            a.tx_period
+        } else {
+            a.tx_period.wrapping_sub(1)
+        };
+        a.sent.push_back(Frame {
+            slot,
+            period,
+            bytes: bytes.to_vec(),
+        });
         // Keep the log bounded: a receiver that falls this far behind the
         // transmitter loses the oldest frames (a real radio would too).
         while a.sent.len() > LOG_DEPTH {
@@ -366,7 +478,9 @@ impl Phy for SimPhy {
         }
         self.ingest();
         let due = match self.pending.front() {
-            Some(a) if self.caps.kind == PhyKind::PacketRadio || a.deliver_at <= self.rx_period => true,
+            Some(a) if self.caps.kind == PhyKind::PacketRadio || a.deliver_at <= self.rx_period => {
+                true
+            }
             _ => false,
         };
         if !due {
@@ -380,9 +494,17 @@ impl Phy for SimPhy {
             slot: a.frame.slot,
             len: n,
             period: a.frame.period,
-            rssi_dbm: if self.caps.meta.rssi { Some(self.imp.rssi_dbm) } else { None },
+            rssi_dbm: if self.caps.meta.rssi {
+                Some(self.imp.rssi_dbm)
+            } else {
+                None
+            },
             snr_db: if self.caps.meta.snr { Some(20) } else { None },
-            antenna: if self.caps.meta.antenna { self.branch } else { 0 },
+            antenna: if self.caps.meta.antenna {
+                self.branch
+            } else {
+                0
+            },
             crc_ok: a.crc_ok,
             sync_tick: self.caps.sync_tick && a.frame.slot == self.caps.rx_slots[0].id,
         })
@@ -391,7 +513,10 @@ impl Phy for SimPhy {
         Ok(self.imp.rssi_dbm)
     }
     fn max_frame_len(&self, slot: u8) -> usize {
-        self.caps.tx_slot(slot).map(|s| s.bytes as usize).unwrap_or(0)
+        self.caps
+            .tx_slot(slot)
+            .map(|s| s.bytes as usize)
+            .unwrap_or(0)
     }
 }
 
@@ -443,7 +568,11 @@ mod tests {
     fn loss_model_hits_the_configured_rate_in_bursts() {
         let air = Air::new(shapes::STREAM_1);
         let mut tx = air.transmitter();
-        let imp = Impairments { loss: 0.002, burst: 10, ..Impairments::CLEAN };
+        let imp = Impairments {
+            loss: 0.002,
+            burst: 10,
+            ..Impairments::CLEAN
+        };
         let mut rx = air.receiver(imp, 7);
         // Interleave like a real link: one period sent, one period received.
         let mut got = Vec::new();
@@ -465,7 +594,10 @@ mod tests {
             }
             prev = Some(m.period);
         }
-        assert!(gaps * 10 <= lost + 200 && gaps * 10 + 200 >= lost, "gaps {gaps} for lost {lost}");
+        assert!(
+            gaps * 10 <= lost + 200 && gaps * 10 + 200 >= lost,
+            "gaps {gaps} for lost {lost}"
+        );
     }
 
     #[test]
@@ -496,11 +628,20 @@ mod tests {
         for (caps, expect_flag) in [(shapes::PACKET, true), (shapes::STREAM_1, false)] {
             let air = Air::new(caps);
             let mut tx = air.transmitter();
-            let mut rx = air.receiver(Impairments { ber: 0.01, ..Impairments::CLEAN }, 9);
+            let mut rx = air.receiver(
+                Impairments {
+                    ber: 0.01,
+                    ..Impairments::CLEAN
+                },
+                9,
+            );
             send_periods(&mut tx, 500, |_, _| vec![0u8; 32]);
             let got = drain(&mut rx, 501);
             assert_eq!(got.len(), 500);
-            let corrupted = got.iter().filter(|(_, b)| b.iter().any(|&x| x != 0)).count();
+            let corrupted = got
+                .iter()
+                .filter(|(_, b)| b.iter().any(|&x| x != 0))
+                .count();
             assert!(corrupted > 400, "corrupted {corrupted}");
             let flagged = got.iter().filter(|(m, _)| !m.crc_ok).count();
             if expect_flag {
@@ -515,7 +656,14 @@ mod tests {
     fn delay_and_jitter_hold_frames_until_due_and_reorder() {
         let air = Air::new(shapes::STREAM_1);
         let mut tx = air.transmitter();
-        let mut rx = air.receiver(Impairments { delay: 3, jitter: 2, ..Impairments::CLEAN }, 5);
+        let mut rx = air.receiver(
+            Impairments {
+                delay: 3,
+                jitter: 2,
+                ..Impairments::CLEAN
+            },
+            5,
+        );
         send_periods(&mut tx, 200, |p, _| p.to_le_bytes().to_vec());
         let mut buf = [0u8; 64];
         // Nothing is due before period 3.
@@ -538,7 +686,10 @@ mod tests {
         let mut rx = air.receiver(Impairments::CLEAN, 2);
         assert_eq!(block_on(tx.tx(0, &[0u8; 65])).err(), Some(PhyError::Frame));
         assert_eq!(block_on(tx.tx(1, &[0u8; 8])).err(), Some(PhyError::Frame));
-        assert_eq!(block_on(tx.set_frequency_khz(469_999)).err(), Some(PhyError::Config));
+        assert_eq!(
+            block_on(tx.set_frequency_khz(469_999)).err(),
+            Some(PhyError::Config)
+        );
         assert!(block_on(tx.set_frequency_khz(915_000)).is_ok());
         for i in 0..5u8 {
             let s = block_on(tx.next_tx_slot());
@@ -553,4 +704,3 @@ mod tests {
         assert_eq!(block_on(rx.rx(&mut buf)).err(), Some(PhyError::Timeout));
     }
 }
-

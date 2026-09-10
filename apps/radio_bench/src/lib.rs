@@ -39,7 +39,10 @@ where
 {
     let mut phy = Sx126xPhy::new(radio);
     if let Err(e) = phy.configure(&CONFIG).await {
-        defmt::error!("radio configure failed ({}); halting TX loop", defmt::Debug2Format(&e));
+        defmt::error!(
+            "radio configure failed ({}); halting TX loop",
+            defmt::Debug2Format(&e)
+        );
         loop {
             Timer::after_millis(1000).await;
         }
@@ -91,7 +94,10 @@ where
 {
     let mut phy = Sx126xPhy::new(radio);
     if let Err(e) = phy.configure(&CONFIG).await {
-        defmt::error!("radio configure failed ({}); halting RX loop", defmt::Debug2Format(&e));
+        defmt::error!(
+            "radio configure failed ({}); halting RX loop",
+            defmt::Debug2Format(&e)
+        );
         loop {
             Timer::after_millis(1000).await;
         }
