@@ -31,6 +31,7 @@ use osrf_app_link_bench::synthetic::ScenarioSource;
 use osrf_app_midi_node::{
     run_rx, run_rx_diversity, run_rx_secondary, run_tx, AeadConfig, AeadUpdate, CipherId,
     Direction, DiversityRxChannel, LinkConfig, LinkConfigSignal, UartMidiSink, UartMidiSource,
+    Waveform,
 };
 use osrf_app_ui_runtime as app;
 use osrf_board_t114 as board;
@@ -216,6 +217,9 @@ const WDT_TIMEOUT_TICKS: u32 = 5 * 32_768;
 /// also fixes the default/clamp: a fresh device boots on `band_plans[0]`,
 /// and a persisted plan outside this list (e.g. after reflashing across
 /// bands) is snapped back to `band_plans[0]`.
+/// Re-exported for the app crate's generated config.
+pub use osrf_app_midi_node::Waveform as LinkWaveform;
+
 pub async fn run(
     spawner: Spawner,
     role: Role,
@@ -225,7 +229,9 @@ pub async fn run(
     power_policy: PowerPolicy,
     chemistry: BatteryChemistry,
     name: &'static str,
+    waveform: Waveform,
 ) -> ! {
+    let base_link = LinkConfig::for_waveform(waveform);
     // Clear DEMCR — see `t114_dap_idle_freeze.md` memory note.
     // Without this, transient HardFaults halt the core forever
     // post-`cargo run` once the probe is detached.
@@ -447,7 +453,7 @@ pub async fn run(
     spawner.spawn(ui_render_task(display, fb, renderer, wdt_render).expect("alloc ui_render_task"));
 
     // ── link_runtime on its own interrupt executor at P2 ─────────
-    let config = app::link_config_from(&settings);
+    let config = app::link_config_from(&base_link, &settings);
 
     let irq = interrupt::EGU0_SWI0;
     irq.set_priority(Priority::P2);
@@ -550,6 +556,7 @@ pub async fn run(
         vbus_present_fn,
         board::power::enter_system_off,
         aead_resolver,
+        base_link,
     )
     .await
 }

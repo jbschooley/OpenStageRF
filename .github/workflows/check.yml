@@ -156,6 +156,10 @@ jobs:
           - ui_rx
           - ui_rx_diversity
           - ui_bench_tx
+          # 902–928 MHz, the 15.247 waveform
+          - ui_tx_915_fcc
+          - ui_rx_915_fcc
+          - ui_rx_diversity_915_fcc
           # 470–514 MHz
           - ui_tx_470
           - ui_rx_470
