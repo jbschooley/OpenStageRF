@@ -257,6 +257,9 @@ pub async fn ui_state_loop<BL, F, W>(
     // and the RX-side decrypt path will use.  Implemented per-profile
     // per-role — see the t114_ui profile for the canonical example.
     aead_resolver: fn(Option<u32>) -> AeadUpdate,
+    // The link config the profile starts from (its `waveform`); the UI
+    // only ever changes frequency and power on top of it.
+    base_link: LinkConfig,
 ) -> !
 where
     BL: embedded_hal::digital::OutputPin,
@@ -335,11 +338,11 @@ where
                     defmt::info!("ui command: {:?}", cmd);
                     match cmd {
                         Command::ApplyChannel(ch) => {
-                            CONFIG_UPDATES.signal(link_config_from(&settings));
+                            CONFIG_UPDATES.signal(link_config_from(&base_link, &settings));
                             save_channel(flash, settings_range.clone(), ch).await;
                         }
                         Command::ApplyBandPlan(plan) => {
-                            CONFIG_UPDATES.signal(link_config_from(&settings));
+                            CONFIG_UPDATES.signal(link_config_from(&base_link, &settings));
                             save_band_plan(flash, settings_range.clone(), plan).await;
                             // Band-plan change resets channel to 0; persist
                             // the new channel too so a reboot in the new plan
@@ -347,7 +350,7 @@ where
                             save_channel(flash, settings_range.clone(), settings.channel).await;
                         }
                         Command::ApplyTxPower(dbm) => {
-                            CONFIG_UPDATES.signal(link_config_from(&settings));
+                            CONFIG_UPDATES.signal(link_config_from(&base_link, &settings));
                             save_tx_power(flash, settings_range.clone(), dbm).await;
                         }
                         Command::ApplySetActiveKey(fp) => {
@@ -639,11 +642,11 @@ pub fn link_status_from_stats(s: &LinkStats) -> LinkStatus {
     }
 }
 
-/// Build a [`LinkConfig`] from the UI's [`Settings`].  Today only
-/// `frequency_hz` and `tx_power_dbm` flow through; the rest stays
-/// at `default_915()` values.
-pub fn link_config_from(settings: &Settings) -> LinkConfig {
-    let mut c = LinkConfig::default_915();
+/// Build a [`LinkConfig`] from the UI's [`Settings`] on top of the
+/// profile's base waveform.  Only `frequency_hz` and `tx_power_dbm`
+/// come from the settings.
+pub fn link_config_from(base: &LinkConfig, settings: &Settings) -> LinkConfig {
+    let mut c = *base;
     c.frequency_hz = settings.current_channel().frequency_khz * 1000;
     c.tx_power_dbm = settings.tx_power_dbm;
     c

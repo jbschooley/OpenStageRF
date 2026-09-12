@@ -1,0 +1,15 @@
+# T114 UI transmitter, DIN MIDI in, 902–928 MHz in the 47 CFR 15.247
+# shape (2-GFSK 150 kb/s, 250 kHz deviation: ≥ 500 kHz at 6 dB, so the
+# full 15.247 power allowance applies instead of 15.249's 0.75 mW).
+# Only the ISM plan: this waveform is a 902–928 MHz rule.
+app       = "t114_ui"
+board     = "t114"
+role      = "tx"
+name      = "Stage TX"
+tx_source = "uart"
+diversity = false
+waveform  = "fcc247"
+band_plans = ["ism915"]
+power_policy = "wired"
+battery      = "lipo"
+keys      = "osrf-keys.toml"

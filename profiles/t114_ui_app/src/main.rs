@@ -33,6 +33,7 @@ async fn main(spawner: Spawner) {
         POWER_POLICY,
         CHEMISTRY,
         NAME,
+        WAVEFORM,
     )
     .await;
 }

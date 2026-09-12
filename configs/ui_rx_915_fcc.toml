@@ -1,0 +1,11 @@
+# T114 UI receiver, 902–928 MHz, the 15.247 waveform (see ui_tx_915_fcc).
+app       = "t114_ui"
+board     = "t114"
+role      = "rx"
+name      = "Stage RX"
+diversity = false
+waveform  = "fcc247"
+band_plans = ["ism915"]
+power_policy = "wired"
+battery      = "lipo"
+keys      = "osrf-keys.toml"

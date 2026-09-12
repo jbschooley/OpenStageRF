@@ -34,7 +34,7 @@ pub use osrf_link_runtime::{
     configure_radio, osrf_crypto, run_rx, run_rx_diversity, run_rx_secondary, run_tx, AeadConfig,
     AeadUpdate, AeadUpdateSignal, CipherId, Direction, DiversityRxChannel, DiversityRxFrame,
     DiversityRxReceiver, DiversityRxSender, LinkConfig, LinkConfigSignal, LinkStats, LinkStatsCell,
-    ScanController, RF_PAYLOAD_MAX, SCAN_MAX_CHANNELS, SCAN_RSSI_NONE,
+    ScanController, Waveform, RF_PAYLOAD_MAX, SCAN_MAX_CHANNELS, SCAN_RSSI_NONE,
 };
 
 pub use uart::{UartMidiSink, UartMidiSource};

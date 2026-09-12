@@ -140,7 +140,55 @@ impl LinkConfig {
             heartbeat_ms: 10,
         }
     }
+
+    /// The 902–928 MHz shape that 47 CFR 15.247 allows at full power:
+    /// digital modulation with a **6 dB bandwidth of at least 500 kHz**.
+    /// 2-GFSK at 150 kb/s with 250 kHz deviation (index 3.3) simulates
+    /// at 575 kHz (6 dB) and 675 kHz (20 dB) with the ideal BT 0.5 pulse
+    /// (`docs/regulatory/midi_915_fcc247.md`), 75 kHz over the rule; the
+    /// SX1262's widest receive filter (467 kHz) then clips ~1.7 dB off
+    /// the edges.  Both numbers are simulation until measured on the
+    /// bench.  Everything else is [`Self::default_915`].
+    pub const fn fcc247_915() -> Self {
+        Self {
+            bitrate_bps: 150_000,
+            deviation_hz: 250_000,
+            ..Self::default_915()
+        }
+    }
+
+    /// The link config a profile starts from (`waveform` key).
+    pub const fn for_waveform(w: Waveform) -> Self {
+        match w {
+            Waveform::Bench => Self::default_915(),
+            Waveform::Fcc247 => Self::fcc247_915(),
+        }
+    }
+
+    /// Carson-rule occupied bandwidth, 2·(deviation + bitrate/2).
+    pub const fn carson_bandwidth_hz(&self) -> u32 {
+        2 * (self.deviation_hz + self.bitrate_bps / 2)
+    }
 }
+
+/// Which on-air shape the MIDI link uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Waveform {
+    /// The original 300 kb/s / 50 kHz bench setting: ~175 kHz at 6 dB,
+    /// which in 902–928 MHz falls under 15.249's 0.75 mW EIRP, not
+    /// 15.247.  Evaluation kits only.
+    Bench,
+    /// [`LinkConfig::fcc247_915`]: qualifies as 15.247 digital
+    /// modulation, up to 1 W conducted (the SX1262 stops at +22 dBm).
+    Fcc247,
+}
+
+// The rule is 500 kHz at 6 dB; Carson's rule overstates the 6 dB width,
+// so this only catches a setting that cannot possibly qualify.
+const _: () = assert!(LinkConfig::fcc247_915().carson_bandwidth_hz() >= 500_000);
+
+impl LinkConfig {}
 
 // ── Live config-update signalling ───────────────────────────────────────────
 
