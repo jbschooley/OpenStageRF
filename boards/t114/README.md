@@ -54,5 +54,6 @@ The print files are in [`3d/`](3d/):
 | `RXTop.3mf`, `RXBottom.3mf` | receiver case |
 | `Flap.3mf` | flap |
 | `OpenStageRF_T114.f3z` | Fusion source for both: set the user parameter `IsRx` to `0` for the transmitter or `1` for the receiver |
+| `OpenStageRF_T114_TX.step`, `OpenStageRF_T114_RX.step` | STEP exports of each variant, for other CAD tools (no parameters) |
 
 `Top.3mf` / `Bottom.3mf` are an earlier version, and the `t114-featherwing-5din-*.3mf` files are for the first FeatherWing / 5-pin DIN build.

@@ -32,7 +32,7 @@ Each build bakes its encryption keys into the firmware from a key file:
 
 If there is no key file, the build still succeeds but bakes in **test keys** (`[0x42; 32]` / `[0x99; 32]`) and prints a `NOT FOR PRODUCTION` warning. Those keys are public (they are in this repository), so anyone can read or inject MIDI on a link built with them: don't use a test-key build anywhere that matters.
 
-`osrf-keys.toml` is gitignored; never commit real keys. The shipped profiles in `configs/` read the key file through their `keys = "osrf-keys.toml"` line; to use a key file somewhere else, change that line in the profile. (Setting `OSRF_KEYS_FILE` in your shell is currently overridden by the profile's `keys` line when you build with `cargo xtask`.)
+`osrf-keys.toml` is gitignored; never commit real keys. The shipped profiles in `configs/` read the key file through their `keys = "osrf-keys.toml"` line; to use a key file somewhere else, set `OSRF_KEYS_FILE` for the build (`OSRF_KEYS_FILE=/path/to/show.toml cargo xtask run ui_tx`), which takes priority over the profile's line, or change the line in the profile.
 
 ## Flashing (T114)
 

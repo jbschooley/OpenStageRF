@@ -259,8 +259,12 @@ fn run_toml_profile(workspace: &Path, config_path: &Path, subcommand: &str) -> E
         .arg("-p")
         .arg(&package)
         .env("OSRF_PROFILE", config_path);
+    // An `OSRF_KEYS_FILE` already set in the environment wins over the profile's
+    // `keys` line, so a show's key file can be picked per build.
     if let Some(keys) = &cfg.keys {
-        cmd.env("OSRF_KEYS_FILE", workspace.join(keys));
+        if std::env::var_os("OSRF_KEYS_FILE").is_none() {
+            cmd.env("OSRF_KEYS_FILE", workspace.join(keys));
+        }
     }
 
     println!("+ {cmd:?}");

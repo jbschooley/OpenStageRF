@@ -11,7 +11,7 @@ cargo xtask build ui_rx
 ```
 
 The xtask resolves `app` → the generic binary crate (`osrf-profile-<app>-app`),
-`board` → the rustc target, sets `OSRF_PROFILE` (this file) and `OSRF_KEYS_FILE`
+`board` → the rustc target, sets `OSRF_PROFILE` (this file) and, unless it is already set, `OSRF_KEYS_FILE`
 (`keys`), and builds it. The crate's `build.rs` reads `OSRF_PROFILE` and
 generates `ROLE` / `TX_SOURCE` / `DIVERSITY` / `BAND_PLANS` / `POWER_POLICY` /
 `CHEMISTRY` / `NAME`.

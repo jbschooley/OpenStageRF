@@ -11,9 +11,9 @@
 //! default display name; `name =` overrides it):
 //! ```toml
 //! device_id = 1            # u32; paired units must match
-//! active    = "SchoolZone" # optional: which key is selected at boot
+//! active    = "MyShow" # optional: which key is selected at boot
 //!
-//! [SchoolZone]
+//! [MyShow]
 //! hex = "<64 hex chars = 32 bytes>"
 //!
 //! [Backup]
