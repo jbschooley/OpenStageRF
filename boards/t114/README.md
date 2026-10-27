@@ -38,9 +38,17 @@ From [`src/lib.rs`](src/lib.rs):
 3. **Plug in the T114** (and the DX-LR30 module on the 2×6 socket for a diversity receiver). Fit the T114's antenna for your band.
 4. **Flash it** over the debug header: see [Building and flashing](../../README.md#flashing-t114) in the main README. Build a TX profile for the transmitter and an RX profile (or `ui_rx_diversity`) for the receiver, both from the same key file.
 
+### MIDI in and out on one board
+
+The board has both jacks, but each unit only uses one: the transmitter uses MIDI in (`MIDI_I`) and the receiver uses MIDI out (`MIDI_O`). The case is made for one jack, so pick one of these:
+
+- **Order one version with both jacks and remove the extra one** with a desoldering pump: take `MIDI_O` off the transmitter board and `MIDI_I` off the receiver board. This was my solution and it works well. The case I designed puts the antenna port in the location of the removed jack.
+- **Keep both jacks.** This needs a larger case, which you'd have to design.
+- **Order two versions of the board**, one without `MIDI_O` for the transmitter and one without `MIDI_I` for the receiver.
+
 ### About the DRC errors in the PCB file
 
-EasyEDA's DRC reports errors where the carrier's header pads sit on top of the holes of the T114 footprint. They come from placing the sockets over the module footprint's own pin holes, not from a fault on the board: the board as ordered works. If you edit the design, the clean fix is to keep the T114 footprint as an outline only (no pads or holes of its own), so the sockets are the only copper there; otherwise those errors can be ignored.
+EasyEDA's DRC reports errors where the carrier's header pads sit on top of the holes of the T114 footprint. They come from placing the sockets over the module footprint's own pin holes, not from a fault on the board: the board as ordered works. If you edit the design, the clean fix is to keep the T114 footprint as an outline only (no pads or holes of its own), so the sockets are the only copper there; otherwise those errors can be ignored. I simply am not experienced enough with PCB design to spend the time on this myself.
 
 ## 3D-printed case
 
