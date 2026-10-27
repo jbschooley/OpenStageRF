@@ -6,7 +6,8 @@ Open-source firmware platform for low-latency wireless MIDI over sub-GHz radio. 
 
 - **Boards:** Heltec T114 v2.1 (nRF52840 + SX1262, built-in 240×135 TFT) as the transmitter and the receiver. The DX-LR30 (STM32F103 + SX1262) is a supported board crate, exercised by the host tests; it is not the main path (see the platform note below).
 - **Link:** one-way MIDI, TX → RX, GFSK on sub-GHz, with sequence numbers, duplicate suppression for critical events, and all-notes-off when the link drops.
-- **MIDI I/O:** DIN MIDI in on the transmitter and out on the receiver, through an opto-isolated DIN front end (e.g. the Adafruit MIDI FeatherWing on the T114's UART).
+- **Hardware:** the T114 plugs into a small carrier board with opto-isolated **TRS MIDI** in and out, a 5-way joystick and an optional second radio: build guide, board files and case in [boards/t114/](boards/t114/README.md).
+- **MIDI I/O:** MIDI in on the transmitter and out on the receiver, through the carrier's TRS jacks.
 - **Receive diversity (optional):** a second SX1262 (a DX-LR30 module) on the receiver's SPI3; the first valid copy of each packet wins.
 - **Bands:** 902–928 MHz (SX1262) and 470–514 MHz (SX1268 / 470-matched modules) band plans; flash the variant that matches your radio's matching network.
 - **Security:** every packet is AEAD-encrypted and replay-protected with keys you generate (see **Keys** below).
@@ -17,7 +18,7 @@ This is hobby/development firmware for boards you build yourself. It is not cert
 
 ## What you need
 
-- A T114 (two for a link; a DX-LR30 module as well for a diversity receiver), a DIN MIDI front end, and an antenna matched to your band.
+- Two T114s and two carrier boards (see [boards/t114/](boards/t114/README.md)); a DX-LR30 module as well for a diversity receiver; an antenna matched to your band; TRS MIDI cables or adapters of the board's TRS type.
 - Rust via [rustup](https://rustup.rs): the repo pins its toolchain in `rust-toolchain.toml`, so rustup installs the right version on first build.
 - [probe-rs](https://probe.rs) and an SWD debug probe (flashing and RTT logs go through it).
 
@@ -39,10 +40,10 @@ If there is no key file, the build still succeeds but bakes in **test keys** (`[
 
 ```bash
 # 902–928 MHz (SX1262) hardware:
-cargo xtask run ui_tx            # UI transmitter — DIN MIDI in from the FeatherWing UART
+cargo xtask run ui_tx            # UI transmitter — MIDI in from the carrier's TRS input
 cargo xtask run ui_rx            # UI receiver — single radio
 cargo xtask run ui_rx_diversity  # UI receiver with dual-SPI receive diversity (on-board SX1262 + DX-LR30 on SPI3)
-cargo xtask run ui_bench_tx      # UI transmitter driven by the built-in synthetic MIDI scenario source (no DIN needed)
+cargo xtask run ui_bench_tx      # UI transmitter driven by the built-in synthetic MIDI scenario source (no MIDI input needed)
 
 # 470–514 MHz (CN470/SX1268) hardware — same UI, 470 band plans:
 cargo xtask run ui_tx_470
@@ -70,8 +71,8 @@ If two probes are connected, flash one at a time (the xtask doesn't pass a `--pr
 - **Band:** US 902–928 MHz ISM (unlicensed)
 - **Modulation:** GFSK — chasing low latency, not LoRa range
 - **Scope:** one-way MIDI link; optional receive diversity (two radios on the receiver); no BLE
-- **UI (RX side):** built-in TFT + external 5-way joystick on header pins
-- **MIDI front end:** external DIN opto-isolator (e.g. Adafruit MIDI FeatherWing for prototype)
+- **UI:** built-in TFT + the carrier's 5-way joystick
+- **MIDI front end:** opto-isolated TRS MIDI on the carrier board ([boards/t114/](boards/t114/README.md)); the first prototypes used an Adafruit MIDI FeatherWing (5-pin DIN)
 - **Language / framework:** Rust + [embassy](https://embassy.dev) (async, no_std, multi-vendor via `embedded-hal`)
 
 The firmware is structured to grow into more boards, radios, and feature profiles, but the initial focus is making one rock-solid configuration before broadening.
@@ -88,7 +89,9 @@ The firmware is structured to grow into more boards, radios, and feature profile
 
 ## Radio rules
 
-The firmware can tune anything the SX126x can, so **you are responsible for using a band, power and waveform that are legal where you are.** The 902–928 MHz profiles target the US ISM band; the 470–514 MHz profiles overlap TV and licensed wireless-microphone spectrum in the US and need the right authorization there. Nothing here is certified, and the default bench waveform is not shaped for full-power operation under FCC 15.247. Decision 7 below has the longer version.
+The firmware can tune anything the SX126x can, so **you are responsible for using a band, power and waveform that are legal where you are.** The 902–928 MHz profiles target the US ISM band; the 470–514 MHz profiles overlap TV and wireless-microphone spectrum in the US and need the right authorization there. Nothing here is certified, and the default bench waveform is not shaped for full-power operation under FCC 15.247. Decision 7 below has the longer version.
+
+My suggestion: use the 470-514 band. Most wireless audio gear uses that for good reason. The only allowed uses of that band are TV and wireless audio, so if you scan for TV channels and avoid them, you can be pretty sure nothing will interfere except for other wireless audio devices in the venue. Make sure to coordinate with other band members and the venue to avoid interfering, just as you would with your IEM system or wireless microphone.
 
 ## Roadmap
 
@@ -142,7 +145,7 @@ Profiles are TOML files in [`configs/`](configs/) (schema in [`configs/README.md
 App code calls `radio_send`, `radio_start_rx`, etc. Drivers implement those for SX126x today, with room for CC13xx, STM32WL integrated radio, etc. The driver is instance-based so two radios can coexist.
 
 ### 3. Packet-based MIDI, not byte-tunneling
-MIDI events are parsed, packetized, and sent with sequence numbers and CRC. The receiver reconstructs DIN MIDI. This enables:
+MIDI events are parsed, packetized, and sent with sequence numbers and CRC. The receiver reconstructs the MIDI stream. This enables:
 - duplicate suppression by sequence number
 - prioritization (note on/off and sustain > CC > clock/sysex)
 - duplicate transmission of critical events without ACK/retry latency
