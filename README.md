@@ -2,6 +2,37 @@
 
 Open-source firmware platform for low-latency wireless MIDI over sub-GHz radio. Designed for live performance reliability — built around a packet-radio link with sequence numbers, duplicate suppression for critical events, and a watchdog all-notes-off on link loss.
 
+## What works today
+
+- **Boards:** Heltec T114 v2.1 (nRF52840 + SX1262, built-in 240×135 TFT) as the transmitter and the receiver. The DX-LR30 (STM32F103 + SX1262) is a supported board crate, exercised by the host tests; it is not the main path (see the platform note below).
+- **Link:** one-way MIDI, TX → RX, GFSK on sub-GHz, with sequence numbers, duplicate suppression for critical events, and all-notes-off when the link drops.
+- **MIDI I/O:** DIN MIDI in on the transmitter and out on the receiver, through an opto-isolated DIN front end (e.g. the Adafruit MIDI FeatherWing on the T114's UART).
+- **Receive diversity (optional):** a second SX1262 (a DX-LR30 module) on the receiver's SPI3; the first valid copy of each packet wins.
+- **Bands:** 902–928 MHz (SX1262) and 470–514 MHz (SX1268 / 470-matched modules) band plans; flash the variant that matches your radio's matching network.
+- **Security:** every packet is AEAD-encrypted and replay-protected with keys you generate (see **Keys** below).
+- **On-device UI:** TFT + 5-way joystick: band plan, channel, key, power and link status.
+- **Reliability:** hardware watchdog, panic log to flash, and a self-reset path; see [docs/reliability.md](docs/reliability.md).
+
+This is hobby/development firmware for boards you build yourself. It is not certified hardware; see **Radio rules** below.
+
+## What you need
+
+- A T114 (two for a link; a DX-LR30 module as well for a diversity receiver), a DIN MIDI front end, and an antenna matched to your band.
+- Rust via [rustup](https://rustup.rs): the repo pins its toolchain in `rust-toolchain.toml`, so rustup installs the right version on first build.
+- [probe-rs](https://probe.rs) and an SWD debug probe (flashing and RTT logs go through it).
+
+## Keys (read this before building)
+
+Each build bakes its encryption keys into the firmware from a key file:
+
+1. Copy `osrf-keys.toml.example` to **`osrf-keys.toml` in the repo root**.
+2. Replace the example keys with your own: `openssl rand -hex 32` for each key.
+3. Build the transmitter and the receiver from the **same** key file (same keys, same `device_id`), and select the same key on both (the `active` key is the boot default).
+
+If there is no key file, the build still succeeds but bakes in **test keys** (`[0x42; 32]` / `[0x99; 32]`) and prints a `NOT FOR PRODUCTION` warning. Those keys are public (they are in this repository), so anyone can read or inject MIDI on a link built with them: don't use a test-key build anywhere that matters.
+
+`osrf-keys.toml` is gitignored; never commit real keys. The shipped profiles in `configs/` read the key file through their `keys = "osrf-keys.toml"` line; to use a key file somewhere else, change that line in the profile. (Setting `OSRF_KEYS_FILE` in your shell is currently overridden by the profile's `keys` line when you build with `cargo xtask`.)
+
 ## Flashing (T114)
 
 `cargo xtask run <profile>` builds for the board's target, flashes via probe-rs, and attaches RTT logs (Ctrl-C to detach). A **profile** is a TOML file in [`configs/`](configs/) — role / tx_source / diversity / band are baked in at build time (the generic `t114_ui` UI binary is configured per build, not a crate per deployment). Current UI profiles:
@@ -38,7 +69,7 @@ If two probes are connected, flash one at a time (the xtask doesn't pass a `--pr
 - **Board:** Heltec T114 v2.1 (nRF52840 + SX1262, built-in 240×135 ST7789 TFT)
 - **Band:** US 902–928 MHz ISM (unlicensed)
 - **Modulation:** GFSK — chasing low latency, not LoRa range
-- **Scope:** one-way MIDI link, single radio per node, no diversity, no BLE
+- **Scope:** one-way MIDI link; optional receive diversity (two radios on the receiver); no BLE
 - **UI (RX side):** built-in TFT + external 5-way joystick on header pins
 - **MIDI front end:** external DIN opto-isolator (e.g. Adafruit MIDI FeatherWing for prototype)
 - **Language / framework:** Rust + [embassy](https://embassy.dev) (async, no_std, multi-vendor via `embedded-hal`)
@@ -54,6 +85,10 @@ The firmware is structured to grow into more boards, radios, and feature profile
 > until then it's exercised through the host-side test suites.  **Other boards (TI CC1352R,
 > STM32WBA, the v2 custom design sketched in [ROADMAP.md](ROADMAP.md)) are community ports
 > unless and until the maintainer needs them — they aren't on the active path.**
+
+## Radio rules
+
+The firmware can tune anything the SX126x can, so **you are responsible for using a band, power and waveform that are legal where you are.** The 902–928 MHz profiles target the US ISM band; the 470–514 MHz profiles overlap TV and licensed wireless-microphone spectrum in the US and need the right authorization there. Nothing here is certified, and the default bench waveform is not shaped for full-power operation under FCC 15.247. Decision 7 below has the longer version.
 
 ## Roadmap
 
@@ -97,10 +132,11 @@ app
 A profile combines a board, a role (TX/RX), enabled features (display, diversity, …), and radio config. App and core code stay hardware-agnostic.
 
 ```
-fw build dx_lr30_tx_basic
-fw build dx_lr30_rx_basic
-fw build stm_oled_rx_dual_spi   # v2 dual-radio diversity
+cargo xtask build ui_tx            # configs/ui_tx.toml
+cargo xtask build ui_rx_diversity  # configs/ui_rx_diversity.toml
 ```
+
+Profiles are TOML files in [`configs/`](configs/) (schema in [`configs/README.md`](configs/README.md)).
 
 ### 2. Radio abstraction
 App code calls `radio_send`, `radio_start_rx`, etc. Drivers implement those for SX126x today, with room for CC13xx, STM32WL integrated radio, etc. The driver is instance-based so two radios can coexist.
@@ -210,66 +246,30 @@ The firmware is written in Rust on top of [embassy](https://embassy.dev) — asy
 
 **Portability boundary rule.** Vendor HAL crates (`embassy-stm32`, `embassy-nrf`, etc.) are only allowed in `boards/<board>/` and `ports/<port>/`. Everywhere else (`core/`, `drivers/<X>/`, `protocols/`, `apps/`) depends only on `embedded-hal` traits and project-internal crates. If a driver ever has to import `embassy-stm32` directly, that's a portability bug.
 
-**Build system.** Cargo workspace with one crate per module (driver, protocol, board, app). Profiles live as YAML files; an `xtask` helper translates `profile.yaml` into the right `cargo build --features ... --target ... -p <board_app>` invocation.
+**Build system.** Cargo workspace with one crate per module (driver, protocol, board, app). Profiles live as TOML files in `configs/`; the `xtask` helper reads one and runs the right `cargo build --target ... -p <app>` with the profile baked in by the app's `build.rs`.
 
 **Other ports stay welcome as community contributions.** A Zephyr+C port (TI CC13xx support, alternative for users who prefer Zephyr's middleware) and a bare-metal STM32 HAL port (minimum-overhead reference) are both reasonable additions if someone wants to maintain them. They aren't on the maintainer's roadmap.
 
 ## Directory Structure
 
 ```
-wireless-performer-fw/
-├── Cargo.toml                              # workspace root
-├── apps/                                   # bin crates (executables)
-│   └── midi_node/                          # TX/RX firmware role; behavior selected by profile
-├── boards/                                 # board crates: pin maps + chip-specific HAL setup
-│   ├── dx_lr30/                            # v1 — STM32F103 + SX1262 (embassy-stm32)
-│   ├── t114/                               # Stage 2.5 — Heltec T114, nRF52840 + SX1262 (embassy-nrf)
-│   ├── nrf5340_dual_sx1262/                # v2 custom MIDI — nRF5340 + 2× SX1262 (embassy-nrf)
-│   └── _future/                            # deferred targets, not on active roadmap
-│       ├── stm32_custom_oled_dual_radio/   # was v2 plan — STM32WBA + 2× SX1262
-│       └── ti_lpstk_cc1352r/               # TI CC1352R, awaiting embassy HAL
-├── ports/                                  # platform-shared code (not chip-specific)
-│   ├── embassy_stm32/                      # STM32 family helpers (flash partitions, etc.)
-│   └── embassy_nrf/                        # nRF family helpers (softdevice glue, etc.)
-├── profiles/                               # build configs: board + role + features + radio
-│   ├── dx_lr30_tx_basic/                   # v1 transmitter
-│   ├── dx_lr30_rx_basic/                   # v1 receiver
-│   ├── t114_rx_diversity/                  # Stage 2.5 receiver on nRF52840
-│   ├── nrf5340_v2_midi/                    # v2 board, MIDI with diversity
-├── drivers/                                # vendor-neutral library crates
-│   ├── radio/
-│   │   ├── sx126x/                         # SX1262/SX1268 — v1/v2, depends on embedded-hal traits only
-│   │   ├── cc1200/                         # future — TI standalone SPI radio, MSK + 4-FSK, embassy-friendly
-│   │   └── cc13xx/                         # future — TI integrated MCU+radio, requires Zephyr+C or embassy HAL port
-│   ├── display/
-│   │   └── ssd1306/                        # I²C OLED
-│   ├── input/
-│   │   └── buttons/                        # GPIO buttons / joystick
-│   ├── midi/
-│   │   └── din_uart/                       # opto-isolated DIN MIDI
-├── core/                                   # portable, hardware-agnostic library crates
-│   ├── link/                               # packetization, seq numbers, CRC, dedupe, watchdog
-│   ├── diversity/                          # arbitration (UART-slave or dual-SPI)
-│   ├── scheduler/                          # event/packet timing
-│   └── config/                             # persisted settings, key store, active profile
-├── protocols/                              # frozen on-air formats
-│   └── midi_packet_v1/
-├── crypto/                                 # AEAD wrappers (chacha20poly1305, ccm) over RustCrypto
-├── xtask/                                  # build helper: profile.yaml → cargo invocation
-├── tools/                                  # host-side
-│   ├── configurator/                       # desktop/CLI key + channel config
-│   ├── packet_analyzer/                    # off-air capture/decode
-│   └── latency_tester/                     # bench measurement harness
-├── docs/
-│   ├── hardware_guides/                    # per-board build / wiring instructions
-│   ├── regulatory/                         # band notes, FCC / certification context
-│   └── build_guides/                       # toolchain + flashing
-├── examples/
-├── tests/
-└── README.md
+OpenStageRF/
+├── apps/              # firmware roles and runtimes: midi_node, ui_runtime, benches (link, radio, midi, ui), blink
+├── boards/            # pin maps + chip-specific HAL setup: t114 (nRF52840), dx_lr30 (STM32F103)
+├── band_plans/        # channel/band plans as TOML (ism915, band470, dense_*, ...)
+├── configs/           # flashable deployment profiles (TOML) for `cargo xtask build|run`
+├── core/              # hardware-agnostic: link, link_runtime, ui, phy_api, panic_log
+├── crypto/            # AEAD wrappers over RustCrypto
+├── docs/              # reliability, UI design, FAQ, hardware guides
+├── drivers/           # radio/sx126x, phy/sx126x, display/st7789, input/joystick5way, midi/din
+├── ports/             # platform-shared embassy helpers
+├── profiles/          # per-board binary crates that the configs build (t114_ui, t114_ui_app, dx_lr30_*, ...)
+├── protocols/         # frozen on-air formats (midi_packet_v1)
+├── tools/             # host-side helpers (UF2 conversion)
+└── xtask/             # build/flash helper: profile TOML -> cargo invocation
 ```
 
-Each `boards/<name>/board.yaml` documents that board's MCU, pin map, and radio wiring. Each `profiles/<name>/profile.yaml` documents the role, features, and radio config for that build target. The `xtask` helper reads the profile YAML and invokes Cargo with the right features, target triple, and board crate.
+[ROADMAP.md](ROADMAP.md) covers boards and radios that are planned but not here yet.
 
 ## License
 
